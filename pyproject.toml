@@ -1,5 +1,5 @@
 [project]
-name = "sign-language"
+name = "realsense-recorder"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -10,11 +10,11 @@ dependencies = [
     "pyrealsense2>=2.58.2.10647",
 ]
 
-[tool.uv]
-package=true
-cache-dir = ".uv-cache"
-
 [dependency-groups]
 dev = [
     "ipykernel>=7.3.0",
 ]
+
+[tool.uv]
+package=true
+cache-dir = ".uv-cache"
