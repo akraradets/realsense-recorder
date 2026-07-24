@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+recordings/
+*.mp4
+*.csv
+*.report.json
+openh264*.dll
+openh264*.dll.bz2
+dist/
+build/
+*.egg-info/
+.DS_Store
+CLIENT_GUIDE.md
