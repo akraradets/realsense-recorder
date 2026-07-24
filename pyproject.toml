@@ -11,12 +11,14 @@ dependencies = [
     "psutil>=5.9.0",
     "pillow>=10.0.0",
     "matplotlib>=3.10.9",
-    "pyrealsense2>=2.58.2.10647",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
+]
+realsense = [
+    "pyrealsense2>=2.58.2.10647",
 ]
 
 [dependency-groups]

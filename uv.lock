@@ -1486,13 +1486,15 @@ dependencies = [
     { name = "opencv-python" },
     { name = "pillow" },
     { name = "psutil" },
-    { name = "pyrealsense2" },
     { name = "pyvirtualcam" },
 ]
 
 [package.optional-dependencies]
 dev = [
     { name = "pytest" },
+]
+realsense = [
+    { name = "pyrealsense2" },
 ]
 
 [package.dev-dependencies]
@@ -1507,11 +1509,11 @@ requires-dist = [
     { name = "opencv-python", specifier = ">=5.0.0.93" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "psutil", specifier = ">=5.9.0" },
-    { name = "pyrealsense2", specifier = ">=2.58.2.10647" },
+    { name = "pyrealsense2", marker = "extra == 'realsense'", specifier = ">=2.58.2.10647" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pyvirtualcam", specifier = ">=0.11.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["dev", "realsense"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "ipykernel", specifier = ">=7.3.0" }]
