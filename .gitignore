@@ -1,3 +1,4 @@
+
 .venv/
 __pycache__/
 *.py[cod]
@@ -13,3 +14,20 @@ build/
 *.egg-info/
 .DS_Store
 CLIENT_GUIDE.md
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+
+logs/*
+data/*
+!.keeps
+
