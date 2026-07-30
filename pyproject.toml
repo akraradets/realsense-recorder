@@ -32,6 +32,7 @@ poc1-proof = "poc1.proof:main"
 poc1-verify = "poc1.verifier:main"
 poc1-tests = "poc1.run_poc1_tests:main"
 poc1-delivery = "poc1.delivery:main"
+poc1-d1 = "poc1.deliverable1.gui:main"
 
 [build-system]
 requires = ["hatchling"]

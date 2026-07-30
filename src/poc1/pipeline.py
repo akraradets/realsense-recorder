@@ -231,6 +231,10 @@ class Pipeline:
             "measured_fps": recorder_summary.get("measured_fps", 0.0),
             "container_fps": recorder_summary.get("container_fps", self.source.target_fps),
             "fps_corrected": recorder_summary.get("fps_corrected", False),
+            "fps_mismatch": recorder_summary.get("fps_mismatch", False),
+            "suggested_container_fps": recorder_summary.get(
+                "suggested_container_fps", self.source.target_fps
+            ),
             "slow_writes": recorder_summary.get("slow_writes", 0),
             "slow_encodes": proc_summary.get("slow_encodes", 0),
             "compression_stage": "processor",
@@ -244,3 +248,16 @@ class Pipeline:
                 and dropped_rec == 0
             ),
         }
+
+    def convert_container_fps(self) -> bool:
+        """Optional remux to measured FPS. Safe to call from a worker thread."""
+        if self.recorder is None:
+            return False
+        ok = self.recorder.convert_container_fps()
+        if ok and self.output_path:
+            report = self.report()
+            report_path = self.output_path.with_suffix(".report.json")
+            report["report_path"] = str(report_path)
+            report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            self._last_report = report
+        return ok

@@ -587,7 +587,12 @@ class App:
         self._set_record_button_idle()
         drops_ok = "OK — no frame drops" if report["no_frame_drops"] else "DROPS DETECTED"
         fps_note = ""
-        if report.get("fps_corrected"):
+        if report.get("fps_mismatch"):
+            fps_note = (
+                f" | measured ~{report.get('measured_fps')}fps "
+                f"(configured {report.get('target_fps')}fps) — conversion optional"
+            )
+        elif report.get("fps_corrected"):
             fps_note = (
                 f" | playback fixed to ~{report.get('container_fps')}fps "
                 f"(webcam hardware limit, not a bug)"
@@ -596,16 +601,86 @@ class App:
             f"stopped [{drops_ok}] read={report['frames_read_by_camera']} "
             f"written={report['frames_written']} codec={report.get('codec', '?')}{fps_note}"
         )
+        self._refresh_report_panel(report)
+        # Warn first; remux only if the user opts in (runs on a worker thread).
+        if report.get("fps_mismatch"):
+            self._offer_fps_conversion(report)
+        out = Path(report.get("output_path") or "")
+        if out:
+            self._show_review_popup(out)
+
+    def _refresh_report_panel(self, report: dict) -> None:
         self.report_var.set(json.dumps({
             k: report[k] for k in (
                 "no_frame_drops", "frames_read_by_camera", "frames_written",
                 "codec", "compression_stage", "measured_fps", "container_fps",
-                "fps_corrected", "bag_recorded", "bag_path",
+                "fps_corrected", "fps_mismatch", "suggested_container_fps",
+                "bag_recorded", "bag_path",
             ) if k in report
         }, indent=2))
-        out = Path(report.get("output_path") or "")
-        if out:
-            self._show_review_popup(out)
+
+    def _offer_fps_conversion(self, report: dict) -> None:
+        target = report.get("target_fps", "?")
+        measured = report.get("measured_fps", 0.0)
+        suggested = report.get("suggested_container_fps", measured)
+        convert = messagebox.askyesno(
+            "Frame rate mismatch",
+            f"Configured {target} fps but the camera delivered ~{measured:.1f} fps.\n\n"
+            f"Convert the file so playback runs in real time "
+            f"(~{suggested:.1f} fps container)?\n\n"
+            "Choose No to keep the original file as recorded.\n"
+            "Conversion runs in the background and may take a while.",
+        )
+        if not convert:
+            return
+        self._start_fps_conversion_async()
+
+    def _start_fps_conversion_async(self) -> None:
+        """Run remux on a child thread so the Tk main thread does not hang."""
+        if not self.pipeline or self.pipeline.recorder is None:
+            return
+        self.status_var.set("converting frame rate… (background — UI stays responsive)")
+        self._set_record_button_idle()
+        try:
+            self.record_btn.configure(state="disabled")
+            self.preview_btn.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+        def worker() -> None:
+            ok = False
+            err: Optional[str] = None
+            try:
+                ok = self.pipeline.convert_container_fps()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("FPS conversion failed")
+                err = str(exc)
+            self.root.after(0, lambda: self._on_fps_conversion_done(ok, err))
+
+        threading.Thread(target=worker, name="fps-convert", daemon=True).start()
+
+    def _on_fps_conversion_done(self, ok: bool, err: Optional[str]) -> None:
+        try:
+            self.record_btn.configure(state="normal")
+            self.preview_btn.configure(state="normal")
+        except tk.TclError:
+            pass
+        if err:
+            self.status_var.set(f"FPS conversion failed: {err} (original kept)")
+            messagebox.showerror("FPS conversion failed", err)
+            return
+        if ok and self.pipeline:
+            report = self.pipeline._last_report or self.pipeline.report()
+            self.status_var.set(
+                f"FPS conversion done — playback ~{report.get('container_fps')}fps"
+            )
+            self._refresh_report_panel(report)
+        else:
+            self.status_var.set("FPS conversion failed (original file kept)")
+            messagebox.showwarning(
+                "FPS conversion",
+                "Could not rewrite the file. The original recording was kept.",
+            )
 
     def _show_review_popup(self, output_path: Path) -> None:
         popup = tk.Toplevel(self.root)

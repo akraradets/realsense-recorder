@@ -12,8 +12,9 @@ camera_handler --sub--> processor (compression) --> recorder
 ```
 
 - **processor** owns encode (H.264 when OpenH264 is available, else **mp4v**).
-- **recorder** accounts encoded frames / remuxes webcam FPS metadata; it does
-  not re-encode.
+- **recorder** accounts encoded frames and *detects* FPS mismatch (e.g. config
+  120 but camera delivered ~60). The GUI **warns** and offers optional
+  conversion; remux runs on a **background thread** so the UI does not hang.
 
 Pass/fail on stop:
 
@@ -96,6 +97,12 @@ uv run python -m poc1.gui --source webcam --device-index 0 --width 1280 --height
 
 - **Also .bag (RealSense HW)** — Viewer-compatible `.bag` when a RealSense is connected.
 - **Detect Capture Card** / **Detect RealSense** — set device index automatically.
+- **FPS mismatch** — if configured FPS ≠ measured FPS (e.g. 120 vs ~60), the GUI
+  **warns** and asks whether to convert playback speed. Conversion runs on a
+  **background thread** (UI stays responsive). Choosing No keeps the original file.
+- **Storage bandwidth** — frames are compressed then written to disk. To check disk
+  load with RealSense hardware, record a take and inspect `*_sysmon.csv`
+  (`disk_write_mb_since_start`) plus `no_frame_drops` in the report.
 
 ### Virtual camera (two terminals)
 
@@ -183,9 +190,44 @@ uv run python -m poc1.virtual_cam_sender --width 1920 --height 1080 --fps 120
 - [x] RealSense `.bag` option when hardware present (MP4 always)
 - [x] Client delivery pack (`poc1.delivery` → `recordings/poc1_delivery/`)
 - [x] **Elgato / capture card** source (`capturecard_source`, auto-detect)
+- [x] **Deliverable 1 (R1–R6)** multi-cam GUI — `uv run python -m poc1.deliverable1.gui`
 - [ ] `.db3` export — **deferred** (Deliverable 2)
-- [ ] Multi-cam arming (R1–R6) — **deferred**
 - [ ] R8–R10 export polish / in-app browser — **deferred**
+
+
+## Deliverable 1 — multi-camera (R1–R6)
+
+Additive package (`poc1.deliverable1`) — **does not change** the POC-1 single-camera GUI/pipeline.
+
+| Req | Feature | How |
+|-----|---------|-----|
+| R1 | List UVC + RealSense | Refresh cameras |
+| R2 | Change FPS / resolution / format | Config dropdown per slot |
+| R3 | Stream 2 or more cameras | Start with 2 slots; use **Add camera slot** for more |
+| R4 | Folder + prefix | Save folder + per-slot prefix (`cam1`/`cam2`/`m`/`r`) |
+| R5 | Arm which cameras record | Armed checkbox per slot |
+| R6 | One Record for all armed | **Record armed cameras** |
+
+```bash
+uv sync --extra dev
+uv sync --extra dev --extra realsense   # optional, for RealSense HW
+
+uv run python -m poc1.deliverable1.gui
+# or: uv run poc1-d1
+
+# Start with 4 slots (you can still add/remove slots in the GUI)
+uv run python -m poc1.deliverable1.gui --slots 4
+```
+
+With real devices: plug Elgato / webcam / RealSense, click **Refresh cameras**,
+add/remove camera cards as needed, select a device + advertised configuration
+for each card, start previews, arm the cameras you want, then use the single
+**Record armed cameras** button.
+
+RealSense configuration uses the selected SDK color profile (resolution, FPS,
+and `bgr8` / `rgb8` / `yuyv` / `y8` data format). Optional `.bag` recording is
+available per RealSense hardware card.
+Synthetic **fake A/B** entries are always listed so you can demo without hardware.
 
 
 
