@@ -90,6 +90,25 @@ class DropCountingQueue:
                     self._name, getattr(item, "seq", "?"), self.dropped_count,
                 )
 
+    def put_block(self, item: Any, timeout: float = 2.0) -> bool:
+        """
+        Block until there is room (no-drop path for synthetic R7 proofs).
+
+        Returns False if the timeout expired (counted as a drop).
+        """
+        try:
+            self._q.put(item, timeout=timeout)
+            return True
+        except queue.Full:
+            with self._lock:
+                self.dropped_count += 1
+            logger.warning(
+                "%s: blocking put timed out, dropping seq=%s (total dropped=%d)",
+                self._name, getattr(item, "seq", "?"), self.dropped_count,
+            )
+            return False
+
+
     def get(self, timeout: Optional[float] = None) -> Optional[Any]:
         try:
             return self._q.get(timeout=timeout)
@@ -119,6 +138,11 @@ class CameraHandler:
     processor_queue_size: int = 512     # generous buffer against jitter at 120fps
 
     def __post_init__(self) -> None:
+        # FHD@120 needs a deeper buffer; fake proofs prefer no-drop backpressure.
+        fps = int(getattr(self.source, "target_fps", 30) or 30)
+        mode = str(getattr(self.source, "mode", "") or "")
+        if mode == "fake" or fps >= 60:
+            self.processor_queue_size = max(self.processor_queue_size, 2048)
         self.viewer_queue = DropCountingQueue(
             self.viewer_queue_size, drop_oldest=True, name="viewer"
         )
@@ -132,6 +156,7 @@ class CameraHandler:
         self._seq = 0
         self.frames_read = 0
         self.frames_to_recorder = 0
+        self._block_processor_puts = mode == "fake"
 
     def start(self) -> None:
         self.source.start()
@@ -201,7 +226,12 @@ class CameraHandler:
                     embed_seq_barcode(owned, seq)
                     env = FrameEnvelope(seq=seq, capture_ts=time.time(), frame=owned)
                     self.viewer_queue.put(env)
-                    self.processor_queue.put(env)
+                    if self._block_processor_puts:
+                        # Prefer read==write for synthetic R7 proofs: wait for
+                        # the encoder instead of discarding frames when full.
+                        self.processor_queue.put_block(env, timeout=2.0)
+                    else:
+                        self.processor_queue.put(env)
                 else:
                     env = FrameEnvelope(seq=-1, capture_ts=time.time(), frame=owned)
                     self.viewer_queue.put(env)

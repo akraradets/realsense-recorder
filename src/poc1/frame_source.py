@@ -93,6 +93,7 @@ class FakeFrameSource:
     target_fps: int = 120
     pattern: str = "bars"  # "bars" | "noise"
     allow_fps_remux: bool = False  # keep stamped FPS for R7 synthetic proofs
+    mode: str = "fake"
 
     def __post_init__(self) -> None:
         self._frame_idx = 0
@@ -145,21 +146,10 @@ class FakeFrameSource:
         seq = self._frame_idx
         embed_seq_barcode(frame, seq)
 
-        ts = time.time()
+        # One light overlay only — four putText calls at FHD@120 burned CPU and
+        # caused encoder queue drops when a second camera was also recording.
         cv2.putText(
             frame, f"frame={seq:08d}", (24, 60),
-            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 6, cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame, f"frame={seq:08d}", (24, 60),
-            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2, cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame, f"t={ts:.6f}", (24, 100),
-            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 6, cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame, f"t={ts:.6f}", (24, 100),
             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA,
         )
 

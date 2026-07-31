@@ -224,6 +224,15 @@ add/remove camera cards as needed, select a device + advertised configuration
 for each card, start previews, arm the cameras you want, then use the single
 **Record armed cameras** button.
 
+**Hardware tips (black / empty preview):**
+1. Close Intel RealSense Viewer, Elgato Capture, OBS, Zoom, Teams, etc. — they lock USB cameras.
+2. RealSense: USB **3** port; pick the `[realsense]` entry (not a UVC twin); start with `1280x720@30 bgr8`.
+3. Elgato: HDMI source powered on with a live signal; pick the named Elgato / capture card entry; try `1920x1080@30 mjpg`.
+4. After plugging/unplugging, always click **Refresh cameras** before Start preview.
+5. Install RealSense support with `uv sync --extra realsense` if `[realsense]` never appears.
+
+**FPS behavior (supervisor):** the MP4 keeps your **configured** FPS. After Stop, if measured FPS differs, the app **warns** and offers optional conversion on a **background thread** (never auto-changes FPS). For exact fake FHD@120 with zero drops, arm only the fake camera (or `uv run python -m poc1.proof`).
+
 RealSense configuration uses the selected SDK color profile (resolution, FPS,
 and `bgr8` / `rgb8` / `yuyv` / `y8` data format). Optional `.bag` recording is
 available per RealSense hardware card.

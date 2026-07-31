@@ -243,10 +243,43 @@ class CameraCard(tk.Frame):
                 for s in self.session.slots
                 if s.slot_id != self.slot_id and s.camera is not None
             }
-            candidate = next(
-                (d for d in self.session.devices if d.cam_id not in used),
-                None,
-            )
+            # Prefer real hardware over virtual cams / synthetic fakes so
+            # Cam1 does not auto-bind to OBS Virtual Camera.
+            candidate = None
+            for prefer in ("realsense", "elgato", "uvc", "fake"):
+                for d in self.session.devices:
+                    if d.cam_id in used:
+                        continue
+                    if "busy at scan" in d.name.lower() and prefer == "uvc":
+                        # Prefer easy-to-open devices first; busy webcam still
+                        # remains selectable manually in the dropdown.
+                        continue
+                    if prefer == "realsense" and d.kind == "realsense":
+                        candidate = d
+                        break
+                    if prefer == "elgato" and d.device_tag == "elgato":
+                        candidate = d
+                        break
+                    if (
+                        prefer == "uvc"
+                        and d.kind == "uvc"
+                        and d.device_tag not in {"virtual", "realsense-uvc"}
+                    ):
+                        candidate = d
+                        break
+                    if prefer == "fake" and d.kind == "fake":
+                        candidate = d
+                        break
+                if candidate:
+                    break
+            # Last resort: busy webcam / any remaining UVC.
+            if candidate is None:
+                for d in self.session.devices:
+                    if d.cam_id in used:
+                        continue
+                    if d.kind == "uvc" and d.device_tag != "virtual":
+                        candidate = d
+                        break
             if candidate:
                 self.device_var.set(candidate.label())
                 self._on_device()
@@ -308,11 +341,33 @@ class CameraCard(tk.Frame):
         try:
             self.session.start_slot_preview(self.slot_id)
             self.app.set_status(f"Camera {self.slot_id + 1} preview started.")
+            # Hardware devices can open successfully yet never deliver frames
+            # (busy USB, no HDMI, wrong profile). Surface that instead of a
+            # permanent black LIVE panel.
+            self.app.root.after(3500, lambda: self._warn_if_no_preview_frames())
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror(
                 f"Camera {self.slot_id + 1} preview failed",
-                f"{exc}\n\nSelect another advertised configuration and try again.",
+                f"{exc}\n\nTips:\n"
+                "• Close RealSense Viewer / Elgato app / OBS if they hold the device\n"
+                "• Use USB 3 for RealSense; HDMI signal ON for Elgato\n"
+                "• Click Refresh, pick the named device, try 1280x720@30\n"
+                "• Select another advertised configuration and try again",
             )
+
+    def _warn_if_no_preview_frames(self) -> None:
+        slot = self.session.slots[self.slot_id]
+        if slot.pipeline is None:
+            return
+        if slot.get_preview_frame() is not None:
+            return
+        messagebox.showwarning(
+            f"Camera {self.slot_id + 1} — no preview frames",
+            "The device opened but no image arrived after a few seconds.\n\n"
+            "Close other camera apps, confirm the physical connection "
+            "(USB3 / HDMI), click Refresh, then Start preview again.",
+        )
+        self.status_label.configure(text="warning: no frames yet")
 
     def stop_preview(self) -> None:
         if self.app.busy:
@@ -576,7 +631,7 @@ class Deliverable1App:
         for card in self.cards:
             # With one physical webcam, Camera 2 must remain unassigned. Auto
             # assignment is intentionally limited to the first card.
-            card.load_devices(auto_assign=auto_assign and card.slot_id == 0)
+            card.load_devices(auto_assign=auto_assign)
         self.count_var.set(f"{len(self.session.slots)} camera slots")
 
     def add_camera(self) -> None:
@@ -619,9 +674,17 @@ class Deliverable1App:
         try:
             devices = self.session.refresh_devices(include_fake=True)
             self.rebuild_cards(auto_assign=initial)
-            real_count = len([d for d in devices if d.kind != "fake"])
+            real = [d for d in devices if d.kind != "fake"]
+            names = ", ".join(d.name for d in real[:6]) or "(none)"
+            kinds = {d.kind for d in real} | {d.device_tag for d in real}
+            tip = ""
+            if "realsense" not in kinds:
+                tip += " No RealSense SDK device yet — plug USB3 + close Viewer."
+            if "elgato" not in kinds:
+                tip += " No named Elgato yet — plug card + HDMI ON + close Elgato app."
             self.set_status(
-                f"Found {real_count} connected camera(s) plus 2 synthetic test sources."
+                f"Found {len(real)} connected camera(s): {names}.{tip} "
+                "Pick devices, Start preview, then Record."
             )
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Camera scan failed", str(exc))
@@ -688,6 +751,28 @@ class Deliverable1App:
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Recording configuration", str(exc))
             return
+
+        armed = [s for s in self.session.slots if s.armed and s.pipeline]
+        heavy = [
+            s
+            for s in armed
+            if s.mode
+            and s.mode.width * s.mode.height * s.mode.fps >= 1920 * 1080 * 60
+        ]
+        if len(armed) >= 2 and heavy:
+            names = ", ".join(s.prefix for s in heavy)
+            if not messagebox.askyesno(
+                "High-rate multi-camera recording",
+                f"Armed cameras include high rate/config ({names}) while "
+                f"{len(armed)} cameras record together.\n\n"
+                "Configured FPS is kept (not auto-lowered). The PC encoder may "
+                "not sustain every stream — you may see measured FPS below "
+                "configured, or drops.\n\n"
+                "For exact fake FHD@120 with no drops, arm only that fake camera.\n\n"
+                "Continue recording anyway?",
+            ):
+                return
+
         self._set_busy(True)
         self.set_status("Starting all armed recorders…")
 
@@ -745,24 +830,53 @@ class Deliverable1App:
             for slot in self.session.slots
             if reports.get(slot.prefix, {}).get("fps_mismatch")
         ]
+        # Supervisor: warn + optional convert; never change FPS automatically.
+        # Conversion always runs on a child thread (not the Tk main thread).
         if mismatched:
             details = "\n".join(
                 f"• {slot.prefix}: configured {report.get('target_fps')} fps, "
-                f"measured ~{report.get('measured_fps')} fps"
+                f"measured ~{float(report.get('measured_fps') or 0):.1f} fps "
+                f"(container still {report.get('container_fps')} fps)"
                 for slot, report in mismatched
             )
             if messagebox.askyesno(
                 "Frame-rate mismatch",
                 f"{details}\n\n"
+                "The file still uses the configured FPS (not changed automatically).\n"
+                "If measured FPS is lower, playback may look too fast.\n\n"
                 "Convert these files to their measured frame rates for real-time "
-                "playback?\n\nConversion runs in a child thread. Choose No to keep "
-                "the original container frame rates.",
+                "playback?\n\n"
+                "Yes = convert in a background thread\n"
+                "No = keep the configured FPS stamp",
             ):
                 self._convert_mismatched_async(mismatched)
 
+        if not ok:
+            drop_notes = []
+            for slot in self.session.slots:
+                report = reports.get(slot.prefix) or {}
+                if report.get("no_frame_drops", True):
+                    continue
+                dropped = int(report.get("dropped_processor_queue") or 0)
+                drop_notes.append(
+                    f"{slot.prefix}: read {report.get('frames_read_by_camera')} "
+                    f"wrote {report.get('frames_written')} "
+                    f"(processor dropped {dropped})"
+                )
+            if drop_notes:
+                messagebox.showwarning(
+                    "Frame drops detected",
+                    "Some cameras could not encode as fast as frames arrived:\n\n"
+                    + "\n".join(drop_notes)
+                    + "\n\nFor exact fake FHD@120 with zero drops, arm ONLY the "
+                    "synthetic fake camera (or run: uv run python -m poc1.proof).\n"
+                    "Recording fake@120 together with another live camera often "
+                    "overloads MPEG-4 encode on one PC.",
+                )
+
     def _convert_mismatched_async(self, mismatched) -> None:
         self._set_busy(True)
-        self.set_status("Converting frame rates in background…")
+        self.set_status("Converting frame rates in background thread…")
 
         def worker() -> None:
             results: dict[str, bool] = {}
@@ -788,8 +902,21 @@ class Deliverable1App:
             self.set_status(
                 "FPS conversion finished with failures: " + ", ".join(failed)
             )
+            messagebox.showwarning(
+                "FPS conversion incomplete",
+                "Could not rewrite: "
+                + ", ".join(failed)
+                + "\nConfigured FPS stamp was kept.",
+            )
         else:
-            self.set_status("FPS conversion complete. Original frame count preserved.")
+            self.set_status(
+                "FPS conversion complete (background thread). Frame count unchanged."
+            )
+            messagebox.showinfo(
+                "FPS conversion complete",
+                "Selected recordings were rewritten to their measured frame rate "
+                "on a background thread. Frame count is unchanged.",
+            )
 
     def show_report(self) -> None:
         popup = tk.Toplevel(self.root)

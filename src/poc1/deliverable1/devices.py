@@ -14,6 +14,14 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 
+from poc1.deliverable1.win_names import (
+    classify_capture_name,
+    clear_name_cache,
+    dshow_open_path,
+    dshow_open_paths_for_tag,
+    friendly_name_for_index,
+    list_windows_capture_names,
+)
 from poc1.device_enum import quiet_opencv
 from poc1.frame_source import FakeFrameSource
 from poc1.pipeline import CvCaptureSource
@@ -50,6 +58,9 @@ class ConnectedCamera:
     serial: Optional[str] = None
     backend: Optional[int] = None
     backend_name: str = ""
+    # Windows DirectShow path, e.g. "video=Elgato HD60 S+" (more reliable than index).
+    open_path: Optional[str] = None
+    device_tag: str = "uvc"  # elgato | realsense-uvc | virtual | uvc | realsense | fake
 
     def label(self) -> str:
         extra = []
@@ -103,6 +114,92 @@ def _opencv_backends() -> list[tuple[int, str]]:
     return backends
 
 
+def _uvc_display_name(
+    index: int,
+    w: int,
+    h: int,
+    fps: float,
+    *,
+    busy: bool = False,
+) -> tuple[str, str, Optional[str]]:
+    """Return (display_name, device_tag, open_path)."""
+    fallback = f"UVC #{index} ({w}x{h}" + (f"@{fps:.0f}" if fps > 0 else "") + ")"
+    friendly, tag = friendly_name_for_index(index, fallback)
+    if tag == "elgato":
+        name = f"Elgato / capture card — {friendly}"
+    elif tag == "realsense-uvc":
+        name = f"RealSense (OpenCV/UVC twin) — {friendly} [use SDK entry instead]"
+    elif tag == "virtual":
+        name = f"Virtual camera — {friendly}"
+    elif friendly != fallback:
+        name = f"{friendly} ({w}x{h})" if w > 0 and h > 0 else friendly
+    elif index > 0 and w >= 1280 and h >= 720:
+        name = f"UVC/capture #{index} ({w}x{h})"
+    else:
+        name = fallback
+    if busy:
+        name = f"{name} [busy at scan — close Zoom/Teams/Camera app, then Start preview]"
+
+    open_path = None
+    if sys.platform == "win32":
+        open_path = dshow_open_path(index)
+        if open_path is None:
+            # Prefer opening by the Windows friendly name (works even when the
+            # OpenCV index probe hangs because another app briefly locks it).
+            names = list_windows_capture_names()
+            if 0 <= index < len(names):
+                open_path = f"video={names[index]}"
+            elif tag == "elgato":
+                elgato_paths = dshow_open_paths_for_tag("elgato")
+                open_path = elgato_paths[0] if elgato_paths else None
+            elif tag == "uvc" and names and (index == 0 or busy):
+                # Only map the built-in/first webcam name onto index 0 (or a
+                # timed-out busy slot). Never attach it to UVC #1+ (often OBS).
+                for candidate in names:
+                    if classify_capture_name(candidate) in {"uvc", "elgato"}:
+                        open_path = f"video={candidate}"
+                        if tag == "uvc" and friendly == fallback:
+                            name = (
+                                f"{candidate} #{index}"
+                                + (
+                                    " [busy at scan — close other apps, then Start preview]"
+                                    if busy
+                                    else ""
+                                )
+                            )
+                        break
+            elif index > 0 and w <= 640 and h <= 480 and not busy:
+                # Common Windows layout: #0 = laptop webcam, #1 = OBS Virtual Camera.
+                name = f"UVC/virtual? #{index} ({w}x{h}) — often OBS Virtual Camera"
+    return name, tag, open_path
+
+
+def _make_uvc_camera(
+    index: int,
+    backend: int,
+    backend_name: str,
+    *,
+    w: int = 640,
+    h: int = 480,
+    fps: float = 0.0,
+    busy: bool = False,
+    open_path: Optional[str] = None,
+    name: Optional[str] = None,
+    device_tag: Optional[str] = None,
+) -> ConnectedCamera:
+    disp, tag, path = _uvc_display_name(index, w, h, fps, busy=busy)
+    return ConnectedCamera(
+        cam_id=f"uvc:{index}:{backend_name}",
+        kind="uvc",
+        name=name or disp,
+        index=index,
+        backend=backend,
+        backend_name=backend_name,
+        open_path=open_path if open_path is not None else path,
+        device_tag=device_tag or tag,
+    )
+
+
 def _probe_uvc_index(index: int, backend: int, backend_name: str) -> Optional[ConnectedCamera]:
     with quiet_opencv():
         cap = cv2.VideoCapture(index, backend)
@@ -112,21 +209,14 @@ def _probe_uvc_index(index: int, backend: int, backend_name: str) -> Optional[Co
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+        # Do not require a frame here — some Windows drivers hang on the first
+        # read while another process briefly holds the device, which made the
+        # real webcam disappear from Refresh. Frame delivery is verified in
+        # FormattedUvcSource.start() when preview begins.
         cap.release()
-    name = f"UVC camera {index}"
-    if w > 0 and h > 0:
-        name = f"UVC #{index} ({w}x{h}" + (f"@{fps:.0f}" if fps > 0 else "") + ")"
-    # Heuristic: high-res non-zero index is often a capture card (Elgato).
-    if index > 0 and w >= 1280 and h >= 720:
-        name = f"UVC/capture #{index} ({w}x{h})"
-    return ConnectedCamera(
-        cam_id=f"uvc:{index}:{backend_name}",
-        kind="uvc",
-        name=name,
-        index=index,
-        backend=backend,
-        backend_name=backend_name,
-    )
+        if w <= 0 or h <= 0:
+            w, h = 640, 480
+    return _make_uvc_camera(index, backend, backend_name, w=w, h=h, fps=fps)
 
 
 def _probe_uvc_index_safe(
@@ -134,43 +224,124 @@ def _probe_uvc_index_safe(
     backend: int,
     backend_name: str,
     timeout_s: float = 2.0,
-) -> Optional[ConnectedCamera]:
-    """OpenCV can hang when another process owns the camera; bound the wait."""
+) -> tuple[Optional[ConnectedCamera], str]:
+    """
+    OpenCV can hang when another process owns the camera; bound the wait.
+
+    Returns (camera_or_none, status) where status is ok | missing | timeout | error.
+    """
     from concurrent.futures import ThreadPoolExecutor
     from concurrent.futures import TimeoutError as FuturesTimeout
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(_probe_uvc_index, index, backend, backend_name)
         try:
-            return future.result(timeout=timeout_s)
+            cam = future.result(timeout=timeout_s)
+            return cam, ("ok" if cam is not None else "missing")
         except FuturesTimeout:
             logger.warning(
                 "UVC probe timed out index=%d backend=%s (device busy or locked)",
                 index, backend_name,
             )
-            return None
+            return None, "timeout"
         except Exception as exc:  # noqa: BLE001
             logger.debug("UVC probe failed index=%d: %s", index, exc)
-            return None
+            return None, "error"
+
+
+def _merge_windows_named_cameras(
+    found_by_index: dict[int, ConnectedCamera],
+    default_backend: int,
+    default_backend_name: str,
+) -> None:
+    """
+    Keep physical cameras visible even when OpenCV index probe fails.
+
+    Windows still knows 'USB2.0 HD UVC WebCam'; we expose it with a DirectShow
+    name path so Start preview can open it without a successful Refresh probe.
+    """
+    if sys.platform != "win32":
+        return
+    names = list_windows_capture_names()
+    if not names:
+        return
+
+    claimed_paths = {
+        c.open_path for c in found_by_index.values() if c.open_path
+    }
+    claimed_names = {c.name.lower() for c in found_by_index.values()}
+
+    for i, name in enumerate(names):
+        tag = classify_capture_name(name)
+        if tag == "virtual":
+            continue
+        path = f"video={name}"
+        if path in claimed_paths:
+            continue
+        if any(name.lower() in existing for existing in claimed_names):
+            continue
+        # Prefer the natural index when free; otherwise use a high synthetic index
+        # that still carries the open_path (FormattedUvcSource opens by name first).
+        index = i if i not in found_by_index else (100 + i)
+        if index in found_by_index:
+            continue
+        found_by_index[index] = ConnectedCamera(
+            cam_id=f"uvc:name:{name}:{default_backend_name}",
+            kind="uvc",
+            name=(
+                f"Elgato / capture card — {name}"
+                if tag == "elgato"
+                else f"{name} (Windows name — try if index probe missed it)"
+            ),
+            index=index if index < 100 else i,
+            backend=default_backend,
+            backend_name=default_backend_name,
+            open_path=path,
+            device_tag=tag,
+        )
+        claimed_paths.add(path)
+        claimed_names.add(name.lower())
+        logger.info("Added Windows-named UVC device missed by OpenCV probe: %s", name)
 
 
 def list_uvc_cameras(max_index: int = 6) -> list[ConnectedCamera]:
     """R1 — enumerate OpenCV/UVC devices (webcam, Elgato, virtual cam, …)."""
-    found: list[ConnectedCamera] = []
-    seen_indices: set[int] = set()
-    for backend, bname in _opencv_backends():
+    clear_name_cache()
+    found_by_index: dict[int, ConnectedCamera] = {}
+    timed_out: set[int] = set()
+    backends = _opencv_backends()
+    for backend, bname in backends:
         for i in range(max_index):
-            if i in seen_indices:
+            if i in found_by_index:
                 continue
-            cam = _probe_uvc_index_safe(i, backend, bname)
-            if cam is None:
+            # Built-in webcams are often slow/locked on first open after boot.
+            timeout_s = 4.0 if i == 0 else 2.5
+            cam, status = _probe_uvc_index_safe(i, backend, bname, timeout_s=timeout_s)
+            if cam is not None:
+                found_by_index[i] = cam
                 continue
-            seen_indices.add(i)
-            found.append(cam)
-        if found and sys.platform == "win32":
-            # Prefer first successful backend on Windows (matches POC-1 DSHOW-first).
-            break
-    return found
+            if status == "timeout":
+                timed_out.add(i)
+
+    # Timed-out indices still belong in the dropdown (usually the real webcam
+    # locked by Zoom/Teams/Camera while OBS Virtual Cam remains easy to open).
+    if timed_out and backends:
+        backend, bname = backends[0]
+        for i in sorted(timed_out):
+            if i in found_by_index:
+                continue
+            found_by_index[i] = _make_uvc_camera(
+                i, backend, bname, w=640, h=480, busy=True
+            )
+            logger.info(
+                "Keeping busy UVC index=%d in device list for manual Start preview",
+                i,
+            )
+
+    if backends:
+        _merge_windows_named_cameras(found_by_index, backends[0][0], backends[0][1])
+
+    return [found_by_index[i] for i in sorted(found_by_index)]
 
 
 def list_realsense_cameras() -> list[ConnectedCamera]:
@@ -189,6 +360,7 @@ def list_realsense_cameras() -> list[ConnectedCamera]:
                 kind="realsense",
                 name=label,
                 serial=serial,
+                device_tag="realsense",
             )
         )
     return out
@@ -204,8 +376,14 @@ def list_all_cameras(
     cams: list[ConnectedCamera] = []
     if probe_uvc:
         cams.extend(list_uvc_cameras())
+    rs_cams: list[ConnectedCamera] = []
     if probe_realsense:
-        cams.extend(list_realsense_cameras())
+        rs_cams = list_realsense_cameras()
+        cams.extend(rs_cams)
+    # When the RealSense SDK sees hardware, hide the OpenCV "UVC twin" entry so
+    # users pick the working [realsense] path instead of a black UVC stream.
+    if rs_cams:
+        cams = [c for c in cams if c.device_tag != "realsense-uvc"]
     if include_fake:
         cams.append(
             ConnectedCamera(
@@ -213,6 +391,7 @@ def list_all_cameras(
                 kind="fake",
                 name="Synthetic fake A (color bars)",
                 index=0,
+                device_tag="fake",
             )
         )
         cams.append(
@@ -221,6 +400,7 @@ def list_all_cameras(
                 kind="fake",
                 name="Synthetic fake B (color bars)",
                 index=1,
+                device_tag="fake",
             )
         )
     return cams
@@ -299,25 +479,61 @@ def list_realsense_modes(serial: Optional[str] = None) -> list[StreamMode]:
             StreamMode(1280, 720, 30, "bgr8"),
             StreamMode(640, 480, 30, "bgr8"),
         ]
-    modes.sort(key=lambda m: (m.width * m.height, m.fps), reverse=True)
+    # Prefer stable color profiles first. High-bandwidth / exotic formats often
+    # open but deliver black or stall on USB2 / busy hosts.
+    def mode_priority(mode: StreamMode) -> tuple[int, int, int, int]:
+        fmt_rank = {
+            "bgr8": 4,
+            "rgb8": 3,
+            "yuyv": 2,
+            "y8": 1,
+        }.get(mode.pixel_format, 0)
+        sweet = (
+            3
+            if (mode.width, mode.height, mode.fps) == (1280, 720, 30)
+            else 2
+            if (mode.width, mode.height, mode.fps) == (640, 480, 30)
+            else 1
+            if mode.fps <= 30 and mode.width * mode.height <= 1280 * 720
+            else 0
+        )
+        # Prefer modest bandwidth among equals (avoid sorting largest first).
+        pixels = mode.width * mode.height
+        return (fmt_rank, sweet, -pixels, -mode.fps)
+
+    modes.sort(key=mode_priority, reverse=True)
     return modes
 
 
 def list_uvc_modes(camera: ConnectedCamera) -> list[StreamMode]:
     """R2 — preset + lightly probed modes for a UVC device."""
-    # Prefer modest defaults first. Many UVC webcams cannot sustain FHD@120,
-    # and selecting that as the first option caused confusing recordings.
-    preferred = [
-        StreamMode(1280, 720, 30, "bgr8"),
-        StreamMode(640, 480, 30, "bgr8"),
-        StreamMode(1280, 720, 60, "bgr8"),
-        StreamMode(1920, 1080, 30, "bgr8"),
-        StreamMode(1920, 1080, 60, "bgr8"),
-        StreamMode(1920, 1080, 120, "bgr8"),
-        StreamMode(1280, 720, 30, "mjpg"),
-        StreamMode(1920, 1080, 30, "mjpg"),
-        StreamMode(1280, 720, 30, "yuyv"),
-    ]
+    # Capture cards (Elgato) usually need MJPG for high-res; webcams vary.
+    if camera.device_tag == "elgato":
+        preferred = [
+            StreamMode(1920, 1080, 60, "mjpg"),
+            StreamMode(1920, 1080, 30, "mjpg"),
+            StreamMode(1280, 720, 60, "mjpg"),
+            StreamMode(1280, 720, 30, "mjpg"),
+            StreamMode(1920, 1080, 60, "bgr8"),
+            StreamMode(1920, 1080, 30, "bgr8"),
+            StreamMode(1280, 720, 30, "bgr8"),
+            StreamMode(640, 480, 30, "bgr8"),
+            StreamMode(1920, 1080, 120, "mjpg"),
+        ]
+    else:
+        # Prefer modest defaults first. Many UVC webcams cannot sustain FHD@120,
+        # and selecting that as the first option caused confusing recordings.
+        preferred = [
+            StreamMode(1280, 720, 30, "bgr8"),
+            StreamMode(640, 480, 30, "bgr8"),
+            StreamMode(1280, 720, 60, "bgr8"),
+            StreamMode(1920, 1080, 30, "bgr8"),
+            StreamMode(1920, 1080, 60, "bgr8"),
+            StreamMode(1920, 1080, 120, "bgr8"),
+            StreamMode(1280, 720, 30, "mjpg"),
+            StreamMode(1920, 1080, 30, "mjpg"),
+            StreamMode(1280, 720, 30, "yuyv"),
+        ]
     modes = list(preferred)
     for w, h, fps, fmt in _UVC_PRESET_MODES:
         candidate = StreamMode(w, h, fps, fmt)
@@ -384,49 +600,171 @@ class FormattedUvcSource(CvCaptureSource):
         fps: int,
         backend,
         pixel_format: str = "bgr8",
+        open_path: Optional[str] = None,
+        device_tag: str = "uvc",
     ):
         safe_fps = fps if fps > 0 else 30
         super().__init__(device_index, width, height, safe_fps, backend=backend)
         self.pixel_format = pixel_format
+        self.open_path = open_path
+        self.device_tag = device_tag
+        self._pending_frame: Optional[np.ndarray] = None
+
+    def _open_capture(self) -> cv2.VideoCapture:
+        """Try DirectShow-by-name first on Windows, then index + backend fallbacks."""
+        attempts: list[tuple[Any, int]] = []
+        if self.open_path and sys.platform == "win32":
+            attempts.append((self.open_path, cv2.CAP_DSHOW))
+            attempts.append((self.open_path, cv2.CAP_MSMF))
+        # Extra named Elgato / webcam paths help when index mapping is ambiguous.
+        if sys.platform == "win32":
+            if self.device_tag == "elgato":
+                for path in dshow_open_paths_for_tag("elgato"):
+                    if path != self.open_path:
+                        attempts.append((path, cv2.CAP_DSHOW))
+            elif self.device_tag == "uvc":
+                for path in dshow_open_paths_for_tag("uvc"):
+                    if path != self.open_path:
+                        attempts.append((path, cv2.CAP_DSHOW))
+        attempts.append((self.device_index, self._backend))
+        if self._backend == cv2.CAP_DSHOW:
+            attempts.append((self.device_index, cv2.CAP_MSMF))
+        if self._backend != cv2.CAP_ANY:
+            attempts.append((self.device_index, cv2.CAP_ANY))
+
+        last_error = "unknown"
+        for target, backend in attempts:
+            try:
+                cap = cv2.VideoCapture(target, backend)
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+                continue
+            if cap.isOpened():
+                self._backend = backend
+                return cap
+            cap.release()
+            last_error = f"open failed target={target!r} backend={backend}"
+        raise RuntimeError(
+            f"Could not open UVC device index={self.device_index}"
+            + (f" path={self.open_path!r}" if self.open_path else "")
+            + f" ({last_error}). Close other camera apps and click Refresh."
+        )
+
+    def _configure_and_grab(
+        self,
+        cap: cv2.VideoCapture,
+        width: int,
+        height: int,
+        fps: int,
+        pixel_format: str,
+    ) -> Optional[np.ndarray]:
+        _apply_uvc_fourcc(cap, pixel_format)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        cap.set(cv2.CAP_PROP_FPS, fps)
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:  # noqa: BLE001
+            pass
+        # Warm up: capture cards often emit a few empty/black frames first.
+        frame = None
+        for _ in range(12):
+            ok, candidate = cap.read()
+            if ok and candidate is not None:
+                frame = candidate
+        return frame
 
     def start(self) -> None:
         with quiet_opencv():
-            self._cap = cv2.VideoCapture(self.device_index, self._backend)
-            if not self._cap.isOpened() and self._backend == cv2.CAP_DSHOW:
+            self._cap = self._open_capture()
+            if self.device_tag == "elgato":
+                attempts = [
+                    (self.width, self.height, self.target_fps, self.pixel_format),
+                    (self.width, self.height, self.target_fps, "mjpg"),
+                    (1920, 1080, 60, "mjpg"),
+                    (1920, 1080, 30, "mjpg"),
+                    (1280, 720, 60, "mjpg"),
+                    (1280, 720, 30, "mjpg"),
+                    (1280, 720, 30, "bgr8"),
+                    (640, 480, 30, "bgr8"),
+                ]
+            else:
+                attempts = [
+                    (self.width, self.height, self.target_fps, self.pixel_format),
+                    (self.width, self.height, self.target_fps, "mjpg"),
+                    (1280, 720, 30, "mjpg"),
+                    (1280, 720, 30, "bgr8"),
+                    (640, 480, 30, "bgr8"),
+                ]
+            # De-dupe while preserving order.
+            seen: set[tuple[int, int, int, str]] = set()
+            unique_attempts: list[tuple[int, int, int, str]] = []
+            for item in attempts:
+                if item not in seen:
+                    seen.add(item)
+                    unique_attempts.append(item)
+
+            first_frame = None
+            last_exc: Optional[Exception] = None
+            for width, height, fps, fmt in unique_attempts:
+                try:
+                    first_frame = self._configure_and_grab(
+                        self._cap, width, height, fps, fmt
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    first_frame = None
+                if first_frame is not None:
+                    self.width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
+                    self.height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
+                    reported_fps = float(self._cap.get(cv2.CAP_PROP_FPS) or 0)
+                    self.actual_fps = reported_fps if reported_fps > 0 else float(fps)
+                    self.actual_width = self.width
+                    self.actual_height = self.height
+                    self.target_fps = fps if fps > 0 else 30
+                    self.pixel_format = fmt
+                    self._pending_frame = np.ascontiguousarray(first_frame)
+                    break
+
+            if first_frame is None:
                 self._cap.release()
-                self._cap = cv2.VideoCapture(self.device_index, cv2.CAP_MSMF)
-                self._backend = cv2.CAP_MSMF
-            if not self._cap.isOpened() and self._backend != cv2.CAP_ANY:
-                self._cap.release()
-                self._cap = cv2.VideoCapture(self.device_index, cv2.CAP_ANY)
-                self._backend = cv2.CAP_ANY
-            if not self._cap.isOpened():
-                raise RuntimeError(
-                    f"Could not open UVC device index={self.device_index}"
+                self._cap = None
+                hint = (
+                    " For Elgato: connect HDMI source power ON, close the Elgato app,"
+                    " then Refresh and pick the Elgato entry."
+                    if self.device_tag == "elgato"
+                    else " Close other camera apps, reconnect USB, Refresh, and try again."
                 )
-            _apply_uvc_fourcc(self._cap, self.pixel_format)
-            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-            self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
-            try:
-                self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception:  # noqa: BLE001
-                pass
-            reported_fps = float(self._cap.get(cv2.CAP_PROP_FPS) or 0)
-            self.actual_fps = reported_fps if reported_fps > 0 else 0.0
-            self.actual_width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH) or self.width)
-            self.actual_height = int(
-                self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or self.height
+                detail = f" ({last_exc})" if last_exc else ""
+                raise RuntimeError(
+                    f"UVC device opened but delivered no frames{detail}.{hint}"
+                )
+
+        mean = float(np.mean(self._pending_frame)) if self._pending_frame is not None else 0.0
+        if mean < 2.0:
+            logger.warning(
+                "UVC preview frames are nearly black (mean=%.2f). "
+                "If this is a capture card, check HDMI signal / input source.",
+                mean,
             )
-            if self.actual_width > 0:
-                self.width = self.actual_width
-            if self.actual_height > 0:
-                self.height = self.actual_height
         logger.info(
-            "D1 UVC source: idx=%d %dx%d@%d fmt=%s (reports %.1ffps)",
-            self.device_index, self.width, self.height, self.target_fps,
-            self.pixel_format, self.actual_fps,
+            "D1 UVC source: idx=%d path=%s %dx%d@%d fmt=%s tag=%s (reports %.1ffps)",
+            self.device_index,
+            self.open_path or "-",
+            self.width,
+            self.height,
+            self.target_fps,
+            self.pixel_format,
+            self.device_tag,
+            self.actual_fps,
         )
+
+    def read(self) -> Optional[np.ndarray]:
+        if self._pending_frame is not None:
+            frame = self._pending_frame
+            self._pending_frame = None
+            return frame
+        return super().read()
 
 
 class ConfiguredRealSenseSource:
@@ -451,6 +789,7 @@ class ConfiguredRealSenseSource:
         self.bag_path: Optional[Any] = None
         self._bag_path: Optional[Any] = None
         self._pipeline: Optional[Any] = None
+        self._pending_frame: Optional[np.ndarray] = None
 
     @staticmethod
     def _rs_format(rs, name: str):
@@ -464,6 +803,49 @@ class ConfiguredRealSenseSource:
             raise ValueError(f"Unsupported RealSense color format: {name}")
         return formats[name]
 
+    def _require_device(self, rs) -> None:
+        devices = list(rs.context().query_devices())
+        if not devices:
+            raise RuntimeError(
+                "No RealSense device found by the Intel SDK (pyrealsense2). "
+                "Close Intel RealSense Viewer and any other app using the camera, "
+                "use a USB 3 port, then click Refresh. "
+                "Install the SDK extra with: uv sync --extra realsense"
+            )
+        if not self.serial:
+            self.serial = devices[0].get_info(rs.camera_info.serial_number)
+            return
+        serials = [d.get_info(rs.camera_info.serial_number) for d in devices]
+        if self.serial not in serials:
+            raise RuntimeError(
+                f"RealSense serial {self.serial} is not connected. "
+                f"Connected: {', '.join(serials) or '(none)'}. Click Refresh."
+            )
+
+    def _start_profile(
+        self,
+        rs,
+        width: int,
+        height: int,
+        fps: int,
+        pixel_format: str,
+    ):
+        pipeline = rs.pipeline()
+        config = rs.config()
+        if self.serial:
+            config.enable_device(self.serial)
+        config.enable_stream(
+            rs.stream.color,
+            width,
+            height,
+            self._rs_format(rs, pixel_format),
+            fps,
+        )
+        if self.bag_path:
+            config.enable_record_to_file(str(self.bag_path))
+        profile = pipeline.start(config)
+        return pipeline, profile
+
     def start(self) -> None:
         if not realsense_available():
             raise RuntimeError(
@@ -472,38 +854,81 @@ class ConfiguredRealSenseSource:
             )
         import pyrealsense2 as rs
 
-        pipeline = rs.pipeline()
-        config = rs.config()
-        if self.serial:
-            config.enable_device(self.serial)
-        rs_format = self._rs_format(rs, self.pixel_format)
-        config.enable_stream(
-            rs.stream.color,
-            self.width,
-            self.height,
-            rs_format,
-            self.target_fps,
-        )
-        if self.bag_path:
-            config.enable_record_to_file(str(self.bag_path))
-        try:
-            profile = pipeline.start(config)
-        except Exception as exc:
+        self._require_device(rs)
+
+        attempts = [
+            (self.width, self.height, self.target_fps, self.pixel_format),
+            (self.width, self.height, self.target_fps, "bgr8"),
+            (1280, 720, 30, "bgr8"),
+            (640, 480, 30, "bgr8"),
+            (848, 480, 30, "bgr8"),
+        ]
+        seen: set[tuple[int, int, int, str]] = set()
+        errors: list[str] = []
+        pipeline = None
+        profile = None
+        used = attempts[0]
+        for attempt in attempts:
+            if attempt in seen:
+                continue
+            seen.add(attempt)
+            width, height, fps, fmt = attempt
             try:
-                pipeline.stop()
-            except Exception:  # noqa: BLE001
-                pass
+                if pipeline is not None:
+                    try:
+                        pipeline.stop()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    pipeline = None
+                pipeline, profile = self._start_profile(rs, width, height, fps, fmt)
+                used = attempt
+                self.pixel_format = fmt
+                break
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{width}x{height}@{fps} {fmt}: {exc}")
+                pipeline = None
+                profile = None
+
+        if pipeline is None or profile is None:
             raise RuntimeError(
-                "RealSense rejected "
-                f"{self.width}x{self.height}@{self.target_fps} "
-                f"{self.pixel_format}: {exc}"
-            ) from exc
+                "RealSense rejected every color profile tried. "
+                "Close Intel RealSense Viewer, reconnect USB3, then Refresh. "
+                + " | ".join(errors[-3:])
+            )
 
         color = profile.get_stream(rs.stream.color).as_video_stream_profile()
         self.width = color.width()
         self.height = color.height()
         self.target_fps = int(color.fps())
         self._pipeline = pipeline
+
+        # Verify frames arrive. Swallowing this used to leave a LIVE black preview.
+        try:
+            first: Optional[np.ndarray] = None
+            for _ in range(8):
+                frames = pipeline.wait_for_frames(timeout_ms=3000)
+                color_frame = frames.get_color_frame()
+                if not color_frame:
+                    continue
+                first = self._convert_color(color_frame)
+                if first is not None and first.size:
+                    break
+            if first is None:
+                raise RuntimeError("SDK returned framesets without a usable color frame")
+            self._pending_frame = first
+            if float(np.mean(first)) < 1.5:
+                logger.warning(
+                    "RealSense first frames are nearly black — lens cap / AE settling?"
+                )
+        except Exception as exc:
+            self.stop()
+            raise RuntimeError(
+                "RealSense stream opened but no color frame arrived. "
+                "Close Intel RealSense Viewer and other camera apps, use USB 3, "
+                f"then try again (wanted {used[0]}x{used[1]}@{used[2]} {used[3]}). "
+                f"SDK error: {exc}"
+            ) from exc
+
         logger.info(
             "D1 RealSense: serial=%s %dx%d@%d fmt=%s bag=%s",
             self.serial,
@@ -521,17 +946,9 @@ class ConfiguredRealSenseSource:
             except Exception:  # noqa: BLE001
                 pass
             self._pipeline = None
+        self._pending_frame = None
 
-    def read(self) -> Optional[np.ndarray]:
-        if self._pipeline is None:
-            return None
-        try:
-            frames = self._pipeline.wait_for_frames(timeout_ms=1000)
-            color = frames.get_color_frame()
-        except Exception:  # noqa: BLE001
-            return None
-        if not color:
-            return None
+    def _convert_color(self, color: Any) -> np.ndarray:
         frame = np.asanyarray(color.get_data())
         if self.pixel_format == "rgb8":
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -541,18 +958,36 @@ class ConfiguredRealSenseSource:
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         return np.ascontiguousarray(frame)
 
+    def read(self) -> Optional[np.ndarray]:
+        if self._pending_frame is not None:
+            frame = self._pending_frame
+            self._pending_frame = None
+            return frame
+        if self._pipeline is None:
+            return None
+        try:
+            frames = self._pipeline.wait_for_frames(timeout_ms=1000)
+            color = frames.get_color_frame()
+        except Exception:  # noqa: BLE001
+            return None
+        if not color:
+            return None
+        return self._convert_color(color)
+
 
 def build_frame_source(
     camera: ConnectedCamera,
     mode: StreamMode,
     *,
-    allow_simulate_realsense: bool = True,
+    allow_simulate_realsense: bool = False,
 ):
     """
     Build a POC-1-compatible frame source for the given camera + mode.
 
     RealSense color streams that are not bgr8 are still opened as bgr8 when
     possible (OpenCV/pipeline expect BGR ndarrays); depth-only formats fall back.
+    Simulation is off by default so a listed RealSense never silently becomes
+    a fake source in the GUI.
     """
     if camera.kind == "fake":
         return FakeFrameSource(
@@ -560,7 +995,12 @@ def build_frame_source(
         )
 
     if camera.kind == "realsense":
-        if camera.serial and realsense_available():
+        if not realsense_available():
+            raise RuntimeError(
+                "RealSense selected but pyrealsense2 is not installed. "
+                "Run: uv sync --extra realsense"
+            )
+        if camera.serial:
             return ConfiguredRealSenseSource(
                 serial=camera.serial,
                 width=mode.width,
@@ -568,7 +1008,6 @@ def build_frame_source(
                 fps=mode.fps,
                 pixel_format=mode.pixel_format,
             )
-        # Kept for API/test callers that explicitly allow simulation.
         return create_realsense_source(
             width=mode.width,
             height=mode.height,
@@ -587,9 +1026,11 @@ def build_frame_source(
         fps=mode.fps,
         backend=backend,
         pixel_format=mode.pixel_format,
+        open_path=camera.open_path,
+        device_tag=camera.device_tag,
     )
-    # Keep mismatch detection enabled for every UVC device. A non-zero index
-    # may be Elgato, another webcam, or a virtual camera; index alone is not
-    # reliable enough to suppress actual-vs-configured FPS warnings.
-    src.allow_fps_remux = True
+    # Webcam/virtual: remux + preview-based stamp (drivers often lie about FPS).
+    # Elgato: keep the selected stamp when the card really delivers it (FHD@60/120);
+    # post-stop auto-remux still fixes playback if measured rate differs.
+    src.allow_fps_remux = camera.device_tag != "elgato"
     return src

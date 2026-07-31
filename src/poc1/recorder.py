@@ -122,8 +122,9 @@ class Recorder:
         self.measured_fps = measured
         self.container_fps = float(self.fps)
 
-        if not self.correct_container_fps:
-            return
+        # Always detect mismatch (webcam, Elgato, RealSense). Whether we auto-remux
+        # is decided by the GUI / allow_fps_remux — but players will play too fast
+        # if we never flag it.
         if abs(measured - self.fps) / max(self.fps, 1) < 0.10:
             return
 

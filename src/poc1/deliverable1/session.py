@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -50,16 +51,32 @@ class CameraSlot:
     status: str = "idle"
     record_bag: bool = False
     _frame_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _preview_ts: list[float] = field(default_factory=list, repr=False)
 
     def on_preview(self, env: FrameEnvelope) -> None:
         with self._frame_lock:
             self.last_frame = env.frame.copy() if env.frame is not None else None
+            now = time.time()
+            self._preview_ts.append(now)
+            if len(self._preview_ts) > 90:
+                self._preview_ts = self._preview_ts[-90:]
 
     def get_preview_frame(self):
         with self._frame_lock:
             if self.last_frame is None:
                 return None
             return self.last_frame.copy()
+
+    def estimate_preview_fps(self) -> Optional[float]:
+        """Recent live preview rate (informational only — never changes record stamp)."""
+        with self._frame_lock:
+            stamps = list(self._preview_ts)
+        if len(stamps) < 8:
+            return None
+        elapsed = stamps[-1] - stamps[0]
+        if elapsed <= 0.05:
+            return None
+        return (len(stamps) - 1) / elapsed
 
 
 class MultiCamSession:
@@ -82,7 +99,7 @@ class MultiCamSession:
         self.out_dir = Path(out_dir)
         self.devices: list[ConnectedCamera] = []
         self.slots: list[CameraSlot] = [
-            CameraSlot(slot_id=i, prefix=_default_prefix(i), armed=(i == 0))
+            CameraSlot(slot_id=i, prefix=_default_prefix(i), armed=True)
             for i in range(n_slots)
         ]
         self._recording = False
@@ -104,7 +121,7 @@ class MultiCamSession:
         slot = CameraSlot(
             slot_id=index,
             prefix=_default_prefix(index),
-            armed=False,
+            armed=True,
         )
         self.slots.append(slot)
         logger.info("D1 camera slot %d added", index + 1)
@@ -203,7 +220,10 @@ class MultiCamSession:
             raise RuntimeError(f"Slot {slot_id}: assign camera + mode first")
         if slot.pipeline is not None:
             return
-        source = build_frame_source(slot.camera, slot.mode)
+        # Never silently substitute a simulated RealSense for a hardware pick.
+        source = build_frame_source(
+            slot.camera, slot.mode, allow_simulate_realsense=False
+        )
         pipe = Pipeline(source=source, on_preview_frame=slot.on_preview)
         pipe.start_preview()
         slot.pipeline = pipe
