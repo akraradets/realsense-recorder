@@ -341,27 +341,67 @@ class MultiCamSession:
             return paths
 
     def stop_recording_armed(self) -> dict[str, dict]:
-        """Stop all armed recordings; return per-prefix reports."""
+        """
+        Stop all active recordings; return per-prefix reports.
+
+        Disables capture into the encode path first (so queues stop growing),
+        then finalizes each pipeline. The session lock is not held during
+        encoder shutdown so Stop cannot deadlock the UI / other session calls.
+        """
         with self._lock:
-            reports: dict[str, dict] = {}
-            for s in self.slots:
-                if s.pipeline is None:
-                    continue
-                if not s.pipeline.camera_handler.is_recording:
-                    continue
-                try:
-                    report = s.pipeline.stop_recording()
-                    s.last_report = report
-                    reports[s.prefix] = report
-                    drops = "OK" if report.get("no_frame_drops") else "DROPS"
-                    s.status = (
-                        f"stopped [{drops}] written={report.get('frames_written')}"
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    s.status = f"stop error: {exc}"
-                    reports[s.prefix] = {"error": str(exc)}
+            if not self._recording:
+                return {}
+            targets = [
+                s
+                for s in self.slots
+                if s.pipeline is not None and s.pipeline.camera_handler.is_recording
+            ]
+            # Flip the flag early so the GUI can treat recording as ending.
             self._recording = False
-            return reports
+
+        # Phase 1: stop feeding the encoder immediately (all cameras).
+        for s in targets:
+            try:
+                assert s.pipeline is not None
+                s.pipeline.camera_handler.disable_recording()
+                s.status = "stopping…"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("disable_recording failed for %s: %s", s.prefix, exc)
+
+        reports: dict[str, dict] = {}
+
+        def _stop_one(slot: CameraSlot) -> tuple[str, dict]:
+            try:
+                assert slot.pipeline is not None
+                report = slot.pipeline.stop_recording()
+                slot.last_report = report
+                drops = "OK" if report.get("no_frame_drops") else "DROPS"
+                slot.status = (
+                    f"stopped [{drops}] written={report.get('frames_written')}"
+                )
+                return slot.prefix, report
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("stop_recording failed for %s", slot.prefix)
+                slot.status = f"stop error: {exc}"
+                return slot.prefix, {"error": str(exc)}
+
+        # Phase 2: finalize writers (independent pipelines — parallel is fine).
+        if len(targets) <= 1:
+            for s in targets:
+                prefix, report = _stop_one(s)
+                reports[prefix] = report
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            with ThreadPoolExecutor(
+                max_workers=min(4, len(targets)), thread_name_prefix="d1-stop"
+            ) as pool:
+                futures = [pool.submit(_stop_one, s) for s in targets]
+                for fut in as_completed(futures):
+                    prefix, report = fut.result()
+                    reports[prefix] = report
+
+        return reports
 
     def shutdown(self) -> None:
         try:

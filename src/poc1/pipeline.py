@@ -172,20 +172,39 @@ class Pipeline:
 
     def stop_recording(self) -> dict:
         """Stop record path, keep preview alive if it was running."""
-        self.camera_handler.disable_recording()
-        self._bag_written = stop_bag_recording(self.source)
+        try:
+            self.camera_handler.disable_recording()
+        except Exception:  # noqa: BLE001
+            logger.exception("disable_recording failed")
+        try:
+            self._bag_written = stop_bag_recording(self.source)
+        except Exception:  # noqa: BLE001
+            logger.exception("stop_bag_recording failed")
+            self._bag_written = None
         if self.processor:
-            self.processor.stop()
+            try:
+                self.processor.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("processor.stop failed")
         if self.recorder:
-            self.recorder.stop()
+            try:
+                self.recorder.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("recorder.stop failed")
         if self.monitor:
-            self.monitor.stop()
+            try:
+                self.monitor.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("monitor.stop failed")
         report = self.report()
         self._last_report = report
         if self.output_path:
-            report_path = self.output_path.with_suffix(".report.json")
-            report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-            report["report_path"] = str(report_path)
+            try:
+                report_path = self.output_path.with_suffix(".report.json")
+                report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+                report["report_path"] = str(report_path)
+            except Exception:  # noqa: BLE001
+                logger.exception("could not write report json")
         logger.info("Recording stopped: %s", report)
         return report
 

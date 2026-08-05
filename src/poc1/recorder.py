@@ -103,7 +103,10 @@ class Recorder:
     def stop(self) -> None:
         self._running.clear()
         if self._thread:
-            self._thread.join(timeout=30.0)
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                logger.warning("recorder thread still alive after join timeout")
+            self._thread = None
         # Measure only — do not remux here (keeps Stop responsive; GUI may ask).
         self._measure_fps()
 

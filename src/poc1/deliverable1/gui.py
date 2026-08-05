@@ -15,6 +15,7 @@ from PIL import Image, ImageTk
 
 from poc1.deliverable1.devices import StreamMode
 from poc1.deliverable1.session import CameraSlot, MultiCamSession
+from poc1.deliverable2.review import show_review_prompt
 from poc1.quiet import configure_app_logging, silence_opencv
 
 configure_app_logging()
@@ -424,6 +425,7 @@ class Deliverable1App:
         )
         self.cards: list[CameraCard] = []
         self.busy = False
+        self._stopping = False
         self.last_reports: dict[str, dict] = {}
         self._closing = False
 
@@ -804,20 +806,38 @@ class Deliverable1App:
         self.set_status(f"RECORDING {len(paths)} camera(s): {names}")
 
     def stop_recording(self) -> None:
-        if self.busy or not self.session.is_recording:
+        if getattr(self, "_stopping", False):
             return
-        self._set_busy(True)
-        self.set_status("Stopping and finalizing recordings in background…")
+        if not self.session.is_recording:
+            if self.busy:
+                self._set_busy(False)
+            return
+        self._stopping = True
+        self._set_busy(True, recording=True)
+        self.set_status("Stopping and finalizing recordings…")
 
         def worker() -> None:
-            reports = self.session.stop_recording_armed()
-            self.root.after(0, lambda: self._record_stopped(reports))
+            reports: dict = {}
+            error: Optional[str] = None
+            try:
+                reports = self.session.stop_recording_armed()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("multi-camera record stop failed")
+                error = str(exc)
+            self.root.after(0, lambda: self._record_stopped(reports, error))
 
         threading.Thread(target=worker, name="d1-record-stop", daemon=True).start()
 
-    def _record_stopped(self, reports: dict[str, dict]) -> None:
+    def _record_stopped(
+        self, reports: dict[str, dict], error: Optional[str] = None
+    ) -> None:
+        self._stopping = False
         self.last_reports = reports
         self._set_busy(False)
+        if error:
+            self.set_status(f"Stop failed: {error}")
+            messagebox.showerror("Stop recording", error)
+            return
         valid = [r for r in reports.values() if "error" not in r]
         ok = bool(valid) and all(r.get("no_frame_drops") for r in valid)
         self.set_status(
@@ -873,6 +893,22 @@ class Deliverable1App:
                     "Recording fake@120 together with another live camera often "
                     "overloads MPEG-4 encode on one PC.",
                 )
+
+        # R8 — post-save review prompt (auto-dismisses in 5 seconds).
+        saved = []
+        for report in reports.values():
+            raw = report.get("output_path")
+            if not raw:
+                continue
+            path = Path(str(raw))
+            if path.is_file() and path.suffix.lower() in {".mp4", ".avi", ".mkv"}:
+                saved.append(path)
+        if saved:
+            show_review_prompt(
+                self.root,
+                saved,
+                on_review=self.review_recording,
+            )
 
     def _convert_mismatched_async(self, mismatched) -> None:
         self._set_busy(True)

@@ -130,6 +130,17 @@ class DropCountingQueue:
                 break
         self.reset_dropped()
 
+    def discard_all(self) -> int:
+        """Remove pending items without resetting drop counters. Returns count."""
+        n = 0
+        while True:
+            try:
+                self._q.get_nowait()
+                n += 1
+            except queue.Empty:
+                break
+        return n
+
 
 @dataclass
 class CameraHandler:

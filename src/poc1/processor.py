@@ -112,18 +112,35 @@ class Processor:
         self._thread.start()
 
     def stop(self) -> None:
+        """
+        Finalize the writer quickly.
+
+        After Stop we discard raw frames still waiting in the input queue.
+        Encoding that backlog on a slow mp4v path can take minutes and makes
+        Stop look frozen. Frames already encoded remain in the file.
+        """
         self._running.clear()
+        discarded = self.in_queue.discard_all()
+        if discarded:
+            logger.info(
+                "processor stop: discarded %d pending raw frame(s) for a fast Stop",
+                discarded,
+            )
         if self._thread:
-            # FHD@120 drain can take well over 30s on mp4v — never race _drain.
-            self._thread.join(timeout=300.0)
+            self._thread.join(timeout=15.0)
             if self._thread.is_alive():
                 logger.error("processor thread still alive after join timeout")
+                self.in_queue.discard_all()
+                self._thread.join(timeout=5.0)
             self._thread = None
         else:
-            self._drain()
+            self.in_queue.discard_all()
         with self._encode_lock:
             if self._writer is not None:
-                self._writer.release()
+                try:
+                    self._writer.release()
+                except Exception:  # noqa: BLE001
+                    logger.exception("VideoWriter.release failed")
                 self._writer = None
         if self._slow_encodes:
             logger.info(
@@ -171,7 +188,8 @@ class Processor:
             if env is None:
                 continue
             self._encode(env)
-        self._drain()
+        # Do not drain the backlog here — stop() discards pending frames so
+        # Stop stays responsive. Only frames encoded above are kept.
 
     def summary(self) -> dict:
         return {
