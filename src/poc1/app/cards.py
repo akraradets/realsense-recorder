@@ -132,7 +132,7 @@ class CameraCard(tk.Frame):
         # Honest copy: bag write only; .db3 is Library export/import.
         self.bag_check = tk.Checkbutton(
             form,
-            text="Also save RealSense .bag (not .db3)",
+            text="Also save RealSense .bag (with MP4)",
             variable=self.bag_var,
             command=self._sync_bag,
             bg=PANEL,
@@ -140,11 +140,12 @@ class CameraCard(tk.Frame):
             activebackground=PANEL,
             activeforeground=INK,
             selectcolor=ACCENT_SOFT,
+            font=("Segoe UI Semibold", 9),
         )
         self.bag_check.grid(row=3, column=1, columnspan=3, sticky="w", pady=(4, 0))
         tk.Label(
             form,
-            text=".db3 / .bd3: convert to MP4 in the Library tab (export).",
+            text="Pick a [realsense] device for .bag. .db3 is ROS2-only (Library export, not live record).",
             bg=PANEL,
             fg=MUTED,
             font=("Segoe UI", 8),

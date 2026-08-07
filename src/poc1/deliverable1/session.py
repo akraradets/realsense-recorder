@@ -300,12 +300,20 @@ class MultiCamSession:
                     mp4 = self.out_dir / f"{s.prefix}_{stamp}.mp4"
                     csv = self.out_dir / f"{s.prefix}_{stamp}_sysmon.csv"
                     bag = None
-                    if (
-                        s.record_bag
-                        and s.camera
-                        and s.camera.kind == "realsense"
-                        and getattr(s.pipeline.source, "mode", "") == "hardware"
-                    ):
+                    if s.record_bag:
+                        if not s.camera or s.camera.kind != "realsense":
+                            raise RuntimeError(
+                                f"Slot {s.slot_id + 1} ({s.prefix}): "
+                                "“Also save RealSense .bag” is checked but the device "
+                                "is not a RealSense SDK camera. Pick a [realsense] entry."
+                            )
+                        src = s.pipeline.source if s.pipeline else None
+                        if getattr(src, "mode", "") != "hardware":
+                            raise RuntimeError(
+                                f"Slot {s.slot_id + 1} ({s.prefix}): "
+                                "RealSense .bag needs a live hardware stream "
+                                "(simulation cannot write .bag)."
+                            )
                         bag = self.out_dir / f"{s.prefix}_{stamp}.bag"
                     assert s.pipeline is not None
                     try:
@@ -326,6 +334,8 @@ class MultiCamSession:
                             f"{s.pipeline.source.target_fps}: {exc}"
                         ) from exc
                     s.status = f"recording → {mp4.name}"
+                    if bag is not None:
+                        s.status += f" + {bag.name}"
                     paths.append(mp4)
                     started.append(s)
             except Exception:

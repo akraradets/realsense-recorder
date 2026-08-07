@@ -138,7 +138,16 @@ class Pipeline:
 
         # Optional RealSense .bag (hardware only). Restart SDK before arming MP4 path.
         if bag_path is not None:
-            start_bag_recording(self.source, bag_path)
+            ok = start_bag_recording(self.source, bag_path)
+            if not ok:
+                raise RuntimeError(
+                    f"Could not start RealSense .bag recording to {bag_path}. "
+                    "Use a [realsense] device (not a UVC twin), close RealSense Viewer, "
+                    "USB 3 port, and ensure: uv sync --extra realsense"
+                )
+            self._bag_path = bag_path
+        else:
+            self._bag_path = None
 
         # Compression lives in the processor; recorder only accounts encoded tokens.
         self.processor.configure_output(

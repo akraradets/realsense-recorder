@@ -96,7 +96,13 @@ class StreamMode:
             object.__setattr__(self, "pixel_format", "bgr8")
 
     def label(self) -> str:
-        return f"{self.width}x{self.height}@{self.fps} {self.pixel_format}"
+        # Make depth/high-FPS options obvious in the Setup dropdown.
+        kind = ""
+        if self.pixel_format == "z16":
+            kind = " depth"
+        elif self.pixel_format == "y8":
+            kind = " ir"
+        return f"{self.width}x{self.height}@{self.fps} {self.pixel_format}{kind}"
 
 
 def _opencv_backends() -> list[tuple[int, str]]:
@@ -423,11 +429,20 @@ def _rs_format_name(fmt: Any) -> str:
 
 
 def list_realsense_modes(serial: Optional[str] = None) -> list[StreamMode]:
-    """R2 — stream profiles advertised by a RealSense device (color preferred)."""
+    """
+    R2 — all video profiles the RealSense SDK advertises for this device.
+
+    Includes color (preferred for MP4) plus depth/IR so higher FPS options the
+    sensor supports (often on depth) appear in the configuration dropdown.
+    """
     if not realsense_available():
         return [
             StreamMode(1280, 720, 30, "bgr8"),
+            StreamMode(1280, 720, 60, "bgr8"),
             StreamMode(640, 480, 30, "bgr8"),
+            StreamMode(640, 480, 60, "bgr8"),
+            StreamMode(848, 480, 90, "z16"),
+            StreamMode(640, 480, 90, "z16"),
         ]
     import pyrealsense2 as rs
 
@@ -439,7 +454,18 @@ def list_realsense_modes(serial: Optional[str] = None) -> list[StreamMode]:
             device = dev
             break
     if device is None:
-        return [StreamMode(1280, 720, 30, "bgr8")]
+        logger.warning(
+            "list_realsense_modes: serial=%s not found — returning common presets",
+            serial,
+        )
+        return [
+            StreamMode(1280, 720, 30, "bgr8"),
+            StreamMode(1280, 720, 60, "bgr8"),
+            StreamMode(640, 480, 30, "bgr8"),
+            StreamMode(640, 480, 60, "bgr8"),
+            StreamMode(1920, 1080, 30, "bgr8"),
+            StreamMode(848, 480, 90, "z16"),
+        ]
 
     modes: list[StreamMode] = []
     seen: set[tuple[int, int, int, str]] = set()
@@ -447,6 +473,12 @@ def list_realsense_modes(serial: Optional[str] = None) -> list[StreamMode]:
         sensors = list(device.query_sensors())
     except Exception:  # noqa: BLE001
         sensors = []
+
+    allowed_streams = {
+        rs.stream.color,
+        rs.stream.depth,
+        rs.stream.infrared,
+    }
     for sensor in sensors:
         try:
             profiles = sensor.get_stream_profiles()
@@ -458,50 +490,79 @@ def list_realsense_modes(serial: Optional[str] = None) -> list[StreamMode]:
             except Exception:  # noqa: BLE001
                 continue
             try:
-                if vp.stream_type() != rs.stream.color:
-                    continue
+                st = vp.stream_type()
             except Exception:  # noqa: BLE001
                 continue
-            w, h, fps = vp.width(), vp.height(), int(vp.fps())
-            fmt = _rs_format_name(vp.format())
-            # Deliverable 1 can convert these color formats to the BGR ndarray
-            # expected by the shared processor/preview pipeline.
-            if fmt not in {"bgr8", "rgb8", "yuyv", "y8"}:
+            if st not in allowed_streams:
                 continue
+            try:
+                w, h = int(vp.width()), int(vp.height())
+                fps = int(round(float(vp.fps())))
+                fmt = _rs_format_name(vp.format())
+            except Exception:  # noqa: BLE001
+                continue
+            if fps <= 0 or w <= 0 or h <= 0:
+                continue
+
+            # Map stream+format to a pipeline pixel_format the GUI can open.
+            if st == rs.stream.color:
+                if fmt not in {"bgr8", "rgb8", "yuyv", "y8"}:
+                    continue
+            elif st == rs.stream.depth:
+                # Depth is recorded/previewed via colorizer → BGR for MP4.
+                fmt = "z16"
+            elif st == rs.stream.infrared:
+                if fmt not in {"y8", "y16"}:
+                    fmt = "y8"
+                else:
+                    fmt = "y8"
+            else:
+                continue
+
             key = (w, h, fps, fmt)
             if key in seen:
                 continue
             seen.add(key)
             modes.append(StreamMode(w, h, fps, fmt))
 
+    # Always offer common color presets so the dropdown is never "30-only"
+    # when the SDK probe is incomplete (USB2 / driver quirks).
+    for preset in (
+        StreamMode(1920, 1080, 30, "bgr8"),
+        StreamMode(1280, 720, 30, "bgr8"),
+        StreamMode(1280, 720, 60, "bgr8"),
+        StreamMode(848, 480, 60, "bgr8"),
+        StreamMode(848, 480, 30, "bgr8"),
+        StreamMode(640, 480, 30, "bgr8"),
+        StreamMode(640, 480, 60, "bgr8"),
+        StreamMode(640, 480, 90, "z16"),
+        StreamMode(848, 480, 90, "z16"),
+        StreamMode(1280, 720, 30, "z16"),
+    ):
+        key = (preset.width, preset.height, preset.fps, preset.pixel_format)
+        if key not in seen:
+            seen.add(key)
+            modes.append(preset)
+
     if not modes:
         modes = [
             StreamMode(1280, 720, 30, "bgr8"),
             StreamMode(640, 480, 30, "bgr8"),
         ]
-    # Prefer stable color profiles first. High-bandwidth / exotic formats often
-    # open but deliver black or stall on USB2 / busy hosts.
-    def mode_priority(mode: StreamMode) -> tuple[int, int, int, int]:
-        fmt_rank = {
-            "bgr8": 4,
-            "rgb8": 3,
-            "yuyv": 2,
-            "y8": 1,
-        }.get(mode.pixel_format, 0)
-        sweet = (
-            3
-            if (mode.width, mode.height, mode.fps) == (1280, 720, 30)
-            else 2
-            if (mode.width, mode.height, mode.fps) == (640, 480, 30)
-            else 1
-            if mode.fps <= 30 and mode.width * mode.height <= 1280 * 720
-            else 0
-        )
-        # Prefer modest bandwidth among equals (avoid sorting largest first).
-        pixels = mode.width * mode.height
-        return (fmt_rank, sweet, -pixels, -mode.fps)
 
-    modes.sort(key=mode_priority, reverse=True)
+    # Sort: color first, then by resolution, then FPS high→low so 60/90 are visible.
+    def mode_priority(mode: StreamMode) -> tuple:
+        is_color = 0 if mode.pixel_format in {"bgr8", "rgb8", "yuyv"} else 1
+        pixels = mode.width * mode.height
+        return (is_color, -pixels, -mode.fps, mode.pixel_format)
+
+    modes.sort(key=mode_priority)
+    logger.info(
+        "RealSense modes for sn=%s: %d profiles (fps set=%s)",
+        serial,
+        len(modes),
+        sorted({m.fps for m in modes}),
+    )
     return modes
 
 
@@ -768,7 +829,7 @@ class FormattedUvcSource(CvCaptureSource):
 
 
 class ConfiguredRealSenseSource:
-    """RealSense color source honoring the selected resolution/FPS/format."""
+    """RealSense color/depth source honoring selected resolution/FPS/format."""
 
     mode = "hardware"
     allow_fps_remux = False
@@ -790,6 +851,8 @@ class ConfiguredRealSenseSource:
         self._bag_path: Optional[Any] = None
         self._pipeline: Optional[Any] = None
         self._pending_frame: Optional[np.ndarray] = None
+        self._colorizer: Optional[Any] = None
+        self._wanted = (self.width, self.height, self.target_fps, self.pixel_format)
 
     @staticmethod
     def _rs_format(rs, name: str):
@@ -798,9 +861,10 @@ class ConfiguredRealSenseSource:
             "rgb8": rs.format.rgb8,
             "yuyv": rs.format.yuyv,
             "y8": rs.format.y8,
+            "z16": rs.format.z16,
         }
         if name not in formats:
-            raise ValueError(f"Unsupported RealSense color format: {name}")
+            raise ValueError(f"Unsupported RealSense format: {name}")
         return formats[name]
 
     def _require_device(self, rs) -> None:
@@ -834,13 +898,21 @@ class ConfiguredRealSenseSource:
         config = rs.config()
         if self.serial:
             config.enable_device(self.serial)
-        config.enable_stream(
-            rs.stream.color,
-            width,
-            height,
-            self._rs_format(rs, pixel_format),
-            fps,
-        )
+        fmt = pixel_format.lower()
+        if fmt == "z16":
+            config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+            self._colorizer = rs.colorizer()
+        elif fmt == "y8":
+            try:
+                config.enable_stream(rs.stream.infrared, width, height, rs.format.y8, fps)
+            except Exception:  # noqa: BLE001
+                config.enable_stream(rs.stream.color, width, height, rs.format.y8, fps)
+            self._colorizer = None
+        else:
+            config.enable_stream(
+                rs.stream.color, width, height, self._rs_format(rs, fmt), fps
+            )
+            self._colorizer = None
         if self.bag_path:
             config.enable_record_to_file(str(self.bag_path))
         profile = pipeline.start(config)
@@ -855,10 +927,20 @@ class ConfiguredRealSenseSource:
         import pyrealsense2 as rs
 
         self._require_device(rs)
-
+        wanted = (
+            self.width,
+            self.height,
+            self.target_fps if self.target_fps > 0 else 30,
+            self.pixel_format,
+        )
+        self._wanted = wanted
+        w, h, fps, fmt = wanted
         attempts = [
-            (self.width, self.height, self.target_fps, self.pixel_format),
-            (self.width, self.height, self.target_fps, "bgr8"),
+            (w, h, fps, fmt),
+            (w, h, fps, "bgr8") if fmt != "z16" else (w, h, fps, "z16"),
+            (w, h, fps, "yuyv") if fmt not in {"z16", "y8"} else (w, h, fps, fmt),
+            (1280, 720, fps, "bgr8") if fmt != "z16" else (848, 480, fps, "z16"),
+            (640, 480, fps, "bgr8") if fmt != "z16" else (640, 480, fps, "z16"),
             (1280, 720, 30, "bgr8"),
             (640, 480, 30, "bgr8"),
             (848, 480, 30, "bgr8"),
@@ -872,7 +954,7 @@ class ConfiguredRealSenseSource:
             if attempt in seen:
                 continue
             seen.add(attempt)
-            width, height, fps, fmt = attempt
+            width, height, try_fps, try_fmt = attempt
             try:
                 if pipeline is not None:
                     try:
@@ -880,41 +962,62 @@ class ConfiguredRealSenseSource:
                     except Exception:  # noqa: BLE001
                         pass
                     pipeline = None
-                pipeline, profile = self._start_profile(rs, width, height, fps, fmt)
+                pipeline, profile = self._start_profile(rs, width, height, try_fps, try_fmt)
                 used = attempt
-                self.pixel_format = fmt
+                self.pixel_format = try_fmt
                 break
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"{width}x{height}@{fps} {fmt}: {exc}")
+                errors.append(f"{width}x{height}@{try_fps} {try_fmt}: {exc}")
                 pipeline = None
                 profile = None
 
         if pipeline is None or profile is None:
             raise RuntimeError(
-                "RealSense rejected every color profile tried. "
+                "RealSense rejected every profile tried. "
                 "Close Intel RealSense Viewer, reconnect USB3, then Refresh. "
                 + " | ".join(errors[-3:])
             )
 
-        color = profile.get_stream(rs.stream.color).as_video_stream_profile()
-        self.width = color.width()
-        self.height = color.height()
-        self.target_fps = int(color.fps())
-        self._pipeline = pipeline
+        try:
+            if self.pixel_format == "z16":
+                stream = profile.get_stream(rs.stream.depth).as_video_stream_profile()
+            elif self.pixel_format == "y8":
+                try:
+                    stream = profile.get_stream(rs.stream.infrared).as_video_stream_profile()
+                except Exception:  # noqa: BLE001
+                    stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            else:
+                stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            self.width = stream.width()
+            self.height = stream.height()
+            self.target_fps = int(stream.fps())
+        except Exception as exc:  # noqa: BLE001
+            self.stop()
+            raise RuntimeError(f"Could not read RealSense stream profile: {exc}") from exc
 
-        # Verify frames arrive. Swallowing this used to leave a LIVE black preview.
+        if used != wanted:
+            logger.warning(
+                "RealSense opened %dx%d@%d %s instead of requested %dx%d@%d %s",
+                self.width,
+                self.height,
+                self.target_fps,
+                self.pixel_format,
+                wanted[0],
+                wanted[1],
+                wanted[2],
+                wanted[3],
+            )
+
+        self._pipeline = pipeline
         try:
             first: Optional[np.ndarray] = None
             for _ in range(8):
                 frames = pipeline.wait_for_frames(timeout_ms=3000)
-                color_frame = frames.get_color_frame()
-                if not color_frame:
-                    continue
-                first = self._convert_color(color_frame)
+                first = self._frames_to_bgr(frames)
                 if first is not None and first.size:
                     break
             if first is None:
-                raise RuntimeError("SDK returned framesets without a usable color frame")
+                raise RuntimeError("SDK returned framesets without a usable frame")
             self._pending_frame = first
             if float(np.mean(first)) < 1.5:
                 logger.warning(
@@ -923,9 +1026,9 @@ class ConfiguredRealSenseSource:
         except Exception as exc:
             self.stop()
             raise RuntimeError(
-                "RealSense stream opened but no color frame arrived. "
+                "RealSense stream opened but no frame arrived. "
                 "Close Intel RealSense Viewer and other camera apps, use USB 3, "
-                f"then try again (wanted {used[0]}x{used[1]}@{used[2]} {used[3]}). "
+                f"then try again (wanted {wanted[0]}x{wanted[1]}@{wanted[2]} {wanted[3]}). "
                 f"SDK error: {exc}"
             ) from exc
 
@@ -947,6 +1050,41 @@ class ConfiguredRealSenseSource:
                 pass
             self._pipeline = None
         self._pending_frame = None
+        self._colorizer = None
+
+    def _frames_to_bgr(self, frames: Any) -> Optional[np.ndarray]:
+        if self.pixel_format == "z16":
+            depth = frames.get_depth_frame()
+            if not depth:
+                return None
+            if self._colorizer is None:
+                import pyrealsense2 as rs
+
+                self._colorizer = rs.colorizer()
+            colorized = self._colorizer.colorize(depth)
+            frame = np.asanyarray(colorized.get_data())
+            if frame.ndim == 2:
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            elif frame.shape[2] == 3:
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            return np.ascontiguousarray(frame)
+
+        if self.pixel_format == "y8":
+            ir = frames.get_infrared_frame()
+            if ir:
+                frame = np.asanyarray(ir.get_data())
+                if frame.ndim == 2:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                return np.ascontiguousarray(frame)
+            color = frames.get_color_frame()
+            if not color:
+                return None
+            return self._convert_color(color)
+
+        color = frames.get_color_frame()
+        if not color:
+            return None
+        return self._convert_color(color)
 
     def _convert_color(self, color: Any) -> np.ndarray:
         frame = np.asanyarray(color.get_data())
@@ -967,12 +1105,10 @@ class ConfiguredRealSenseSource:
             return None
         try:
             frames = self._pipeline.wait_for_frames(timeout_ms=1000)
-            color = frames.get_color_frame()
         except Exception:  # noqa: BLE001
             return None
-        if not color:
-            return None
-        return self._convert_color(color)
+        return self._frames_to_bgr(frames)
+
 
 
 def build_frame_source(

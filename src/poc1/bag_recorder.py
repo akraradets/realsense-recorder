@@ -6,7 +6,8 @@ with ``config.enable_record_to_file(...)`` so the resulting ``.bag`` opens in
 Intel RealSense Viewer.
 
 If no device / simulation / SDK missing: skip .bag, keep the MP4 proof path.
-POC-1 does not fail when hardware is absent.
+POC-1 does not fail when hardware is absent — but Deliverable 1 raises when
+the user explicitly checked “Also save RealSense .bag”.
 """
 from __future__ import annotations
 
@@ -24,30 +25,50 @@ def can_record_bag(source: Any) -> bool:
 def start_bag_recording(source: Any, bag_path: Path) -> bool:
     """
     Restart a hardware RealSense pipeline with .bag recording enabled.
-    Call before enable_recording so color frames still feed the MP4 path.
+    Call before enable_recording so color/depth frames still feed the MP4 path.
+
+    Returns True only when the bag file path is armed on a live hardware stream.
     """
     if not can_record_bag(source):
-        logger.info(
-            "Skipping .bag (need RealSense hardware). MP4 path remains the POC-1 proof."
+        logger.warning(
+            "Skipping .bag (source mode=%r is not hardware RealSense).",
+            getattr(source, "mode", None),
         )
         return False
     try:
         import pyrealsense2 as rs  # noqa: F401
     except ImportError:
-        logger.info("pyrealsense2 not installed — skip .bag")
+        logger.warning("pyrealsense2 is not installed — cannot write .bag")
         return False
 
     bag_path = Path(bag_path)
     bag_path.parent.mkdir(parents=True, exist_ok=True)
+    # Remove a stale zero-byte file from a previous failed attempt.
+    if bag_path.exists() and bag_path.stat().st_size == 0:
+        bag_path.unlink(missing_ok=True)
+
     try:
         source.stop()
         source.bag_path = bag_path
-        source.start()
         source._bag_path = bag_path
-        logger.info("RealSense .bag recording armed -> %s", bag_path)
+        source.start()
+        # RealSense usually creates the bag immediately when recording starts.
+        if not bag_path.exists():
+            # Some SDK builds create the file slightly later — touch a marker by
+            # reading one frame so the recorder is active.
+            try:
+                _ = source.read()
+            except Exception:  # noqa: BLE001
+                pass
+        logger.info(
+            "RealSense .bag recording armed -> %s (exists=%s size=%s)",
+            bag_path,
+            bag_path.exists(),
+            bag_path.stat().st_size if bag_path.exists() else 0,
+        )
         return True
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not arm .bag recording: %s (MP4 continues)", exc)
+        logger.warning("Could not arm .bag recording: %s (MP4 may continue)", exc)
         try:
             source.bag_path = None
             source._bag_path = None
@@ -66,7 +87,8 @@ def stop_bag_recording(source: Any) -> Optional[Path]:
     if not path or not can_record_bag(source):
         if hasattr(source, "bag_path"):
             source.bag_path = None
-        source._bag_path = None
+        if hasattr(source, "_bag_path"):
+            source._bag_path = None
         return None
 
     try:
@@ -84,5 +106,8 @@ def stop_bag_recording(source: Any) -> Optional[Path]:
     if p.exists() and p.stat().st_size > 0:
         logger.info("RealSense .bag saved: %s (%d bytes)", p, p.stat().st_size)
         return p
-    logger.info("No .bag file produced — check RealSense Viewer / device support")
+    logger.warning(
+        "No .bag file produced at %s — check USB3 / close RealSense Viewer / device support",
+        p,
+    )
     return None

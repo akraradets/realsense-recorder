@@ -75,7 +75,52 @@ def test_export_bd3_unreadable_gives_clear_error(tmp_path: Path):
     junk.write_bytes(b"not a video container")
     result = export_to_mp4(junk, codec="h264")
     assert not result.ok
-    assert "Could not convert" in result.message or "could not" in result.message.lower()
+    assert "Could not convert" in result.message or "failed" in result.message.lower()
+
+
+def test_export_rosbag2_db3_to_mp4(tmp_path: Path):
+    """R10: ROS2 .db3 with Image topic exports to a playable MP4."""
+    pytest.importorskip("rosbags")
+    pytest.importorskip("rosbags.image")
+    from rosbags.rosbag2 import Writer
+    from rosbags.typesys import Stores, get_typestore
+    from rosbags.typesys.stores.latest import builtin_interfaces__msg__Time as Time
+    from rosbags.typesys.stores.latest import sensor_msgs__msg__Image as Image
+    from rosbags.typesys.stores.latest import std_msgs__msg__Header as Header
+
+    typestore = get_typestore(Stores.LATEST)
+    bag_dir = tmp_path / "sample_bag"
+    with Writer(bag_dir, version=9) as writer:
+        conn = writer.add_connection(
+            "/camera/color/image_raw", Image.__msgtype__, typestore=typestore
+        )
+        for i in range(10):
+            img = np.zeros((48, 64, 3), dtype=np.uint8)
+            img[:, :] = (i * 20 % 255, 40, 90)
+            msg = Image(
+                header=Header(
+                    stamp=Time(sec=0, nanosec=i * 50_000_000),
+                    frame_id="cam",
+                ),
+                height=48,
+                width=64,
+                encoding="bgr8",
+                is_bigendian=0,
+                step=64 * 3,
+                data=np.frombuffer(img.tobytes(), dtype=np.uint8),
+            )
+            writer.write(
+                conn,
+                i * 50_000_000,
+                typestore.serialize_cdr(msg, Image.__msgtype__),
+            )
+
+    db3 = next(bag_dir.glob("*.db3"))
+    out = tmp_path / "from_db3.mp4"
+    result = export_to_mp4(db3, out, codec="h264")
+    assert result.ok, result.message
+    assert out.is_file() and out.stat().st_size > 32
+    assert result.frames >= 1
 
 
 def test_show_review_prompt_behavior():

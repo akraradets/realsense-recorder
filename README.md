@@ -218,7 +218,8 @@ uv run poc1
 | **Library** | Browse / play takes; export `.bag` / `.bd3` / `.db3` → MP4 |
 
 After Stop: a short “Review footage?” popup (5s) can open the take in **Library**.  
-`.bag` can be written while recording RealSense; `.db3` is **import/export only** (not recorded natively).
+`.bag` can be written while recording RealSense; `.db3` is **import/export only**
+(not recorded natively) — Library Export converts ROS2 bags with image topics to MP4 via `rosbags`.
 
 Legacy separate UIs still work (`poc1-d1`, `poc1-d2`, `poc1-gui`) if you need them.
 
@@ -289,8 +290,9 @@ uv run python -m poc1.deliverable2.gui --folder ./recordings/deliverable1
 ```
 
 **R10 notes:** `.bag` uses the RealSense SDK (`pyrealsense2`). `.bd3` / `.db3`
-try OpenCV, then ffmpeg on PATH, then a misnamed-bag attempt. ROS2 topic bags
-need `rosbag2` (not bundled) — the UI shows a clear error in that case.
+(ROS 2) convert via pure-Python **rosbags** + **rosbags-image** when the bag
+contains `sensor_msgs/Image` or `CompressedImage` topics — then Library can
+play the resulting MP4. Fallbacks: OpenCV, ffmpeg, misnamed-bag try.
 
 
 

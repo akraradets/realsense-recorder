@@ -2,8 +2,8 @@
 R10 — export .bag / .bd3 / .db3 to MP4 (H.264 or H.265 when available).
 
 .bag  → Intel RealSense SDK playback (color preferred, else colorized depth)
-.bd3 / .db3 → OpenCV decode if the file is video-like; else ffmpeg remux/transcode
-              when ffmpeg is on PATH; clear error otherwise
+.bd3 / .db3 → ROS 2 bags via pure-Python ``rosbags`` (+ ``rosbags-image``);
+              fallbacks: OpenCV, ffmpeg, misnamed RealSense bag
 """
 from __future__ import annotations
 
@@ -24,6 +24,13 @@ from poc1.device_enum import quiet_opencv
 logger = logging.getLogger("poc1.d2.export")
 
 ProgressCb = Optional[Callable[[str], None]]
+
+_IMAGE_MSG_TYPES = {
+    "sensor_msgs/msg/Image",
+    "sensor_msgs/Image",
+    "sensor_msgs/msg/CompressedImage",
+    "sensor_msgs/CompressedImage",
+}
 
 
 @dataclass
@@ -324,13 +331,13 @@ def _export_via_ffmpeg(
     label: str,
     progress: Callable[[str], None],
 ) -> ExportResult:
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = _find_ffmpeg()
     if not ffmpeg:
         return ExportResult(
             False,
             None,
             label,
-            message="ffmpeg not found on PATH",
+            message="ffmpeg not found on PATH (install ffmpeg or add it to PATH)",
         )
     vcodec = "libx265" if codec.lower() in {"h265", "hevc", "h.265"} else "libx264"
     progress(f"ffmpeg {vcodec}: {source.name} → {output.name}")
@@ -364,6 +371,311 @@ def _export_via_ffmpeg(
     )
 
 
+def _find_ffmpeg() -> Optional[str]:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        return ffmpeg
+    # Common Windows install locations when ffmpeg is not on PATH.
+    candidates = [
+        Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
+        Path(r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"),
+        Path.home() / "scoop" / "apps" / "ffmpeg" / "current" / "ffmpeg.exe",
+        Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Links" / "ffmpeg.exe",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return str(path)
+    return None
+
+
+def _looks_like_ros2_db3(source: Path) -> bool:
+    """Best-effort detect ROS2 sqlite3 bag without requiring rosbag2."""
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+        try:
+            cur = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' LIMIT 20"
+            )
+            tables = {row[0] for row in cur.fetchall()}
+        finally:
+            conn.close()
+        return bool({"topics", "messages", "schema"} & tables) or "topics" in tables
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _resolve_rosbag_dir(source: Path) -> tuple[Path, Optional[tempfile.TemporaryDirectory]]:
+    """
+    Return a directory path AnyReader can open.
+
+    ROS2 bags are usually a folder (metadata.yaml + *.db3). If the user selected
+    a lone .db3, build a temporary bag folder with a minimal metadata.yaml.
+    """
+    source = Path(source)
+    if source.is_dir():
+        return source, None
+
+    meta = source.parent / "metadata.yaml"
+    if meta.is_file():
+        return source.parent, None
+
+    # Sibling folder with the same stem (common layout).
+    sibling = source.parent / source.stem
+    if sibling.is_dir() and (sibling / "metadata.yaml").is_file():
+        return sibling, None
+
+    tmp = tempfile.TemporaryDirectory(
+        prefix="poc1_rosbag_", ignore_cleanup_errors=True
+    )
+    bag_dir = Path(tmp.name)
+    db_name = source.name
+    shutil.copy2(source, bag_dir / db_name)
+    # Minimal metadata so rosbags can open sqlite3 storage; topic list is
+    # discovered from the database by the reader.
+    (bag_dir / "metadata.yaml").write_text(
+        "\n".join(
+            [
+                "rosbag2_bagfile_information:",
+                "  version: 5",
+                "  storage_identifier: sqlite3",
+                "  duration:",
+                "    nanoseconds: 0",
+                "  starting_time:",
+                "    nanoseconds_since_epoch: 0",
+                "  message_count: 0",
+                "  topics_with_message_count: []",
+                "  compression_format: ''",
+                "  compression_mode: ''",
+                "  relative_file_paths:",
+                f"    - {db_name}",
+                "  files:",
+                f"    - path: {db_name}",
+                "      starting_time:",
+                "        nanoseconds_since_epoch: 0",
+                "      duration:",
+                "        nanoseconds: 0",
+                "      message_count: 0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return bag_dir, tmp
+
+
+def _pick_image_connections(connections) -> list:
+    """Prefer color/image topics; fall back to any Image / CompressedImage."""
+    image_conns = [
+        c
+        for c in connections
+        if getattr(c, "msgtype", "") in _IMAGE_MSG_TYPES
+        or str(getattr(c, "msgtype", "")).endswith("/Image")
+        or str(getattr(c, "msgtype", "")).endswith("/CompressedImage")
+    ]
+    if not image_conns:
+        return []
+
+    def score(conn) -> tuple:
+        topic = (conn.topic or "").lower()
+        msg = (conn.msgtype or "").lower()
+        prefer = 0
+        if "compressed" in msg:
+            prefer += 1
+        if any(k in topic for k in ("color", "rgb", "image_raw", "bgr", "camera")):
+            prefer += 3
+        if "depth" in topic or "infra" in topic:
+            prefer -= 2
+        return (prefer, -len(topic))
+
+    image_conns.sort(key=score, reverse=True)
+    return image_conns
+
+
+def _export_rosbag2_to_mp4(
+    source: Path,
+    output: Path,
+    fourcc: str,
+    label: str,
+    progress: Callable[[str], None],
+) -> ExportResult:
+    """Convert ROS2 .db3/.bd3 (or bag folder) to MP4 using pure-Python rosbags."""
+    try:
+        from rosbags.highlevel import AnyReader
+        from rosbags.image import message_to_cvimage
+    except ImportError:
+        return ExportResult(
+            False,
+            None,
+            label,
+            message=(
+                "ROS bag support needs packages: rosbags + rosbags-image. "
+                "Run: uv sync"
+            ),
+        )
+
+    # Skip obvious non-sqlite junk before creating temp bag folders.
+    if source.is_file() and not _looks_like_ros2_db3(source):
+        return ExportResult(
+            False,
+            None,
+            label,
+            message=f"{source.name} is not a ROS 2 sqlite bag (.db3)",
+        )
+
+    bag_dir, tmp_holder = _resolve_rosbag_dir(source)
+    try:
+        progress(f"Opening ROS bag: {source.name}")
+        with AnyReader([bag_dir]) as reader:
+            image_conns = _pick_image_connections(reader.connections)
+            if not image_conns:
+                topics = ", ".join(
+                    f"{c.topic} ({c.msgtype})" for c in list(reader.connections)[:12]
+                ) or "(none)"
+                return ExportResult(
+                    False,
+                    None,
+                    label,
+                    message=(
+                        f"No image topics in {source.name}.\n"
+                        f"Topics found: {topics}\n"
+                        "Need sensor_msgs/Image or CompressedImage to make an MP4."
+                    ),
+                )
+
+            # Use the best-scoring image topic.
+            chosen = image_conns[0]
+            progress(f"Exporting topic {chosen.topic} ({chosen.msgtype})")
+
+            writer: Optional[cv2.VideoWriter] = None
+            used_fourcc = fourcc
+            frames_written = 0
+            width = height = 0
+            stamps: list[int] = []
+            connections = [chosen]
+
+            for connection, timestamp, rawdata in reader.messages(
+                connections=connections
+            ):
+                try:
+                    msg = reader.deserialize(rawdata, connection.msgtype)
+                    frame = message_to_cvimage(msg, "bgr8")
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("skip frame at %s: %s", timestamp, exc)
+                    continue
+                if frame is None or not hasattr(frame, "shape"):
+                    continue
+                if frame.ndim == 2:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                elif frame.shape[2] == 4:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+                h, w = frame.shape[:2]
+                stamps.append(int(timestamp))
+                if writer is None:
+                    width, height = w, h
+                    # Estimate FPS from first few stamps later; start with 30.
+                    writer, used_fourcc = _open_writer(output, fourcc, 30.0, w, h)
+                    if writer is None:
+                        return ExportResult(
+                            False,
+                            None,
+                            label,
+                            message=f"VideoWriter failed for {fourcc}/{w}x{h}",
+                        )
+                if (w, h) != (width, height):
+                    frame = cv2.resize(frame, (width, height))
+                writer.write(np.ascontiguousarray(frame))
+                frames_written += 1
+                if frames_written % 60 == 0:
+                    progress(f"Exported {frames_written} frames from ROS bag…")
+
+            if writer is not None:
+                writer.release()
+
+            if frames_written <= 0:
+                output.unlink(missing_ok=True)
+                return ExportResult(
+                    False,
+                    None,
+                    label,
+                    message=(
+                        f"Topic {chosen.topic} had no decodable image frames."
+                    ),
+                )
+
+            # Re-stamp container FPS from message timestamps when possible.
+            fps = 30.0
+            if len(stamps) >= 2:
+                elapsed_ns = stamps[-1] - stamps[0]
+                if elapsed_ns > 0:
+                    fps = (len(stamps) - 1) / (elapsed_ns / 1e9)
+                    fps = float(min(max(fps, 1.0), 120.0))
+            if abs(fps - 30.0) > 0.5:
+                progress(f"Adjusting container FPS to ~{fps:.1f}")
+                tmp_out = output.with_suffix(".retimed.mp4")
+                if _rewrite_mp4_fps(output, tmp_out, fps, used_fourcc):
+                    tmp_out.replace(output)
+                else:
+                    tmp_out.unlink(missing_ok=True)
+
+            final_label = (
+                label if used_fourcc == fourcc else f"{label} -> {used_fourcc}"
+            )
+            return ExportResult(
+                True,
+                output,
+                f"{final_label} via rosbags/{chosen.topic}",
+                frames=frames_written,
+                message=(
+                    f"Wrote {frames_written} frames from {chosen.topic} -> {output.name}"
+                ),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("rosbag export failed")
+        output.unlink(missing_ok=True)
+        return ExportResult(
+            False,
+            None,
+            label,
+            message=f"ROS bag export failed: {exc}",
+        )
+    finally:
+        if tmp_holder is not None:
+            try:
+                tmp_holder.cleanup()
+            except OSError:
+                pass
+
+
+def _rewrite_mp4_fps(
+    source: Path, dest: Path, fps: float, fourcc: str
+) -> bool:
+    """Copy frames into a new MP4 stamped with the given FPS."""
+    with quiet_opencv():
+        cap = cv2.VideoCapture(str(source))
+    if not cap.isOpened():
+        cap.release()
+        return False
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    writer, _used = _open_writer(dest, fourcc, fps, max(width, 1), max(height, 1))
+    if writer is None:
+        cap.release()
+        return False
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            writer.write(frame)
+    finally:
+        cap.release()
+        writer.release()
+    return dest.is_file() and dest.stat().st_size > 32
+
+
 def _export_bd3_or_db3(
     source: Path,
     output: Path,
@@ -374,8 +686,13 @@ def _export_bd3_or_db3(
     """
     .bd3 / .db3 may be ROS2 sqlite bags or misc containers.
 
-    Try OpenCV → ffmpeg → explicit failure (ROS topic extraction needs rosbag2).
+    Prefer pure-Python rosbags image export, then OpenCV → ffmpeg →
+    misnamed RealSense bag.
     """
+    ros_try = _export_rosbag2_to_mp4(source, output, fourcc, label, progress)
+    if ros_try.ok:
+        return ros_try
+
     result = _export_via_opencv(source, output, fourcc, label, progress)
     if result.ok:
         return result
@@ -385,7 +702,6 @@ def _export_bd3_or_db3(
     if ff.ok:
         return ff
 
-    # Misnamed RealSense bag: copy with .bag extension and try the SDK path.
     with tempfile.TemporaryDirectory() as tmp:
         renamed = Path(tmp) / f"{source.stem}.bag"
         try:
@@ -397,14 +713,25 @@ def _export_bd3_or_db3(
         except Exception as exc:  # noqa: BLE001
             bag_msg = str(exc)
 
-    return ExportResult(
-        False,
-        None,
-        label,
-        message=(
-            f"Could not convert {source.name}.\n"
-            "Supported: playable video, RealSense .bag (SDK), or ffmpeg on PATH.\n"
-            "ROS2 topic .db3/.bd3 needs rosbag2 (not bundled).\n"
-            f"OpenCV: {result.message}\nffmpeg: {ff.message}\nbag-try: {bag_msg}"
-        ),
+    ros2 = _looks_like_ros2_db3(source)
+    guidance = (
+        f"Could not convert {source.name} to MP4.\n\n"
+        f"ROS bag path: {ros_try.message}\n\n"
+        "Tips:\n"
+        "  • Run: uv sync   (installs rosbags + rosbags-image)\n"
+        "  • Bag must contain sensor_msgs/Image or CompressedImage\n"
+        "  • If the bag is a folder, Export that folder’s .db3 or keep metadata.yaml beside it\n\n"
+        f"OpenCV: {result.message}\n"
+        f"ffmpeg: {ff.message}\n"
+        f"bag-try: {bag_msg}"
     )
+    if not ros2 and "No image topics" not in ros_try.message:
+        guidance = (
+            f"Could not convert {source.name} to MP4.\n\n"
+            f"ROS bag path: {ros_try.message}\n"
+            f"OpenCV: {result.message}\n"
+            f"ffmpeg: {ff.message}\n"
+            f"bag-try: {bag_msg}"
+        )
+
+    return ExportResult(False, None, label, message=guidance)

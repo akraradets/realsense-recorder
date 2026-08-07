@@ -11,6 +11,8 @@ dependencies = [
     "psutil>=5.9.0",
     "pillow>=10.0.0",
     "matplotlib>=3.10.9",
+    "rosbags>=0.10.0",
+    "rosbags-image>=0.10.0",
 ]
 
 [project.optional-dependencies]
