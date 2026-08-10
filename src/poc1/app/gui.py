@@ -540,20 +540,16 @@ class UnifiedApp:
             messagebox.showerror("Recording", str(exc))
             return
 
-        armed = [s for s in self.session.slots if s.armed and s.pipeline]
+        armed = [s for s in self.session.slots if s.armed]
         heavy = [
             s
             for s in armed
             if s.mode and s.mode.width * s.mode.height * s.mode.fps >= 1920 * 1080 * 60
         ]
         if len(armed) >= 2 and heavy:
-            if not messagebox.askyesno(
-                "High-rate recording",
-                "You’re recording multiple high-rate cameras together.\n\n"
-                "Playback speed stays as configured unless you choose to fix it later.\n"
-                "Continue?",
-            ):
-                return
+            self.set_status(
+                "High-rate multi-cam — recording at configured FPS (encoder may drop if overloaded)."
+            )
 
         self._set_busy(True)
         self.set_status("Starting recording…")
@@ -580,6 +576,12 @@ class UnifiedApp:
         self.record_tip.set(f"Recording {len(paths)} camera(s)…")
         self.set_status("Recording — press Stop when finished.")
         self.notebook.select(self.record_page)
+        warnings = list(getattr(self.session, "last_start_warnings", []) or [])
+        if warnings:
+            messagebox.showwarning(
+                "RealSense .bag skipped",
+                "MP4 recording started.\n\n" + "\n\n".join(warnings),
+            )
 
     def stop_recording(self) -> None:
         # Always allow Stop while a take is active — even if busy from a

@@ -129,25 +129,21 @@ class Pipeline:
             self.start_preview()
         self.output_path = output_path
         self.monitor_csv = monitor_csv
-        self._bag_path = bag_path
+        self._bag_path = None
         self._bag_written = None
 
         # Fresh queues so a previous take cannot leak frames into this one.
         self.camera_handler.processor_queue.clear()
         self.processor.out_queue.clear()
 
-        # Optional RealSense .bag (hardware only). Restart SDK before arming MP4 path.
+        # When .bag is requested it is required: arm or raise (no soft-skip).
         if bag_path is not None:
-            ok = start_bag_recording(self.source, bag_path)
-            if not ok:
-                raise RuntimeError(
-                    f"Could not start RealSense .bag recording to {bag_path}. "
-                    "Use a [realsense] device (not a UVC twin), close RealSense Viewer, "
-                    "USB 3 port, and ensure: uv sync --extra realsense"
-                )
-            self._bag_path = bag_path
-        else:
-            self._bag_path = None
+            self.camera_handler.pause_reads()
+            try:
+                active = start_bag_recording(self.source, bag_path)
+                self._bag_path = Path(active)
+            finally:
+                self.camera_handler.resume_reads()
 
         # Compression lives in the processor; recorder only accounts encoded tokens.
         self.processor.configure_output(
@@ -175,21 +171,38 @@ class Pipeline:
         self.monitor.start()
         self.camera_handler.enable_recording()
         logger.info(
-            "Recording started -> %s (compression=%s)",
-            output_path, self.processor.codec_label,
+            "Recording started -> %s (compression=%s bag=%s)",
+            output_path,
+            self.processor.codec_label,
+            bool(self._bag_path),
         )
 
     def stop_recording(self) -> dict:
         """Stop record path, keep preview alive if it was running."""
+        expected_bag = None
+        if self._bag_path is not None:
+            expected_bag = (
+                getattr(self.source, "_bag_final_path", None)
+                or getattr(self.source, "_bag_path", None)
+                or self._bag_path
+            )
         try:
             self.camera_handler.disable_recording()
         except Exception:  # noqa: BLE001
             logger.exception("disable_recording failed")
         try:
-            self._bag_written = stop_bag_recording(self.source)
+            self.camera_handler.pause_reads()
+            try:
+                self._bag_written = stop_bag_recording(self.source)
+            finally:
+                self.camera_handler.resume_reads()
         except Exception:  # noqa: BLE001
             logger.exception("stop_bag_recording failed")
             self._bag_written = None
+            try:
+                self.camera_handler.resume_reads()
+            except Exception:  # noqa: BLE001
+                pass
         if self.processor:
             try:
                 self.processor.stop()
@@ -215,6 +228,13 @@ class Pipeline:
             except Exception:  # noqa: BLE001
                 logger.exception("could not write report json")
         logger.info("Recording stopped: %s", report)
+        if expected_bag is not None and not self._bag_written:
+            raise RuntimeError(
+                f"MP4 was saved, but RealSense .bag was not "
+                f"(expected {Path(expected_bag).name}). "
+                "Close RealSense Viewer, use USB 3, Start preview with .bag checked, "
+                "then Record again."
+            )
         return report
 
     def stop(self) -> dict:

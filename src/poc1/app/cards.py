@@ -145,7 +145,8 @@ class CameraCard(tk.Frame):
         self.bag_check.grid(row=3, column=1, columnspan=3, sticky="w", pady=(4, 0))
         tk.Label(
             form,
-            text="Pick a [realsense] device for .bag. .db3 is ROS2-only (Library export, not live record).",
+            text="With this checked, Record writes MP4 and .bag together (RealSense only). "
+            "Start preview after checking so .bag can pre-arm.",
             bg=PANEL,
             fg=MUTED,
             font=("Segoe UI", 8),
@@ -193,6 +194,7 @@ class CameraCard(tk.Frame):
         if slot.camera:
             self.device_var.set(slot.camera.label())
             self._load_modes(slot)
+            self._refresh_bag_enabled()
             return
 
         if auto_assign:
@@ -239,6 +241,7 @@ class CameraCard(tk.Frame):
                 return
         self.device_var.set("Select a camera…")
         self.mode_var.set("Select configuration…")
+        self._refresh_bag_enabled()
 
     def _load_modes(self, slot: CameraSlot) -> None:
         self._mode_by_label = {m.label(): m for m in slot.available_modes}
@@ -251,10 +254,12 @@ class CameraCard(tk.Frame):
             return
         cam_id = self._cam_by_label.get(self.device_var.get())
         if not cam_id:
+            self._refresh_bag_enabled()
             return
         try:
             slot = self.session.assign_camera(self.slot_id, cam_id)
             self._load_modes(slot)
+            self._refresh_bag_enabled()
             self.preview.configure(image="", text="Start preview to see live video")
             self._photo = None
             self.app.refresh_record_gate()
@@ -285,6 +290,17 @@ class CameraCard(tk.Frame):
 
     def _sync_bag(self) -> None:
         self.session.slots[self.slot_id].record_bag = self.bag_var.get()
+
+    def _refresh_bag_enabled(self, locked: bool = False) -> None:
+        slot = self.session.slots[self.slot_id]
+        bag_ok = (not locked) and slot.camera is not None and slot.camera.kind == "realsense"
+        if not bag_ok and self.bag_var.get():
+            self.bag_var.set(False)
+            slot.record_bag = False
+        try:
+            self.bag_check.configure(state="normal" if bag_ok else "disabled")
+        except tk.TclError:
+            pass
 
     def sync_controls(self) -> None:
         self._sync_prefix()
@@ -329,7 +345,7 @@ class CameraCard(tk.Frame):
         self.mode_combo.configure(state=combo)
         self.prefix_entry.configure(state=entry)
         self.arm_check.configure(state=entry)
-        self.bag_check.configure(state=entry)
+        self._refresh_bag_enabled(locked=locked)
         self.remove_btn.configure(
             state="disabled" if locked or len(self.session.slots) <= 2 else "normal"
         )

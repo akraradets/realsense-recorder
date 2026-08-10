@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+from poc1.bag_recorder import pending_bag_path, prearm_bag_on_source
 from poc1.camera_handler import FrameEnvelope
 from poc1.deliverable1.devices import (
     ConnectedCamera,
@@ -104,6 +105,7 @@ class MultiCamSession:
         ]
         self._recording = False
         self._lock = threading.Lock()
+        self.last_start_warnings: list[str] = []
 
     @property
     def is_recording(self) -> bool:
@@ -224,10 +226,22 @@ class MultiCamSession:
         source = build_frame_source(
             slot.camera, slot.mode, allow_simulate_realsense=False
         )
+        # Pre-arm paused .bag during preview so Record only needs resume().
+        if (
+            slot.record_bag
+            and slot.camera.kind == "realsense"
+            and getattr(source, "mode", None) == "hardware"
+        ):
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            prearm_bag_on_source(
+                source, pending_bag_path(self.out_dir, slot.slot_id, slot.prefix)
+            )
         pipe = Pipeline(source=source, on_preview_frame=slot.on_preview)
         pipe.start_preview()
         slot.pipeline = pipe
         slot.status = f"preview {slot.camera.kind} {slot.mode.label()}"
+        if slot.record_bag and slot.camera.kind == "realsense":
+            slot.status += " (.bag armed)"
         logger.info("Slot %d preview started (%s)", slot_id, slot.status)
 
     def stop_slot_preview(self, slot_id: int) -> None:
@@ -263,23 +277,43 @@ class MultiCamSession:
 
     def start_recording_armed(self, stamp: Optional[str] = None) -> list[Path]:
         """
-        R6 — one Record action: start encode on every armed slot that has preview.
+        R6 — one Record action: start encode on every armed slot.
+
+        Auto-starts preview for armed slots that are still idle so Record is not
+        blocked by “preview not running” when a camera is assigned and armed.
         """
         with self._lock:
             if self._recording:
                 raise RuntimeError("Already recording")
+            self.last_start_warnings = []
             armed = [s for s in self.slots if s.armed]
             if not armed:
                 raise RuntimeError("No cameras armed — enable Armed on at least one slot")
+
             for s in armed:
-                if s.pipeline is None or not s.pipeline._preview_started:
+                if s.camera is None or s.mode is None:
                     raise RuntimeError(
-                        f"Slot {s.slot_id} ({s.prefix}) is armed but preview is not running"
+                        f"Camera {s.slot_id + 1} ({s.prefix}) is armed but has no "
+                        "device/configuration. Assign a camera and mode, or uncheck Armed."
                     )
-                if s.pipeline.source.target_fps <= 0:
-                    # A few UVC drivers use -1 to mean "unknown". The source
-                    # normally normalizes this before preview; keep a final guard
-                    # here so VideoWriter can never receive an invalid FPS.
+                if s.pipeline is None or not s.pipeline._preview_started:
+                    try:
+                        # Drop any half-open pipeline, then start fresh.
+                        if s.pipeline is not None:
+                            try:
+                                s.pipeline.stop()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            s.pipeline = None
+                        self.start_slot_preview(s.slot_id)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Camera {s.slot_id + 1} ({s.prefix}) could not start "
+                            f"preview for Record: {exc}\n\n"
+                            "Check HDMI/USB, close other camera apps, then try again "
+                            "— or uncheck Armed on this camera."
+                        ) from exc
+                if s.pipeline is not None and s.pipeline.source.target_fps <= 0:
                     s.pipeline.source.target_fps = 30
 
             prefixes = [s.prefix.casefold() for s in armed]
@@ -303,17 +337,30 @@ class MultiCamSession:
                     if s.record_bag:
                         if not s.camera or s.camera.kind != "realsense":
                             raise RuntimeError(
-                                f"Slot {s.slot_id + 1} ({s.prefix}): "
-                                "“Also save RealSense .bag” is checked but the device "
-                                "is not a RealSense SDK camera. Pick a [realsense] entry."
+                                f"Camera {s.slot_id + 1} ({s.prefix}): "
+                                "RealSense .bag is checked but this is not a "
+                                "[realsense] device. Uncheck .bag or pick RealSense."
                             )
                         src = s.pipeline.source if s.pipeline else None
                         if getattr(src, "mode", "") != "hardware":
                             raise RuntimeError(
-                                f"Slot {s.slot_id + 1} ({s.prefix}): "
-                                "RealSense .bag needs a live hardware stream "
-                                "(simulation cannot write .bag)."
+                                f"Camera {s.slot_id + 1} ({s.prefix}): "
+                                "RealSense .bag needs a live hardware stream."
                             )
+                        # If preview was started before .bag was checked, restart
+                        # with a paused bag writer so Record can resume reliably.
+                        if getattr(src, "_rs_recorder", None) is None:
+                            try:
+                                if s.pipeline is not None:
+                                    s.pipeline.stop()
+                                s.pipeline = None
+                                self.start_slot_preview(s.slot_id)
+                                src = s.pipeline.source if s.pipeline else None
+                            except Exception as exc:
+                                raise RuntimeError(
+                                    f"Camera {s.slot_id + 1} ({s.prefix}): "
+                                    f"could not pre-arm .bag for Record: {exc}"
+                                ) from exc
                         bag = self.out_dir / f"{s.prefix}_{stamp}.bag"
                     assert s.pipeline is not None
                     try:
@@ -328,7 +375,7 @@ class MultiCamSession:
                         if mp4.exists() and mp4.stat().st_size == 0:
                             mp4.unlink(missing_ok=True)
                         raise RuntimeError(
-                            f"Slot {s.slot_id + 1} ({s.prefix}) could not start "
+                            f"Camera {s.slot_id + 1} ({s.prefix}) could not start "
                             f"recording at {s.pipeline.source.width}x"
                             f"{s.pipeline.source.height}@"
                             f"{s.pipeline.source.target_fps}: {exc}"

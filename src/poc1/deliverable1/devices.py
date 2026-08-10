@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 import cv2
@@ -571,15 +572,16 @@ def list_uvc_modes(camera: ConnectedCamera) -> list[StreamMode]:
     # Capture cards (Elgato) usually need MJPG for high-res; webcams vary.
     if camera.device_tag == "elgato":
         preferred = [
+            StreamMode(1920, 1080, 120, "mjpg"),
             StreamMode(1920, 1080, 60, "mjpg"),
-            StreamMode(1920, 1080, 30, "mjpg"),
+            StreamMode(1280, 720, 120, "mjpg"),
             StreamMode(1280, 720, 60, "mjpg"),
+            StreamMode(1920, 1080, 30, "mjpg"),
             StreamMode(1280, 720, 30, "mjpg"),
             StreamMode(1920, 1080, 60, "bgr8"),
             StreamMode(1920, 1080, 30, "bgr8"),
             StreamMode(1280, 720, 30, "bgr8"),
             StreamMode(640, 480, 30, "bgr8"),
-            StreamMode(1920, 1080, 120, "mjpg"),
         ]
     else:
         # Prefer modest defaults first. Many UVC webcams cannot sustain FHD@120,
@@ -849,10 +851,15 @@ class ConfiguredRealSenseSource:
         self.pixel_format = pixel_format.lower()
         self.bag_path: Optional[Any] = None
         self._bag_path: Optional[Any] = None
+        self._bag_final_path: Optional[Any] = None
         self._pipeline: Optional[Any] = None
+        self._profile: Optional[Any] = None
+        self._rs_recorder: Optional[Any] = None
         self._pending_frame: Optional[np.ndarray] = None
         self._colorizer: Optional[Any] = None
         self._wanted = (self.width, self.height, self.target_fps, self.pixel_format)
+        # When True, pause SDK bag writer immediately after start (preview pre-arm).
+        self.bag_start_paused: bool = False
 
     @staticmethod
     def _rs_format(rs, name: str):
@@ -914,11 +921,18 @@ class ConfiguredRealSenseSource:
             )
             self._colorizer = None
         if self.bag_path:
-            config.enable_record_to_file(str(self.bag_path))
+            # Absolute path — relative paths can fail silently on Windows SDK builds.
+            bag = Path(self.bag_path).resolve()
+            bag.parent.mkdir(parents=True, exist_ok=True)
+            if bag.exists() and bag.stat().st_size == 0:
+                bag.unlink(missing_ok=True)
+            config.enable_record_to_file(str(bag))
+            self.bag_path = bag
+            self._bag_path = bag
         profile = pipeline.start(config)
         return pipeline, profile
 
-    def start(self) -> None:
+    def start(self, *, allow_fallback: bool = True) -> None:
         if not realsense_available():
             raise RuntimeError(
                 "pyrealsense2 is not installed. Run: "
@@ -935,16 +949,26 @@ class ConfiguredRealSenseSource:
         )
         self._wanted = wanted
         w, h, fps, fmt = wanted
-        attempts = [
-            (w, h, fps, fmt),
-            (w, h, fps, "bgr8") if fmt != "z16" else (w, h, fps, "z16"),
-            (w, h, fps, "yuyv") if fmt not in {"z16", "y8"} else (w, h, fps, fmt),
-            (1280, 720, fps, "bgr8") if fmt != "z16" else (848, 480, fps, "z16"),
-            (640, 480, fps, "bgr8") if fmt != "z16" else (640, 480, fps, "z16"),
-            (1280, 720, 30, "bgr8"),
-            (640, 480, 30, "bgr8"),
-            (848, 480, 30, "bgr8"),
-        ]
+        # When arming .bag (or restoring after a failed bag), never silently drop
+        # to 640x480 — that mismatch is what users saw in Record error dialogs.
+        strict = bool(self.bag_path) or not allow_fallback
+        if strict:
+            attempts = [
+                (w, h, fps, fmt),
+                (w, h, fps, "bgr8") if fmt not in {"z16", "y8"} else (w, h, fps, fmt),
+                (w, h, fps, "yuyv") if fmt not in {"z16", "y8"} else (w, h, fps, fmt),
+            ]
+        else:
+            attempts = [
+                (w, h, fps, fmt),
+                (w, h, fps, "bgr8") if fmt != "z16" else (w, h, fps, "z16"),
+                (w, h, fps, "yuyv") if fmt not in {"z16", "y8"} else (w, h, fps, fmt),
+                (1280, 720, fps, "bgr8") if fmt != "z16" else (848, 480, fps, "z16"),
+                (640, 480, fps, "bgr8") if fmt != "z16" else (640, 480, fps, "z16"),
+                (1280, 720, 30, "bgr8"),
+                (640, 480, 30, "bgr8"),
+                (848, 480, 30, "bgr8"),
+            ]
         seen: set[tuple[int, int, int, str]] = set()
         errors: list[str] = []
         pipeline = None
@@ -1009,6 +1033,23 @@ class ConfiguredRealSenseSource:
             )
 
         self._pipeline = pipeline
+        self._profile = profile
+        self._rs_recorder = None
+        if self.bag_path:
+            try:
+                self._rs_recorder = profile.get_device().as_recorder()
+                if self.bag_start_paused:
+                    self._rs_recorder.pause()
+                    logger.info("RealSense .bag pre-armed (paused) -> %s", self.bag_path)
+                else:
+                    logger.info("RealSense .bag recording active -> %s", self.bag_path)
+            except Exception as exc:  # noqa: BLE001
+                self.stop()
+                raise RuntimeError(
+                    f"RealSense opened but .bag recorder is unavailable: {exc}. "
+                    "Close RealSense Viewer, use USB 3, then try again."
+                ) from exc
+
         try:
             first: Optional[np.ndarray] = None
             for _ in range(8):
@@ -1033,14 +1074,28 @@ class ConfiguredRealSenseSource:
             ) from exc
 
         logger.info(
-            "D1 RealSense: serial=%s %dx%d@%d fmt=%s bag=%s",
+            "D1 RealSense: serial=%s %dx%d@%d fmt=%s bag=%s paused=%s",
             self.serial,
             self.width,
             self.height,
             self.target_fps,
             self.pixel_format,
             bool(self.bag_path),
+            bool(self.bag_start_paused and self._rs_recorder is not None),
         )
+
+    def pause_bag(self) -> None:
+        if self._rs_recorder is not None:
+            try:
+                self._rs_recorder.pause()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("pause_bag: %s", exc)
+
+    def resume_bag(self) -> None:
+        if self._rs_recorder is None:
+            raise RuntimeError("No RealSense .bag recorder is armed")
+        self._rs_recorder.resume()
+        self.bag_start_paused = False
 
     def stop(self) -> None:
         if self._pipeline is not None:
@@ -1049,6 +1104,8 @@ class ConfiguredRealSenseSource:
             except Exception:  # noqa: BLE001
                 pass
             self._pipeline = None
+        self._profile = None
+        self._rs_recorder = None
         self._pending_frame = None
         self._colorizer = None
 

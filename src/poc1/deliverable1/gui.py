@@ -236,6 +236,7 @@ class CameraCard(tk.Frame):
         if slot.camera:
             self.device_var.set(slot.camera.label())
             self._load_modes(slot)
+            self._refresh_bag_enabled()
             return
 
         if auto_assign:
@@ -287,6 +288,7 @@ class CameraCard(tk.Frame):
                 return
         self.device_var.set("Select a camera...")
         self.mode_var.set("Select configuration...")
+        self._refresh_bag_enabled()
 
     def _load_modes(self, slot: CameraSlot) -> None:
         self._mode_by_label = {m.label(): m for m in slot.available_modes}
@@ -299,10 +301,12 @@ class CameraCard(tk.Frame):
             return
         cam_id = self._cam_by_label.get(self.device_var.get())
         if not cam_id:
+            self._refresh_bag_enabled()
             return
         try:
             slot = self.session.assign_camera(self.slot_id, cam_id)
             self._load_modes(slot)
+            self._refresh_bag_enabled()
             self.preview.configure(image="", text="Preview not started")
             self._photo = None
         except Exception as exc:  # noqa: BLE001
@@ -330,6 +334,21 @@ class CameraCard(tk.Frame):
 
     def _sync_bag(self) -> None:
         self.session.slots[self.slot_id].record_bag = self.bag_var.get()
+
+    def _refresh_bag_enabled(self, locked: bool = False) -> None:
+        slot = self.session.slots[self.slot_id]
+        bag_ok = (
+            (not locked)
+            and slot.camera is not None
+            and slot.camera.kind == "realsense"
+        )
+        if not bag_ok and self.bag_var.get():
+            self.bag_var.set(False)
+            slot.record_bag = False
+        try:
+            self.bag_check.configure(state="normal" if bag_ok else "disabled")
+        except tk.TclError:
+            pass
 
     def sync_controls(self) -> None:
         self._sync_prefix()
@@ -384,7 +403,7 @@ class CameraCard(tk.Frame):
         self.mode_combo.configure(state=combo_state)
         self.prefix_entry.configure(state=entry_state)
         self.arm_check.configure(state=entry_state)
-        self.bag_check.configure(state=entry_state)
+        self._refresh_bag_enabled(locked=locked)
         self.remove_btn.configure(
             state="disabled" if locked or len(self.session.slots) <= 2 else "normal"
         )
@@ -754,7 +773,7 @@ class Deliverable1App:
             messagebox.showerror("Recording configuration", str(exc))
             return
 
-        armed = [s for s in self.session.slots if s.armed and s.pipeline]
+        armed = [s for s in self.session.slots if s.armed]
         heavy = [
             s
             for s in armed
@@ -763,17 +782,9 @@ class Deliverable1App:
         ]
         if len(armed) >= 2 and heavy:
             names = ", ".join(s.prefix for s in heavy)
-            if not messagebox.askyesno(
-                "High-rate multi-camera recording",
-                f"Armed cameras include high rate/config ({names}) while "
-                f"{len(armed)} cameras record together.\n\n"
-                "Configured FPS is kept (not auto-lowered). The PC encoder may "
-                "not sustain every stream — you may see measured FPS below "
-                "configured, or drops.\n\n"
-                "For exact fake FHD@120 with no drops, arm only that fake camera.\n\n"
-                "Continue recording anyway?",
-            ):
-                return
+            self.set_status(
+                f"High-rate multi-cam ({names}) — recording at configured FPS."
+            )
 
         self._set_busy(True)
         self.set_status("Starting all armed recorders…")
@@ -804,6 +815,12 @@ class Deliverable1App:
         self._set_busy(False, recording=True)
         names = ", ".join(path.name for path in paths)
         self.set_status(f"RECORDING {len(paths)} camera(s): {names}")
+        warnings = list(getattr(self.session, "last_start_warnings", []) or [])
+        if warnings:
+            messagebox.showwarning(
+                "RealSense .bag skipped",
+                "MP4 recording started.\n\n" + "\n\n".join(warnings),
+            )
 
     def stop_recording(self) -> None:
         if getattr(self, "_stopping", False):

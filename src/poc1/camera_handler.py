@@ -163,6 +163,8 @@ class CameraHandler:
         self._thread: Optional[threading.Thread] = None
         self._running = threading.Event()
         self._recording = threading.Event()
+        self._paused = threading.Event()  # clear = reading; set = pause reads
+        self._in_read = threading.Event()
         self._record_lock = threading.Lock()
         self._seq = 0
         self.frames_read = 0
@@ -171,9 +173,23 @@ class CameraHandler:
 
     def start(self) -> None:
         self.source.start()
+        self._paused.clear()
         self._running.set()
         self._thread = threading.Thread(target=self._loop, name="camera-handler", daemon=True)
         self._thread.start()
+
+    def pause_reads(self, timeout: float = 2.0) -> None:
+        """
+        Stop calling source.read() so the device can be safely restarted
+        (e.g. RealSense enable_record_to_file) without racing the capture thread.
+        """
+        self._paused.set()
+        deadline = time.time() + timeout
+        while self._in_read.is_set() and time.time() < deadline:
+            time.sleep(0.005)
+
+    def resume_reads(self) -> None:
+        self._paused.clear()
 
     def enable_recording(self) -> None:
         """Begin fanning frames into the processor/recorder path."""
@@ -198,6 +214,7 @@ class CameraHandler:
     def stop(self) -> None:
         with self._record_lock:
             self._recording.clear()
+        self._paused.clear()
         self._running.clear()
         if self._thread:
             self._thread.join(timeout=5.0)
@@ -205,12 +222,20 @@ class CameraHandler:
 
     def _loop(self) -> None:
         while self._running.is_set():
+            if self._paused.is_set():
+                time.sleep(0.005)
+                continue
+
             # Snapshot arming state before read so a mid-read enable_recording()
             # cannot attach a pre-reset synthetic barcode to seq 0.
             with self._record_lock:
                 was_recording = self._recording.is_set()
 
-            frame = self.source.read()
+            self._in_read.set()
+            try:
+                frame = self.source.read()
+            finally:
+                self._in_read.clear()
             if frame is None:
                 if not self._running.is_set():
                     break
