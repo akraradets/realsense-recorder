@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -721,87 +722,189 @@ class FormattedUvcSource(CvCaptureSource):
         fps: int,
         pixel_format: str,
     ) -> Optional[np.ndarray]:
+        # Order matters for Elgato/DirectShow: FOURCC first, then size, then FPS
+        # (repeated), then small buffer so we measure the real delivery rate.
         _apply_uvc_fourcc(cap, pixel_format)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        cap.set(cv2.CAP_PROP_FPS, fps)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+        for _ in range(3):
+            cap.set(cv2.CAP_PROP_FPS, float(fps))
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:  # noqa: BLE001
             pass
         # Warm up: capture cards often emit a few empty/black frames first.
         frame = None
-        for _ in range(12):
+        for _ in range(15):
             ok, candidate = cap.read()
             if ok and candidate is not None:
                 frame = candidate
         return frame
 
+    def _measure_delivery_fps(self, seconds: float = 0.7) -> float:
+        """Count frames for a short window to learn the real HDMI/driver rate."""
+        if self._cap is None:
+            return 0.0
+        n = 0
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < seconds:
+            ok, frame = self._cap.read()
+            if ok and frame is not None:
+                n += 1
+                self._pending_frame = np.ascontiguousarray(frame)
+        elapsed = time.perf_counter() - t0
+        if elapsed <= 0.05 or n < 2:
+            return 0.0
+        return (n - 1) / elapsed
+
     def start(self) -> None:
         with quiet_opencv():
-            self._cap = self._open_capture()
-            if self.device_tag == "elgato":
-                attempts = [
-                    (self.width, self.height, self.target_fps, self.pixel_format),
-                    (self.width, self.height, self.target_fps, "mjpg"),
-                    (1920, 1080, 60, "mjpg"),
-                    (1920, 1080, 30, "mjpg"),
-                    (1280, 720, 60, "mjpg"),
-                    (1280, 720, 30, "mjpg"),
-                    (1280, 720, 30, "bgr8"),
-                    (640, 480, 30, "bgr8"),
-                ]
-            else:
-                attempts = [
-                    (self.width, self.height, self.target_fps, self.pixel_format),
-                    (self.width, self.height, self.target_fps, "mjpg"),
-                    (1280, 720, 30, "mjpg"),
-                    (1280, 720, 30, "bgr8"),
-                    (640, 480, 30, "bgr8"),
-                ]
-            # De-dupe while preserving order.
-            seen: set[tuple[int, int, int, str]] = set()
-            unique_attempts: list[tuple[int, int, int, str]] = []
-            for item in attempts:
-                if item not in seen:
-                    seen.add(item)
-                    unique_attempts.append(item)
+            wanted_w, wanted_h = self.width, self.height
+            wanted_fps = self.target_fps if self.target_fps > 0 else 30
+            wanted_fmt = self.pixel_format
 
-            first_frame = None
+            if self.device_tag == "elgato":
+                profiles = [
+                    (wanted_w, wanted_h, wanted_fps, wanted_fmt),
+                    (wanted_w, wanted_h, wanted_fps, "mjpg"),
+                    (1920, 1080, wanted_fps, "mjpg"),
+                    (1280, 720, wanted_fps, "mjpg"),
+                ]
+                if wanted_fps > 60:
+                    profiles += [
+                        (wanted_w, wanted_h, 60, "mjpg"),
+                        (1920, 1080, 60, "mjpg"),
+                        (1280, 720, 60, "mjpg"),
+                    ]
+                else:
+                    profiles += [
+                        (1920, 1080, 30, "mjpg"),
+                        (1280, 720, 30, "mjpg"),
+                        (640, 480, 30, "bgr8"),
+                    ]
+            else:
+                profiles = [
+                    (wanted_w, wanted_h, wanted_fps, wanted_fmt),
+                    (wanted_w, wanted_h, wanted_fps, "mjpg"),
+                    (1280, 720, 30, "mjpg"),
+                    (1280, 720, 30, "bgr8"),
+                    (640, 480, 30, "bgr8"),
+                ]
+
+            seen_p: set[tuple[int, int, int, str]] = set()
+            unique_profiles: list[tuple[int, int, int, str]] = []
+            for prof in profiles:
+                if prof not in seen_p:
+                    seen_p.add(prof)
+                    unique_profiles.append(prof)
+
             last_exc: Optional[Exception] = None
-            for width, height, fps, fmt in unique_attempts:
+            chosen: Optional[
+                tuple[float, int, int, int, str, cv2.VideoCapture, np.ndarray]
+            ] = None
+
+            open_targets: list[tuple[Any, int]] = []
+            if self.open_path and sys.platform == "win32":
+                open_targets += [
+                    (self.open_path, cv2.CAP_DSHOW),
+                    (self.open_path, cv2.CAP_MSMF),
+                ]
+            if sys.platform == "win32" and self.device_tag == "elgato":
+                for path in dshow_open_paths_for_tag("elgato"):
+                    open_targets += [(path, cv2.CAP_DSHOW), (path, cv2.CAP_MSMF)]
+            open_targets += [(self.device_index, self._backend)]
+            if self._backend == cv2.CAP_DSHOW:
+                open_targets.append((self.device_index, cv2.CAP_MSMF))
+
+            seen_open: set[tuple[str, int]] = set()
+            for target, backend in open_targets:
+                ok_key = (str(target), int(backend))
+                if ok_key in seen_open:
+                    continue
+                seen_open.add(ok_key)
                 try:
-                    first_frame = self._configure_and_grab(
-                        self._cap, width, height, fps, fmt
-                    )
+                    cap = cv2.VideoCapture(target, backend)
                 except Exception as exc:  # noqa: BLE001
                     last_exc = exc
-                    first_frame = None
-                if first_frame is not None:
-                    self.width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
-                    self.height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
-                    reported_fps = float(self._cap.get(cv2.CAP_PROP_FPS) or 0)
-                    self.actual_fps = reported_fps if reported_fps > 0 else float(fps)
-                    self.actual_width = self.width
-                    self.actual_height = self.height
-                    self.target_fps = fps if fps > 0 else 30
-                    self.pixel_format = fmt
-                    self._pending_frame = np.ascontiguousarray(first_frame)
-                    break
+                    continue
+                if not cap.isOpened():
+                    cap.release()
+                    continue
 
-            if first_frame is None:
-                self._cap.release()
-                self._cap = None
-                hint = (
-                    " For Elgato: connect HDMI source power ON, close the Elgato app,"
-                    " then Refresh and pick the Elgato entry."
-                    if self.device_tag == "elgato"
-                    else " Close other camera apps, reconnect USB, Refresh, and try again."
-                )
+                matched_high = False
+                for width, height, fps, fmt in unique_profiles:
+                    try:
+                        frame = self._configure_and_grab(cap, width, height, fps, fmt)
+                    except Exception as exc:  # noqa: BLE001
+                        last_exc = exc
+                        continue
+                    if frame is None:
+                        continue
+                    self._cap = cap
+                    owned = np.ascontiguousarray(frame)
+                    self._pending_frame = owned
+                    measured = self._measure_delivery_fps(0.6 if fps >= 90 else 0.4)
+                    reported = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+                    rate = measured if measured > 1 else (
+                        reported if reported > 0 else float(fps)
+                    )
+                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
+                    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
+                    if chosen is None or rate > chosen[0]:
+                        if chosen is not None and chosen[5] is not cap:
+                            try:
+                                chosen[5].release()
+                            except Exception:  # noqa: BLE001
+                                pass
+                        chosen = (rate, w, h, fps, fmt, cap, owned)
+                    if fps >= 90 and rate >= fps * 0.85:
+                        matched_high = True
+                        break
+
+                if matched_high:
+                    break
+                if chosen is None or chosen[5] is not cap:
+                    try:
+                        cap.release()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            if chosen is None:
                 detail = f" ({last_exc})" if last_exc else ""
+                hint = (
+                    " For Elgato: HDMI source ON, close Elgato app, set source to "
+                    "1080p120 if you need 120fps, then Refresh."
+                    if self.device_tag == "elgato"
+                    else " Close other camera apps, reconnect USB, Refresh."
+                )
                 raise RuntimeError(
                     f"UVC device opened but delivered no frames{detail}.{hint}"
                 )
+
+            rate, w, h, req_fps, fmt, cap, frame = chosen
+            self._cap = cap
+            self.width = w
+            self.height = h
+            self.pixel_format = fmt
+            self.actual_fps = rate
+            self.actual_width = w
+            self.actual_height = h
+            self._pending_frame = frame
+
+            if req_fps >= 90 and rate < req_fps * 0.85:
+                stamped = int(round(rate / 5.0) * 5) or 60
+                stamped = max(15, min(stamped, req_fps))
+                logger.warning(
+                    "Elgato requested %dfps but measured ~%.1ffps — stamping @%dfps. "
+                    "The capture card only outputs what the HDMI source sends; set "
+                    "the console/PC to 1080p120 for true 120.",
+                    req_fps,
+                    rate,
+                    stamped,
+                )
+                self.target_fps = stamped
+            else:
+                self.target_fps = req_fps if req_fps > 0 else 30
 
         mean = float(np.mean(self._pending_frame)) if self._pending_frame is not None else 0.0
         if mean < 2.0:
@@ -811,7 +914,7 @@ class FormattedUvcSource(CvCaptureSource):
                 mean,
             )
         logger.info(
-            "D1 UVC source: idx=%d path=%s %dx%d@%d fmt=%s tag=%s (reports %.1ffps)",
+            "D1 UVC source: idx=%d path=%s %dx%d@%d fmt=%s tag=%s (measured ~%.1ffps)",
             self.device_index,
             self.open_path or "-",
             self.width,
@@ -828,6 +931,7 @@ class FormattedUvcSource(CvCaptureSource):
             self._pending_frame = None
             return frame
         return super().read()
+
 
 
 class ConfiguredRealSenseSource:

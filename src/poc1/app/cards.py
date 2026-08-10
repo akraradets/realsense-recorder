@@ -145,8 +145,8 @@ class CameraCard(tk.Frame):
         self.bag_check.grid(row=3, column=1, columnspan=3, sticky="w", pady=(4, 0))
         tk.Label(
             form,
-            text="With this checked, Record writes MP4 and .bag together (RealSense only). "
-            "Start preview after checking so .bag can pre-arm.",
+            text="With this checked, Record writes MP4 and a stamped .bag together "
+            "(RealSense only). Close RealSense Viewer; use USB 3.",
             bg=PANEL,
             fg=MUTED,
             font=("Segoe UI", 8),

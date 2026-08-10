@@ -1,20 +1,19 @@
 """
 Intel RealSense .bag recording (opens in RealSense Viewer).
 
-When “Also save RealSense .bag” is checked, .bag is required together with MP4 —
-arming must succeed (no silent skip).
+When “Also save RealSense .bag” is checked, .bag is required with MP4.
 
-Preferred flow:
-  1. Preview starts with enable_record_to_file + recorder.pause() (pre-arm).
-  2. Record calls resume() — no pipeline restart.
-  3. Stop finalizes the file and restores preview.
+Strategy (reliable on Windows):
+  - Pause the capture thread
+  - Restart the SDK pipeline with enable_record_to_file(final_stamped_path)
+  - Verify the .bag file grows
+  - On stop: pipeline.stop() finalizes the file, then restore preview without bag
 
-Fallback: pause capture thread, restart pipeline with recording, retries.
+No hidden “.pending_” files — the stamped camN_….bag is written directly.
 """
 from __future__ import annotations
 
 import logging
-import shutil
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -63,32 +62,29 @@ def _call_start(source: Any, *, allow_fallback: bool) -> None:
 
 
 def pending_bag_path(out_dir: Path, slot_id: int, prefix: str) -> Path:
+    """Visible temp name (kept for API compatibility; Record uses stamped path)."""
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in prefix) or "cam"
-    return Path(out_dir).resolve() / f".pending_{safe}_slot{slot_id}.bag"
+    return Path(out_dir).resolve() / f"{safe}_slot{slot_id}_recording.bag"
 
 
 def prearm_bag_on_source(source: Any, bag_path: Path) -> None:
-    """Configure a RealSense source to open with a paused .bag writer."""
-    bag_path = Path(bag_path).resolve()
-    bag_path.parent.mkdir(parents=True, exist_ok=True)
-    if bag_path.exists():
-        try:
-            bag_path.unlink()
-        except OSError:
-            pass
-    source.bag_path = bag_path
-    source._bag_path = bag_path
+    """No-op pre-arm: bag is armed at Record to the final stamped path."""
+    # Clear any previous bag state so preview stays a normal live stream.
+    source.bag_path = None
+    source._bag_path = None
     source._bag_final_path = None
-    source.bag_start_paused = True
+    if hasattr(source, "bag_start_paused"):
+        source.bag_start_paused = False
+    if hasattr(source, "_rs_recorder"):
+        source._rs_recorder = None
+    _ = bag_path  # API compat
 
 
 def start_bag_recording(source: Any, bag_path: Path) -> Path:
     """
-    Ensure RealSense .bag writing is active for this take.
+    Restart RealSense with .bag writing to ``bag_path`` (required).
 
-    Returns the active bag path (may be a pending file that will be renamed on stop).
-    Raises RuntimeError if .bag cannot be armed — callers must not continue without it
-    when the user checked RealSense .bag.
+    Raises RuntimeError if arming fails.
     """
     if not can_record_bag(source):
         raise RuntimeError(
@@ -105,38 +101,25 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
 
     bag_path = Path(bag_path).resolve()
     bag_path.parent.mkdir(parents=True, exist_ok=True)
-    wanted = _wanted_from_source(source)
-
-    # Fast path: preview already pre-armed a paused recorder.
-    recorder = getattr(source, "_rs_recorder", None)
-    current = getattr(source, "_bag_path", None) or getattr(source, "bag_path", None)
-    if recorder is not None and current is not None:
+    if bag_path.exists():
         try:
-            source._bag_final_path = bag_path
-            if hasattr(source, "resume_bag"):
-                source.resume_bag()
-            else:
-                recorder.resume()
-            logger.info(
-                "RealSense .bag resumed -> writing %s (final name %s)",
-                current,
-                bag_path.name,
-            )
-            return Path(current)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("resume_bag failed (%s); restarting with record_to_file", exc)
+            bag_path.unlink()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot overwrite existing .bag ({bag_path.name}): {exc}"
+            ) from exc
 
-    # Restart pipeline with recording to the final stamped path.
+    wanted = _wanted_from_source(source)
     last_exc: Optional[BaseException] = None
+
     for attempt in range(1, 5):
         try:
             try:
                 source.stop()
             except Exception:  # noqa: BLE001
                 pass
-            time.sleep(0.3 * attempt)
-            if bag_path.exists() and bag_path.stat().st_size == 0:
-                bag_path.unlink(missing_ok=True)
+            time.sleep(0.35 * attempt)
+
             source.bag_path = bag_path
             source._bag_path = bag_path
             source._bag_final_path = bag_path
@@ -145,24 +128,27 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
             _restore_wanted(source, wanted)
             _call_start(source, allow_fallback=False)
 
-            # Confirm the SDK created the bag and frames flow.
-            for _ in range(5):
+            # Pull frames so the SDK creates / grows the bag.
+            size = 0
+            for _ in range(12):
                 try:
                     _ = source.read()
                 except Exception:  # noqa: BLE001
                     pass
-                if bag_path.exists() and bag_path.stat().st_size > 0:
-                    break
+                if bag_path.exists():
+                    size = bag_path.stat().st_size
+                    if size > 0:
+                        break
                 time.sleep(0.05)
 
-            if not bag_path.exists():
-                raise RuntimeError("SDK did not create the .bag file")
+            if not bag_path.exists() or bag_path.stat().st_size <= 0:
+                raise RuntimeError("SDK created no .bag data after start")
 
             logger.info(
                 "RealSense .bag armed (try %d) -> %s (%d bytes)",
                 attempt,
                 bag_path,
-                bag_path.stat().st_size if bag_path.exists() else 0,
+                bag_path.stat().st_size,
             )
             return bag_path
         except Exception as exc:  # noqa: BLE001
@@ -179,7 +165,7 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
             except Exception:  # noqa: BLE001
                 pass
 
-    # Restore preview without bag, then fail hard — user asked for .bag.
+    # Restore preview without bag, then fail hard.
     try:
         source.bag_path = None
         source._bag_path = None
@@ -198,20 +184,17 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
         logger.exception("Could not restore RealSense preview after bag failure")
 
     raise RuntimeError(
-        f"Could not start RealSense .bag recording to {bag_path}. "
+        f"Could not start RealSense .bag recording to {bag_path.name}. "
         f"Last error: {last_exc}. "
-        "Close Intel RealSense Viewer and other camera apps, use a USB 3 port, "
-        "then Start preview again with RealSense .bag checked."
+        "Close Intel RealSense Viewer, use USB 3, Start preview on RealSense, "
+        "check Also save RealSense .bag, then Record again."
     )
 
 
 def stop_bag_recording(source: Any) -> Optional[Path]:
-    """
-    Finalize .bag (pipeline stop closes the file), rename to final path if needed,
-    then restart preview without bag.
-    """
+    """Finalize .bag by stopping the SDK pipeline, then restore preview."""
     path = getattr(source, "_bag_path", None) or getattr(source, "bag_path", None)
-    final = getattr(source, "_bag_final_path", None)
+    final = getattr(source, "_bag_final_path", None) or path
     if not path or not can_record_bag(source):
         if hasattr(source, "bag_path"):
             source.bag_path = None
@@ -237,8 +220,10 @@ def stop_bag_recording(source: Any) -> Optional[Path]:
     source._bag_final_path = None
     if hasattr(source, "bag_start_paused"):
         source.bag_start_paused = False
+    if hasattr(source, "_rs_recorder"):
+        source._rs_recorder = None
 
-    time.sleep(0.35)
+    time.sleep(0.4)
     _restore_wanted(source, wanted)
     try:
         _call_start(source, allow_fallback=False)
@@ -249,28 +234,9 @@ def stop_bag_recording(source: Any) -> Optional[Path]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("RealSense preview restart after .bag failed: %s", exc)
 
-    p = Path(path)
-    out = p
-    if final is not None:
-        final_p = Path(final).resolve()
-        if p.exists() and p.resolve() != final_p:
-            try:
-                final_p.parent.mkdir(parents=True, exist_ok=True)
-                if final_p.exists():
-                    final_p.unlink()
-                shutil.move(str(p), str(final_p))
-                out = final_p
-            except OSError as exc:
-                logger.warning("Could not rename .bag to %s: %s", final_p, exc)
-                out = p
-        elif final_p.exists():
-            out = final_p
-
+    out = Path(final) if final is not None else Path(path)
     if out.exists() and out.stat().st_size > 0:
         logger.info("RealSense .bag saved: %s (%d bytes)", out, out.stat().st_size)
         return out
-    logger.error(
-        "No .bag file produced at %s — recording may be incomplete",
-        out,
-    )
+    logger.error("No .bag file produced at %s", out)
     return None

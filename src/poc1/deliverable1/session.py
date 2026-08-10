@@ -14,7 +14,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-from poc1.bag_recorder import pending_bag_path, prearm_bag_on_source
 from poc1.camera_handler import FrameEnvelope
 from poc1.deliverable1.devices import (
     ConnectedCamera,
@@ -226,22 +225,12 @@ class MultiCamSession:
         source = build_frame_source(
             slot.camera, slot.mode, allow_simulate_realsense=False
         )
-        # Pre-arm paused .bag during preview so Record only needs resume().
-        if (
-            slot.record_bag
-            and slot.camera.kind == "realsense"
-            and getattr(source, "mode", None) == "hardware"
-        ):
-            self.out_dir.mkdir(parents=True, exist_ok=True)
-            prearm_bag_on_source(
-                source, pending_bag_path(self.out_dir, slot.slot_id, slot.prefix)
-            )
         pipe = Pipeline(source=source, on_preview_frame=slot.on_preview)
         pipe.start_preview()
         slot.pipeline = pipe
         slot.status = f"preview {slot.camera.kind} {slot.mode.label()}"
         if slot.record_bag and slot.camera.kind == "realsense":
-            slot.status += " (.bag armed)"
+            slot.status += " (.bag on Record)"
         logger.info("Slot %d preview started (%s)", slot_id, slot.status)
 
     def stop_slot_preview(self, slot_id: int) -> None:
@@ -347,20 +336,6 @@ class MultiCamSession:
                                 f"Camera {s.slot_id + 1} ({s.prefix}): "
                                 "RealSense .bag needs a live hardware stream."
                             )
-                        # If preview was started before .bag was checked, restart
-                        # with a paused bag writer so Record can resume reliably.
-                        if getattr(src, "_rs_recorder", None) is None:
-                            try:
-                                if s.pipeline is not None:
-                                    s.pipeline.stop()
-                                s.pipeline = None
-                                self.start_slot_preview(s.slot_id)
-                                src = s.pipeline.source if s.pipeline else None
-                            except Exception as exc:
-                                raise RuntimeError(
-                                    f"Camera {s.slot_id + 1} ({s.prefix}): "
-                                    f"could not pre-arm .bag for Record: {exc}"
-                                ) from exc
                         bag = self.out_dir / f"{s.prefix}_{stamp}.bag"
                     assert s.pipeline is not None
                     try:
