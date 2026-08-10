@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+from poc1.bag_recorder import clear_bag_on_source, with_sdk_record_suffix
 from poc1.camera_handler import FrameEnvelope
 from poc1.deliverable1.devices import (
     ConnectedCamera,
@@ -230,12 +231,15 @@ class MultiCamSession:
         source = build_frame_source(
             slot.camera, slot.mode, allow_simulate_realsense=False
         )
+        # Preview must never enable SDK record_to_file (some SDKs reject .bag
+        # and would fail Start preview when the checkbox is on).
+        clear_bag_on_source(source)
         pipe = Pipeline(source=source, on_preview_frame=slot.on_preview)
         pipe.start_preview()
         slot.pipeline = pipe
         slot.status = f"preview {slot.camera.kind} {slot.mode.label()}"
         if slot.record_bag and slot.camera.kind == "realsense":
-            slot.status += " (.bag on Record)"
+            slot.status += " (.bag/.db3 on Record)"
         logger.info("Slot %d preview started (%s)", slot_id, slot.status)
 
     def stop_slot_preview(self, slot_id: int) -> None:
@@ -356,7 +360,9 @@ class MultiCamSession:
                                 f"Camera {s.slot_id + 1} ({s.prefix}): "
                                 "RealSense .bag needs a live hardware stream."
                             )
-                        bag = self.out_dir / f"{s.prefix}_{stamp}.bag"
+                        bag = with_sdk_record_suffix(
+                            self.out_dir / f"{s.prefix}_{stamp}.bag"
+                        )
                         s.record_bag = True
                     assert s.pipeline is not None
                     logger.info(

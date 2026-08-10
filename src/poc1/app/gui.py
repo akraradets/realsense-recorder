@@ -197,9 +197,9 @@ class UnifiedApp:
         adv.pack(fill="x", padx=8, pady=(4, 0))
         tk.Label(
             adv,
-            text="Files are compressed MP4 (+ optional RealSense .bag). "
+            text="Files are compressed MP4 (+ optional RealSense .bag/.db3). "
             "System usage CSV and JSON reports are written next to each take. "
-            "Import/export .db3 or .bd3 in Library.",
+            "Library can export bags to MP4.",
             fg=MUTED,
             font=("Segoe UI", 8),
             wraplength=1000,
