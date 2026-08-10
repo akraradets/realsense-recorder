@@ -508,6 +508,9 @@ class UnifiedApp:
         self.busy = busy
         for card in self.cards:
             card.set_locked(busy or recording)
+            # After unlock, force checkbox to match slot intent (never silently uncheck).
+            if not busy and not recording:
+                card.restore_bag_checkbox()
         state = "disabled" if busy or recording else "normal"
         for btn in (
             self.refresh_btn,
@@ -527,6 +530,19 @@ class UnifiedApp:
             self.stop_record_btn.configure(state="disabled")
             self.refresh_record_gate()
 
+    def _capture_bag_intent(self) -> dict[int, bool]:
+        """Read .bag checkboxes directly from the UI (not a possibly-stale slot flag)."""
+        intent: dict[int, bool] = {}
+        for card in self.cards:
+            slot = self.session.slots[card.slot_id]
+            want = bool(card.bag_var.get())
+            if slot.camera is None or slot.camera.kind != "realsense":
+                want = False
+            intent[card.slot_id] = want
+            slot.record_bag = want
+        self.session.bag_intent = dict(intent)
+        return intent
+
     def start_recording(self) -> None:
         if self.busy or self.session.is_recording:
             return
@@ -540,8 +556,15 @@ class UnifiedApp:
             messagebox.showerror("Recording", str(exc))
             return
 
-        # Snapshot .bag intent before UI lock (busy used to clear the flag).
-        bag_intent = {s.slot_id: bool(s.record_bag) for s in self.session.slots}
+        # Capture checkbox state BEFORE busy/lock — this is what Record will use.
+        bag_intent = self._capture_bag_intent()
+        rs_bag = [
+            self.session.slots[i].prefix
+            for i, want in bag_intent.items()
+            if want and self.session.slots[i].armed
+        ]
+        if rs_bag:
+            self.set_status(f"Recording with RealSense .bag: {', '.join(rs_bag)}")
 
         armed = [s for s in self.session.slots if s.armed]
         heavy = [
@@ -555,15 +578,16 @@ class UnifiedApp:
             )
 
         self._set_busy(True)
+        # Re-apply after lock so nothing in set_locked can drop the flag.
         for s in self.session.slots:
-            s.record_bag = bag_intent.get(s.slot_id, s.record_bag)
+            s.record_bag = bag_intent.get(s.slot_id, False)
         self.set_status("Starting recording…")
 
         def worker() -> None:
             paths: list[Path] = []
             error: Optional[str] = None
             try:
-                paths = self.session.start_recording_armed()
+                paths = self.session.start_recording_armed(bag_intent=bag_intent)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("record start failed")
                 error = str(exc)
@@ -574,19 +598,23 @@ class UnifiedApp:
     def _record_started(self, paths: list[Path], error: Optional[str]) -> None:
         if error:
             self._set_busy(False)
+            for card in self.cards:
+                card.restore_bag_checkbox()
             self.set_status("Recording did not start.")
             messagebox.showerror("Recording", error)
             return
         self._set_busy(False, recording=True)
         self.record_tip.set(f"Recording {len(paths)} camera(s)…")
-        self.set_status("Recording — press Stop when finished.")
+        bags = [
+            s.prefix
+            for s in self.session.slots
+            if s.armed and self.session.bag_intent.get(s.slot_id)
+        ]
+        if bags:
+            self.set_status(f"Recording — .bag ON for {', '.join(bags)}. Press Stop when finished.")
+        else:
+            self.set_status("Recording — press Stop when finished.")
         self.notebook.select(self.record_page)
-        warnings = list(getattr(self.session, "last_start_warnings", []) or [])
-        if warnings:
-            messagebox.showwarning(
-                "RealSense .bag skipped",
-                "MP4 recording started.\n\n" + "\n\n".join(warnings),
-            )
 
     def stop_recording(self) -> None:
         # Always allow Stop while a take is active — even if busy from a
@@ -622,6 +650,8 @@ class UnifiedApp:
         self._stopping = False
         self.last_reports = reports
         self._set_busy(False)
+        for card in self.cards:
+            card.restore_bag_checkbox()
         if error:
             self.set_status(f"Stop failed: {error}")
             messagebox.showerror("Stop recording", error)
@@ -630,12 +660,37 @@ class UnifiedApp:
 
         valid = [r for r in reports.values() if "error" not in r]
         ok = bool(valid) and all(r.get("no_frame_drops") for r in valid)
-        self.set_status(
+        bag_ok = [
+            (prefix, r)
+            for prefix, r in reports.items()
+            if r.get("bag_recorded")
+        ]
+        bag_missing = [
+            prefix
+            for prefix, r in reports.items()
+            if "error" not in r
+            and self.session.bag_intent.get(
+                next((s.slot_id for s in self.session.slots if s.prefix == prefix), -1),
+                False,
+            )
+            and not r.get("bag_recorded")
+        ]
+        status = (
             "Saved cleanly — no frame drops."
             if ok
             else "Saved. Check Last report if something looks off."
         )
+        if bag_ok:
+            status += f" .bag saved: {', '.join(p for p, _ in bag_ok)}."
+        self.set_status(status)
         self.record_tip.set("Recording stopped. Arm cameras and start previews to record again.")
+        if bag_missing:
+            messagebox.showerror(
+                "RealSense .bag missing",
+                "MP4 was saved, but .bag was checked and not written for:\n"
+                + ", ".join(bag_missing)
+                + "\n\nClose RealSense Viewer, use USB 3, keep .bag checked, Record again.",
+            )
 
         mismatched = [
             (slot, reports.get(slot.prefix, {}))

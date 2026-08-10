@@ -74,7 +74,7 @@ def test_build_frame_source_wires_uvc_and_realsense():
     assert src.device_tag == "elgato"
     assert src.open_path == "video=Elgato HD60"
     assert src.target_fps == 30
-    assert src.allow_fps_remux is False
+    assert src.allow_fps_remux is True  # Elgato remux safety net when HDMI is 60Hz
 
     webcam = ConnectedCamera(
         cam_id="uvc:0:DSHOW",

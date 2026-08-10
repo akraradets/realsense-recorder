@@ -105,6 +105,9 @@ class MultiCamSession:
         self._recording = False
         self._lock = threading.Lock()
         self.last_start_warnings: list[str] = []
+        # Authoritative .bag intent for the next/current Record (slot_id -> bool).
+        # UI checkboxes can race with busy/lock; Record uses this map only.
+        self.bag_intent: dict[int, bool] = {}
 
     @property
     def is_recording(self) -> bool:
@@ -266,17 +269,25 @@ class MultiCamSession:
         for slot in self.slots:
             self.stop_slot_preview(slot.slot_id)
 
-    def start_recording_armed(self, stamp: Optional[str] = None) -> list[Path]:
+    def start_recording_armed(
+        self,
+        stamp: Optional[str] = None,
+        bag_intent: Optional[dict[int, bool]] = None,
+    ) -> list[Path]:
         """
         R6 — one Record action: start encode on every armed slot.
 
-        Auto-starts preview for armed slots that are still idle so Record is not
-        blocked by “preview not running” when a camera is assigned and armed.
+        ``bag_intent`` is the authoritative map of slot_id -> want .bag. When
+        provided it overrides checkbox/slot.record_bag (avoids UI lock races).
         """
         with self._lock:
             if self._recording:
                 raise RuntimeError("Already recording")
             self.last_start_warnings = []
+            if bag_intent is not None:
+                self.bag_intent = {int(k): bool(v) for k, v in bag_intent.items()}
+            intent = dict(self.bag_intent)
+
             armed = [s for s in self.slots if s.armed]
             if not armed:
                 raise RuntimeError("No cameras armed — enable Armed on at least one slot")
@@ -287,6 +298,12 @@ class MultiCamSession:
                         f"Camera {s.slot_id + 1} ({s.prefix}) is armed but has no "
                         "device/configuration. Assign a camera and mode, or uncheck Armed."
                     )
+                # Keep slot.record_bag aligned with authoritative intent for UI restore.
+                want_bag = bool(intent.get(s.slot_id, s.record_bag))
+                if s.camera.kind == "realsense":
+                    s.record_bag = want_bag
+                else:
+                    s.record_bag = False
                 if s.pipeline is None or not s.pipeline._preview_started:
                     try:
                         # Drop any half-open pipeline, then start fresh.
@@ -325,7 +342,8 @@ class MultiCamSession:
                     mp4 = self.out_dir / f"{s.prefix}_{stamp}.mp4"
                     csv = self.out_dir / f"{s.prefix}_{stamp}_sysmon.csv"
                     bag = None
-                    if s.record_bag:
+                    want_bag = bool(intent.get(s.slot_id, s.record_bag))
+                    if want_bag:
                         if not s.camera or s.camera.kind != "realsense":
                             raise RuntimeError(
                                 f"Camera {s.slot_id + 1} ({s.prefix}): "
@@ -339,7 +357,15 @@ class MultiCamSession:
                                 "RealSense .bag needs a live hardware stream."
                             )
                         bag = self.out_dir / f"{s.prefix}_{stamp}.bag"
+                        s.record_bag = True
                     assert s.pipeline is not None
+                    logger.info(
+                        "Record slot %d prefix=%s bag_intent=%s bag_path=%s",
+                        s.slot_id,
+                        s.prefix,
+                        want_bag,
+                        bag,
+                    )
                     try:
                         s.pipeline.start_recording(mp4, csv, bag_path=bag)
                     except Exception as exc:
@@ -357,6 +383,20 @@ class MultiCamSession:
                             f"{s.pipeline.source.height}@"
                             f"{s.pipeline.source.target_fps}: {exc}"
                         ) from exc
+                    if bag is not None and (
+                        s.pipeline._bag_path is None
+                        or not Path(bag).exists()
+                        or Path(bag).stat().st_size <= 0
+                    ):
+                        try:
+                            s.pipeline.stop_recording()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        raise RuntimeError(
+                            f"Camera {s.slot_id + 1} ({s.prefix}): .bag was checked but "
+                            f"no bag file was created at {bag.name}. "
+                            "Close RealSense Viewer, use USB 3, then try again."
+                        )
                     s.status = f"recording → {mp4.name}"
                     if bag is not None:
                         s.status += f" + {bag.name}"

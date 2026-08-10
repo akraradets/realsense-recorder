@@ -336,11 +336,24 @@ class CameraCard(tk.Frame):
     def _sync_bag(self) -> None:
         self.session.slots[self.slot_id].record_bag = self.bag_var.get()
 
+    def restore_bag_checkbox(self) -> None:
+        slot = self.session.slots[self.slot_id]
+        want = bool(slot.record_bag) or bool(
+            getattr(self.session, "bag_intent", {}).get(self.slot_id, False)
+        )
+        if slot.camera is None or slot.camera.kind != "realsense":
+            want = False
+        slot.record_bag = want
+        try:
+            self.bag_var.set(want)
+            self._refresh_bag_enabled(locked=False)
+        except tk.TclError:
+            pass
+
     def _refresh_bag_enabled(self, locked: bool = False) -> None:
         slot = self.session.slots[self.slot_id]
         is_rs = slot.camera is not None and slot.camera.kind == "realsense"
-        # Do not clear record_bag when locking the UI for Record — that bug
-        # caused checked .bag to be ignored (MP4-only, bag_recorded=false).
+        # Do not clear record_bag when locking the UI for Record.
         if not is_rs:
             if self.bag_var.get():
                 self.bag_var.set(False)
@@ -755,6 +768,8 @@ class Deliverable1App:
         self.busy = busy
         for card in self.cards:
             card.set_locked(busy or recording)
+            if not busy and not recording and hasattr(card, "restore_bag_checkbox"):
+                card.restore_bag_checkbox()
         state = "disabled" if busy or recording else "normal"
         self.refresh_btn.configure(state=state)
         self.add_btn.configure(state=state)
@@ -766,6 +781,18 @@ class Deliverable1App:
             state="normal" if recording and not busy else "disabled"
         )
 
+    def _capture_bag_intent(self) -> dict[int, bool]:
+        intent: dict[int, bool] = {}
+        for card in self.cards:
+            slot = self.session.slots[card.slot_id]
+            want = bool(card.bag_var.get())
+            if slot.camera is None or slot.camera.kind != "realsense":
+                want = False
+            intent[card.slot_id] = want
+            slot.record_bag = want
+        self.session.bag_intent = dict(intent)
+        return intent
+
     def start_recording(self) -> None:
         if self.busy or self.session.is_recording:
             return
@@ -775,7 +802,7 @@ class Deliverable1App:
             messagebox.showerror("Recording configuration", str(exc))
             return
 
-        bag_intent = {s.slot_id: bool(s.record_bag) for s in self.session.slots}
+        bag_intent = self._capture_bag_intent()
 
         armed = [s for s in self.session.slots if s.armed]
         heavy = [
@@ -792,14 +819,14 @@ class Deliverable1App:
 
         self._set_busy(True)
         for s in self.session.slots:
-            s.record_bag = bag_intent.get(s.slot_id, s.record_bag)
+            s.record_bag = bag_intent.get(s.slot_id, False)
         self.set_status("Starting all armed recorders…")
 
         def worker() -> None:
             paths: list[Path] = []
             error: Optional[str] = None
             try:
-                paths = self.session.start_recording_armed()
+                paths = self.session.start_recording_armed(bag_intent=bag_intent)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("multi-camera record start failed")
                 error = str(exc)

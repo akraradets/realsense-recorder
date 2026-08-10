@@ -292,12 +292,25 @@ class CameraCard(tk.Frame):
     def _sync_bag(self) -> None:
         self.session.slots[self.slot_id].record_bag = self.bag_var.get()
 
+    def restore_bag_checkbox(self) -> None:
+        """Keep the checkbox matching the slot intent after busy/unlock."""
+        slot = self.session.slots[self.slot_id]
+        want = bool(slot.record_bag) or bool(
+            getattr(self.session, "bag_intent", {}).get(self.slot_id, False)
+        )
+        if slot.camera is None or slot.camera.kind != "realsense":
+            want = False
+        slot.record_bag = want
+        try:
+            self.bag_var.set(want)
+            self._refresh_bag_enabled(locked=False)
+        except tk.TclError:
+            pass
+
     def _refresh_bag_enabled(self, locked: bool = False) -> None:
         slot = self.session.slots[self.slot_id]
         is_rs = slot.camera is not None and slot.camera.kind == "realsense"
-        # Only clear .bag when the device is not RealSense. Never clear it just
-        # because the UI is locked/busy — that wiped record_bag right before
-        # Record and produced MP4-only takes with bag_recorded=false.
+        # Never clear .bag because the UI is locked/busy.
         if not is_rs:
             if self.bag_var.get():
                 self.bag_var.set(False)
