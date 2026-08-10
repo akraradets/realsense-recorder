@@ -52,8 +52,8 @@ class LibraryPage(tk.Frame):
         tip.pack(fill="x")
         tk.Label(
             tip,
-            text="Library: play MP4; export RealSense .bag or ROS2 .db3 → MP4 "
-            "(needs image topics). Arm/Record live on Setup + Record.",
+            text="Library: play MP4; export RealSense .bag/.db3 or ROS2 bags → MP4 "
+            "(H.264 / H.265 when available). Arm/Record live on Setup + Record.",
             bg=SURFACE,
             fg=MUTED,
             font=("Segoe UI", 9),

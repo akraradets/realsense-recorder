@@ -1,9 +1,9 @@
 """
 R10 — export .bag / .bd3 / .db3 to MP4 (H.264 or H.265 when available).
 
-.bag  → Intel RealSense SDK playback (color preferred, else colorized depth)
-.bd3 / .db3 → ROS 2 bags via pure-Python ``rosbags`` (+ ``rosbags-image``);
-              fallbacks: OpenCV, ffmpeg, misnamed RealSense bag
+.bag / RealSense .db3 → Intel RealSense SDK playback (color preferred, else depth)
+ROS2 .db3 / .bd3      → pure-Python ``rosbags`` (+ ``rosbags-image``) when Image topics exist
+fallbacks             → OpenCV, ffmpeg
 """
 from __future__ import annotations
 
@@ -154,6 +154,7 @@ def _export_realsense_bag(
     label: str,
     progress: Callable[[str], None],
 ) -> ExportResult:
+    """Playback a RealSense SDK recording (.bag or .db3) and encode color/depth to MP4."""
     try:
         import pyrealsense2 as rs
     except ImportError:
@@ -161,14 +162,19 @@ def _export_realsense_bag(
             False,
             None,
             label,
-            message="pyrealsense2 is required for .bag export. "
+            message="pyrealsense2 is required for RealSense .bag/.db3 export. "
             "Run: uv sync --extra realsense",
         )
 
-    progress(f"Opening RealSense bag: {source.name}")
+    source = Path(source).resolve()
+    progress(f"Opening RealSense recording: {source.name}")
     pipeline = rs.pipeline()
     config = rs.config()
-    rs.config.enable_device_from_file(config, str(source), repeat_playback=False)
+    try:
+        rs.config.enable_device_from_file(config, str(source), repeat_playback=False)
+    except TypeError:
+        # Older pyrealsense2 bindings without repeat_playback kwarg.
+        rs.config.enable_device_from_file(config, str(source))
     # Prefer color; enable depth as fallback for older bags.
     try:
         config.enable_stream(rs.stream.color)
@@ -183,7 +189,10 @@ def _export_realsense_bag(
         profile = pipeline.start(config)
     except Exception as exc:  # noqa: BLE001
         return ExportResult(
-            False, None, label, message=f"Could not open bag: {exc}"
+            False,
+            None,
+            label,
+            message=f"Could not open RealSense recording: {exc}",
         )
 
     playback = profile.get_device().as_playback()
@@ -255,7 +264,7 @@ def _export_realsense_bag(
     if frames_written <= 0:
         output.unlink(missing_ok=True)
         return ExportResult(
-            False, None, label, message="Bag contained no exportable frames"
+            False, None, label, message="Recording contained no exportable frames"
         )
 
     final_label = label if used_fourcc == fourcc else f"{label} → {used_fourcc}"
@@ -684,15 +693,24 @@ def _export_bd3_or_db3(
     progress: Callable[[str], None],
 ) -> ExportResult:
     """
-    .bd3 / .db3 may be ROS2 sqlite bags or misc containers.
-
-    Prefer pure-Python rosbags image export, then OpenCV → ffmpeg →
-    misnamed RealSense bag.
+    .bd3 / .db3 may be:
+      - RealSense SDK recordings (newer librealsense) — play via pyrealsense2
+      - ROS2 bags with sensor_msgs Image topics — play via rosbags
     """
+    source = Path(source)
+
+    # 1) RealSense SDK first — POC1 Record writes RealSense .db3 this way.
+    #    Do NOT rename to .bag; modern SDK requires the .db3 extension for playback.
+    rs_try = _export_realsense_bag(source, output, fourcc, label, progress)
+    if rs_try.ok:
+        return rs_try
+
+    # 2) Standard ROS2 bags with Image / CompressedImage topics.
     ros_try = _export_rosbag2_to_mp4(source, output, fourcc, label, progress)
     if ros_try.ok:
         return ros_try
 
+    # 3) Generic video containers mislabeled as .db3/.bd3.
     result = _export_via_opencv(source, output, fourcc, label, progress)
     if result.ok:
         return result
@@ -702,36 +720,16 @@ def _export_bd3_or_db3(
     if ff.ok:
         return ff
 
-    with tempfile.TemporaryDirectory() as tmp:
-        renamed = Path(tmp) / f"{source.stem}.bag"
-        try:
-            shutil.copy2(source, renamed)
-            bag_try = _export_realsense_bag(renamed, output, fourcc, label, progress)
-            if bag_try.ok:
-                return bag_try
-            bag_msg = bag_try.message
-        except Exception as exc:  # noqa: BLE001
-            bag_msg = str(exc)
-
-    ros2 = _looks_like_ros2_db3(source)
     guidance = (
         f"Could not convert {source.name} to MP4.\n\n"
-        f"ROS bag path: {ros_try.message}\n\n"
-        "Tips:\n"
-        "  • Run: uv sync   (installs rosbags + rosbags-image)\n"
-        "  • Bag must contain sensor_msgs/Image or CompressedImage\n"
-        "  • If the bag is a folder, Export that folder’s .db3 or keep metadata.yaml beside it\n\n"
+        f"RealSense SDK: {rs_try.message}\n"
+        f"ROS bag path: {ros_try.message}\n"
         f"OpenCV: {result.message}\n"
-        f"ffmpeg: {ff.message}\n"
-        f"bag-try: {bag_msg}"
+        f"ffmpeg: {ff.message}\n\n"
+        "Tips:\n"
+        "  • RealSense recordings from this app need: uv sync --extra realsense\n"
+        "  • You can also play the matching .mp4 from the same Record take\n"
+        "  • True ROS2 bags need sensor_msgs/Image topics (uv sync for rosbags)\n"
+        "  • Or open the .db3 in Intel RealSense Viewer"
     )
-    if not ros2 and "No image topics" not in ros_try.message:
-        guidance = (
-            f"Could not convert {source.name} to MP4.\n\n"
-            f"ROS bag path: {ros_try.message}\n"
-            f"OpenCV: {result.message}\n"
-            f"ffmpeg: {ff.message}\n"
-            f"bag-try: {bag_msg}"
-        )
-
     return ExportResult(False, None, label, message=guidance)
