@@ -1026,13 +1026,31 @@ class ConfiguredRealSenseSource:
             self._colorizer = None
         if self.bag_path:
             # Absolute path — relative paths can fail silently on Windows SDK builds.
-            bag = Path(self.bag_path).resolve()
+            # Newer librealsense requires .db3 (not legacy .bag); coerce here so even
+            # a stale caller that passes .pending_*.bag cannot crash Start preview.
+            from poc1.bag_recorder import coerce_record_path, set_recording_suffix
+
+            bag = coerce_record_path(Path(self.bag_path)).resolve()
             bag.parent.mkdir(parents=True, exist_ok=True)
-            if bag.exists() and bag.stat().st_size == 0:
+            if bag.exists() and bag.is_file() and bag.stat().st_size == 0:
                 bag.unlink(missing_ok=True)
-            config.enable_record_to_file(str(bag))
+            try:
+                config.enable_record_to_file(str(bag))
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc).lower()
+                if "db3" in msg and bag.suffix.lower() != ".db3":
+                    set_recording_suffix(".db3")
+                    bag = bag.with_suffix(".db3")
+                    config.enable_record_to_file(str(bag))
+                elif "bag" in msg and "extension" in msg and bag.suffix.lower() != ".bag":
+                    set_recording_suffix(".bag")
+                    bag = bag.with_suffix(".bag")
+                    config.enable_record_to_file(str(bag))
+                else:
+                    raise
             self.bag_path = bag
             self._bag_path = bag
+            set_recording_suffix(bag.suffix)
         profile = pipeline.start(config)
         return pipeline, profile
 
@@ -1095,9 +1113,30 @@ class ConfiguredRealSenseSource:
                 self.pixel_format = try_fmt
                 break
             except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
                 errors.append(f"{width}x{height}@{try_fps} {try_fmt}: {exc}")
                 pipeline = None
                 profile = None
+                # Auto-fix wrong record extension mid-profile loop (SDK demands .db3).
+                if self.bag_path and "db3" in msg.lower():
+                    from poc1.bag_recorder import coerce_record_path, set_recording_suffix
+
+                    set_recording_suffix(".db3")
+                    self.bag_path = coerce_record_path(Path(self.bag_path))
+                    self._bag_path = self.bag_path
+                    try:
+                        pipeline, profile = self._start_profile(
+                            rs, width, height, try_fps, try_fmt
+                        )
+                        used = attempt
+                        self.pixel_format = try_fmt
+                        break
+                    except Exception as exc2:  # noqa: BLE001
+                        errors.append(
+                            f"{width}x{height}@{try_fps} {try_fmt} (.db3 retry): {exc2}"
+                        )
+                        pipeline = None
+                        profile = None
 
         if pipeline is None or profile is None:
             raise RuntimeError(

@@ -66,7 +66,9 @@ class UnifiedApp:
         self._record_tiles: list[tk.Label] = []
         self._record_photos: list = []
 
-        root.title("POC1 Recorder")
+        from poc1.bag_recorder import BUILD_ID
+
+        root.title(f"POC1 Recorder — {BUILD_ID}")
         root.configure(bg=BG)
         root.geometry("1240x860")
         root.minsize(980, 700)
@@ -84,6 +86,8 @@ class UnifiedApp:
     # ── chrome ───────────────────────────────────────────────────────────
 
     def _build_chrome(self) -> None:
+        from poc1.bag_recorder import BUILD_ID
+
         header = tk.Frame(self.root, bg=PANEL, padx=20, pady=14)
         header.pack(fill="x")
         header.configure(highlightbackground=BORDER, highlightthickness=1)
@@ -94,6 +98,13 @@ class UnifiedApp:
             fg=INK,
             font=("Segoe UI Semibold", 18),
         ).pack(side="left")
+        tk.Label(
+            header,
+            text=f"  {BUILD_ID}",
+            bg=PANEL,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+        ).pack(side="left", padx=(8, 0))
         tk.Label(
             header,
             text="Cameras  ·  Record  ·  Library",

@@ -1,8 +1,8 @@
 """
 Intel RealSense SDK recording (legacy .bag or ROS2 .db3).
 
-Newer librealsense builds require ``.db3`` (rosbag2/SQLite). Older builds use
-``.bag``. We probe the SDK once and write the extension it accepts.
+Newer librealsense builds (common on Windows) require ``.db3``. Older builds
+use ``.bag``. We default to ``.db3`` and fall back to ``.bag`` if needed.
 
 Recording is armed only at Record time — never during Start preview.
 """
@@ -16,7 +16,12 @@ from typing import Any, Optional
 logger = logging.getLogger("poc1.bag")
 
 # Cached after first successful probe: ".bag" or ".db3"
-_RECORD_SUFFIX: Optional[str] = None
+# Default .db3 — modern pyrealsense2 rejects .bag with:
+#   "Output file must have .db3 extension"
+_RECORD_SUFFIX: Optional[str] = ".db3"
+
+# Build stamp so operators can confirm they are not on a stale Phue copy.
+BUILD_ID = "sdk-record-v3-2026-08-10"
 
 
 def can_record_bag(source: Any) -> bool:
@@ -28,46 +33,53 @@ def recording_suffix() -> str:
     global _RECORD_SUFFIX
     if _RECORD_SUFFIX:
         return _RECORD_SUFFIX
-    # Default .bag; start_bag_recording flips to .db3 if the SDK rejects .bag.
-    return ".bag"
+    return ".db3"
 
 
 def set_recording_suffix(suffix: str) -> None:
     global _RECORD_SUFFIX
     suf = suffix if suffix.startswith(".") else f".{suffix}"
     if suf not in {".bag", ".db3"}:
-        suf = ".bag"
+        suf = ".db3"
     _RECORD_SUFFIX = suf
     logger.info("RealSense SDK record suffix set to %s", suf)
 
 
-def with_sdk_record_suffix(path: Path) -> Path:
-    """Rewrite path to the SDK-required suffix (.bag or .db3)."""
+def coerce_record_path(path: Path) -> Path:
+    """
+    Force a path the current SDK will accept.
+
+    Always rewrites to the preferred suffix (.db3 by default). Also strips
+    legacy hidden ``.pending_*`` names if anything still passes one in.
+    """
     path = Path(path)
+    name = path.name
+    if name.startswith(".pending_"):
+        # Old builds used .pending_cam1_slot0.bag — never write those.
+        clean = name[len(".pending_") :]
+        if clean.endswith(".bag") or clean.endswith(".db3"):
+            stem = Path(clean).stem
+        else:
+            stem = clean
+        path = path.with_name(stem + recording_suffix())
     return path.with_suffix(recording_suffix())
 
 
+def with_sdk_record_suffix(path: Path) -> Path:
+    """Rewrite path to the SDK-required suffix (.bag or .db3)."""
+    return coerce_record_path(path)
+
+
 def paths_to_try(path: Path) -> list[Path]:
-    """Candidate record paths: known-good suffix first, then the other."""
+    """Candidate record paths: preferred suffix first (.db3), then the other."""
     path = Path(path)
-    primary = with_sdk_record_suffix(path)
-    other_suf = ".db3" if primary.suffix.lower() == ".bag" else ".bag"
-    secondary = path.with_suffix(other_suf)
-    out = [primary]
+    primary = coerce_record_path(path)
+    other_suf = ".bag" if primary.suffix.lower() == ".db3" else ".db3"
+    secondary = primary.with_suffix(other_suf)
+    out: list[Path] = [primary]
     if secondary != primary:
         out.append(secondary)
-    # Also try original if different
-    if path.suffix.lower() in {".bag", ".db3"} and path not in out:
-        out.insert(0, path)
-    # Dedupe preserving order
-    seen: set[str] = set()
-    unique: list[Path] = []
-    for p in out:
-        key = str(p.resolve()) if p.parent.exists() else str(p)
-        if key not in seen:
-            seen.add(key)
-            unique.append(p)
-    return unique
+    return out
 
 
 def _restore_wanted(source: Any, wanted: tuple[int, int, int, str]) -> None:
@@ -114,13 +126,7 @@ def pending_bag_path(out_dir: Path, slot_id: int, prefix: str) -> Path:
 
 def prearm_bag_on_source(source: Any, bag_path: Path) -> None:
     """No-op: never arm SDK recording during preview (causes Start preview errors)."""
-    source.bag_path = None
-    source._bag_path = None
-    source._bag_final_path = None
-    if hasattr(source, "bag_start_paused"):
-        source.bag_start_paused = False
-    if hasattr(source, "_rs_recorder"):
-        source._rs_recorder = None
+    clear_bag_on_source(source)
     _ = bag_path
 
 
@@ -142,7 +148,7 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
     """
     Restart RealSense with SDK file recording to ``bag_path``.
 
-    Automatically retries with ``.db3`` if this SDK rejects ``.bag`` (and vice versa).
+    Tries ``.db3`` first (required by newer SDKs), then ``.bag``.
     Raises RuntimeError if arming fails.
     """
     if not can_record_bag(source):
@@ -169,9 +175,6 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
             try:
                 if candidate.is_file():
                     candidate.unlink()
-                elif candidate.is_dir():
-                    # rosbag2 sometimes uses a folder; remove empty marker files only
-                    pass
             except OSError as exc:
                 last_exc = exc
                 continue
@@ -205,14 +208,11 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
                             size = 0
                         if size > 0:
                             break
-                    # rosbag2 may create a directory
                     if candidate.with_suffix("").exists():
                         break
                     time.sleep(0.05)
 
                 if candidate.exists() and candidate.stat().st_size <= 0:
-                    # Some SDK builds create the file on stop only — allow empty
-                    # at arm time if pipeline is live.
                     if getattr(source, "_pipeline", None) is None:
                         raise RuntimeError("SDK created no record file after start")
 
@@ -235,24 +235,22 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
                     exc,
                 )
                 try:
-                    source.bag_path = None
-                    source._bag_path = None
-                    source._bag_final_path = None
-                    if hasattr(source, "bag_start_paused"):
-                        source.bag_start_paused = False
+                    clear_bag_on_source(source)
                     if candidate.exists() and candidate.is_file() and candidate.stat().st_size == 0:
                         candidate.unlink(missing_ok=True)
                 except Exception:  # noqa: BLE001
                     pass
-                # If SDK explicitly demands the other extension, jump to it.
                 if "db3" in msg and candidate.suffix.lower() == ".bag":
                     set_recording_suffix(".db3")
                     break
-                if "bag" in msg and "extension" in msg and candidate.suffix.lower() == ".db3":
+                if (
+                    "bag" in msg
+                    and "extension" in msg
+                    and candidate.suffix.lower() == ".db3"
+                ):
                     set_recording_suffix(".bag")
                     break
 
-    # Restore preview without recording, then fail hard.
     try:
         clear_bag_on_source(source)
         _restore_wanted(source, wanted)
@@ -267,7 +265,7 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
         logger.exception("Could not restore RealSense preview after record failure")
 
     raise RuntimeError(
-        f"Could not start RealSense SDK recording ({bag_path.name}). "
+        f"Could not start RealSense SDK recording ({Path(bag_path).name}). "
         f"Last error: {last_exc}. "
         "This PC’s RealSense SDK may require .db3 instead of .bag (or the reverse). "
         "Close Intel RealSense Viewer, use USB 3, then Record again."
@@ -309,13 +307,14 @@ def stop_bag_recording(source: Any) -> Optional[Path]:
     if out.exists() and out.stat().st_size > 0:
         logger.info("RealSense record saved: %s (%d bytes)", out, out.stat().st_size)
         return out
-    # rosbag2 may write beside the path
     if out.suffix.lower() == ".db3":
         parent = out.parent
         stem = out.stem
         for child in parent.glob(f"{stem}*"):
             if child.is_file() and child.stat().st_size > 0:
-                logger.info("RealSense record saved: %s (%d bytes)", child, child.stat().st_size)
+                logger.info(
+                    "RealSense record saved: %s (%d bytes)", child, child.stat().st_size
+                )
                 return child
     logger.error("No RealSense record file produced at %s", out)
     return None

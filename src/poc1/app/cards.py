@@ -129,10 +129,10 @@ class CameraCard(tk.Frame):
         )
         self.arm_check.grid(row=2, column=2, columnspan=2, sticky="w", padx=8)
 
-        # SDK file may be .bag (legacy) or .db3 (newer librealsense); written on Record only.
+        # Written on Record only (never on Start preview). New SDKs save .db3.
         self.bag_check = tk.Checkbutton(
             form,
-            text="Also save RealSense .bag/.db3 (with MP4)",
+            text="Also save RealSense SDK file (.db3/.bag) with MP4",
             variable=self.bag_var,
             command=self._sync_bag,
             bg=PANEL,
@@ -145,8 +145,8 @@ class CameraCard(tk.Frame):
         self.bag_check.grid(row=3, column=1, columnspan=3, sticky="w", pady=(4, 0))
         tk.Label(
             form,
-            text="Checked = also save RealSense SDK file with MP4 (.bag or .db3). "
-            "Applies on Record only — Start preview is live video. Close Viewer; USB 3.",
+            text="On Record only (not preview). This PC’s SDK usually writes .db3. "
+            "Close RealSense Viewer; use USB 3.",
             bg=PANEL,
             fg=MUTED,
             font=("Segoe UI", 8),
