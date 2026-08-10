@@ -305,6 +305,7 @@ class CameraCard(tk.Frame):
             return
         try:
             slot = self.session.assign_camera(self.slot_id, cam_id)
+            self.bag_var.set(bool(slot.record_bag))
             self._load_modes(slot)
             self._refresh_bag_enabled()
             self.preview.configure(image="", text="Preview not started")
@@ -337,16 +338,17 @@ class CameraCard(tk.Frame):
 
     def _refresh_bag_enabled(self, locked: bool = False) -> None:
         slot = self.session.slots[self.slot_id]
-        bag_ok = (
-            (not locked)
-            and slot.camera is not None
-            and slot.camera.kind == "realsense"
-        )
-        if not bag_ok and self.bag_var.get():
-            self.bag_var.set(False)
+        is_rs = slot.camera is not None and slot.camera.kind == "realsense"
+        # Do not clear record_bag when locking the UI for Record — that bug
+        # caused checked .bag to be ignored (MP4-only, bag_recorded=false).
+        if not is_rs:
+            if self.bag_var.get():
+                self.bag_var.set(False)
             slot.record_bag = False
         try:
-            self.bag_check.configure(state="normal" if bag_ok else "disabled")
+            self.bag_check.configure(
+                state="disabled" if locked or not is_rs else "normal"
+            )
         except tk.TclError:
             pass
 
@@ -773,6 +775,8 @@ class Deliverable1App:
             messagebox.showerror("Recording configuration", str(exc))
             return
 
+        bag_intent = {s.slot_id: bool(s.record_bag) for s in self.session.slots}
+
         armed = [s for s in self.session.slots if s.armed]
         heavy = [
             s
@@ -787,6 +791,8 @@ class Deliverable1App:
             )
 
         self._set_busy(True)
+        for s in self.session.slots:
+            s.record_bag = bag_intent.get(s.slot_id, s.record_bag)
         self.set_status("Starting all armed recorders…")
 
         def worker() -> None:
@@ -867,26 +873,21 @@ class Deliverable1App:
             for slot in self.session.slots
             if reports.get(slot.prefix, {}).get("fps_mismatch")
         ]
-        # Supervisor: warn + optional convert; never change FPS automatically.
-        # Conversion always runs on a child thread (not the Tk main thread).
         if mismatched:
             details = "\n".join(
-                f"• {slot.prefix}: configured {report.get('target_fps')} fps, "
-                f"measured ~{float(report.get('measured_fps') or 0):.1f} fps "
-                f"(container still {report.get('container_fps')} fps)"
+                f"• {slot.prefix}: requested {report.get('requested_fps', report.get('target_fps'))} fps, "
+                f"delivered ~{float(report.get('measured_fps') or 0):.0f} fps "
+                f"(file stamped {report.get('container_fps')} fps)"
                 for slot, report in mismatched
             )
-            if messagebox.askyesno(
-                "Frame-rate mismatch",
+            self.set_status("Fixing playback timing for mismatched cameras…")
+            self._convert_mismatched_async(mismatched)
+            messagebox.showinfo(
+                "Playback timing",
                 f"{details}\n\n"
-                "The file still uses the configured FPS (not changed automatically).\n"
-                "If measured FPS is lower, playback may look too fast.\n\n"
-                "Convert these files to their measured frame rates for real-time "
-                "playback?\n\n"
-                "Yes = convert in a background thread\n"
-                "No = keep the configured FPS stamp",
-            ):
-                self._convert_mismatched_async(mismatched)
+                "Playback speed was auto-fixed to match real time.\n"
+                "For true 120fps on Elgato: set the HDMI source itself to 1080p120.",
+            )
 
         if not ok:
             drop_notes = []

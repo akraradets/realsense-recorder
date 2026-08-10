@@ -1140,19 +1140,23 @@ class ConfiguredRealSenseSource:
         self._profile = profile
         self._rs_recorder = None
         if self.bag_path:
+            # enable_record_to_file already writes the .bag. as_recorder() is only
+            # needed for pause/resume — must NOT abort if the cast fails (common
+            # on some Windows SDK builds) or we lose bag writes entirely.
             try:
                 self._rs_recorder = profile.get_device().as_recorder()
-                if self.bag_start_paused:
+                if self.bag_start_paused and self._rs_recorder is not None:
                     self._rs_recorder.pause()
                     logger.info("RealSense .bag pre-armed (paused) -> %s", self.bag_path)
                 else:
                     logger.info("RealSense .bag recording active -> %s", self.bag_path)
             except Exception as exc:  # noqa: BLE001
-                self.stop()
-                raise RuntimeError(
-                    f"RealSense opened but .bag recorder is unavailable: {exc}. "
-                    "Close RealSense Viewer, use USB 3, then try again."
-                ) from exc
+                self._rs_recorder = None
+                logger.warning(
+                    "as_recorder() unavailable (%s) — continuing with "
+                    "enable_record_to_file only",
+                    exc,
+                )
 
         try:
             first: Optional[np.ndarray] = None
@@ -1327,7 +1331,6 @@ def build_frame_source(
         device_tag=camera.device_tag,
     )
     # Webcam/virtual: remux + preview-based stamp (drivers often lie about FPS).
-    # Elgato: keep the selected stamp when the card really delivers it (FHD@60/120);
-    # post-stop auto-remux still fixes playback if measured rate differs.
-    src.allow_fps_remux = camera.device_tag != "elgato"
+    # Elgato: stamp from measured delivery at Record; remux remains a safety net.
+    src.allow_fps_remux = True
     return src

@@ -540,6 +540,9 @@ class UnifiedApp:
             messagebox.showerror("Recording", str(exc))
             return
 
+        # Snapshot .bag intent before UI lock (busy used to clear the flag).
+        bag_intent = {s.slot_id: bool(s.record_bag) for s in self.session.slots}
+
         armed = [s for s in self.session.slots if s.armed]
         heavy = [
             s
@@ -552,6 +555,8 @@ class UnifiedApp:
             )
 
         self._set_busy(True)
+        for s in self.session.slots:
+            s.record_bag = bag_intent.get(s.slot_id, s.record_bag)
         self.set_status("Starting recording…")
 
         def worker() -> None:
@@ -637,20 +642,22 @@ class UnifiedApp:
             for slot in self.session.slots
             if reports.get(slot.prefix, {}).get("fps_mismatch")
         ]
+        # Auto-fix remaining mismatches (Elgato already auto-fixed in pipeline).
         if mismatched:
             details = "\n".join(
-                f"• {slot.prefix}: set to {report.get('target_fps')} fps, "
-                f"camera delivered ~{float(report.get('measured_fps') or 0):.0f} fps"
+                f"• {slot.prefix}: requested {report.get('requested_fps', report.get('target_fps'))} fps, "
+                f"delivered ~{float(report.get('measured_fps') or 0):.0f} fps "
+                f"(file stamped {report.get('container_fps')} fps)"
                 for slot, report in mismatched
             )
-            if messagebox.askyesno(
-                "Playback may look fast",
+            self.set_status("Fixing playback timing for mismatched cameras…")
+            self._convert_mismatched_async(mismatched)
+            messagebox.showinfo(
+                "Playback timing",
                 f"{details}\n\n"
-                "Fix speed so playback matches real time?\n"
-                "(Runs in the background — the file’s frame count stays the same.)\n\n"
-                "Yes = fix speed\nNo = keep as recorded",
-            ):
-                self._convert_mismatched_async(mismatched)
+                "Playback speed was auto-fixed to match real time.\n"
+                "For true 120fps on Elgato: set the HDMI source itself to 1080p120.",
+            )
 
         if not ok:
             drop_notes = []
@@ -754,11 +761,13 @@ class UnifiedApp:
                     "frames_written",
                     "width",
                     "height",
+                    "requested_fps",
                     "target_fps",
                     "measured_fps",
                     "fps_mismatch",
                     "container_fps",
                     "bag_recorded",
+                    "bag_path",
                     "output_path",
                 )
                 if key in report

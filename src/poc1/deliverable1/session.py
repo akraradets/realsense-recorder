@@ -188,6 +188,8 @@ class MultiCamSession:
         slot.mode = slot.available_modes[0] if slot.available_modes else StreamMode(
             1280, 720, 30, "bgr8"
         )
+        # RealSense: default .bag ON so MP4+.bag is the normal path unless unchecked.
+        slot.record_bag = cam.kind == "realsense"
         slot.status = f"assigned {cam.label()}"
         return slot
 

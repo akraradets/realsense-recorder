@@ -145,6 +145,11 @@ class Pipeline:
             finally:
                 self.camera_handler.resume_reads()
 
+        # Capture cards often advertise 120 while HDMI only sends ~60. Stamp the
+        # MP4 at the real delivery rate so playback matches wall-clock time.
+        self._requested_fps = int(getattr(self.source, "target_fps", 30) or 30)
+        self._align_elgato_fps()
+
         # Compression lives in the processor; recorder only accounts encoded tokens.
         self.processor.configure_output(
             output_path=output_path,
@@ -152,8 +157,10 @@ class Pipeline:
             height=self.source.height,
             fps=self.source.target_fps,
         )
-        # Remux only for real capture devices that lie about FPS (webcam).
+        # Remux safety net for devices that still drift after stamping.
         allow_remux = bool(getattr(self.source, "allow_fps_remux", True))
+        if getattr(self.source, "device_tag", "") == "elgato":
+            allow_remux = True
         self.recorder = Recorder(
             out_queue=self.processor.out_queue,
             output_path=output_path,
@@ -171,11 +178,45 @@ class Pipeline:
         self.monitor.start()
         self.camera_handler.enable_recording()
         logger.info(
-            "Recording started -> %s (compression=%s bag=%s)",
+            "Recording started -> %s (compression=%s bag=%s fps=%s requested=%s)",
             output_path,
             self.processor.codec_label,
             bool(self._bag_path),
+            self.source.target_fps,
+            getattr(self, "_requested_fps", self.source.target_fps),
         )
+
+    def _align_elgato_fps(self) -> None:
+        """Force Elgato stamp to measured HDMI rate before opening VideoWriter."""
+        if getattr(self.source, "device_tag", "") != "elgato":
+            return
+        measure = getattr(self.source, "_measure_delivery_fps", None)
+        if not callable(measure):
+            return
+        self.camera_handler.pause_reads()
+        try:
+            rate = float(measure(0.55) or 0.0)
+        finally:
+            self.camera_handler.resume_reads()
+        if rate < 5:
+            return
+        self.source.actual_fps = rate
+        requested = int(getattr(self, "_requested_fps", self.source.target_fps) or 30)
+        if requested >= 90 and rate < requested * 0.85:
+            stamped = int(round(rate / 5.0) * 5) or 60
+            stamped = max(15, min(stamped, requested))
+            logger.warning(
+                "Elgato Record stamp %dfps → %dfps (measured ~%.1f). "
+                "Set HDMI source to 1080p120 for true 120.",
+                requested,
+                stamped,
+                rate,
+            )
+            self.source.target_fps = stamped
+        elif abs(rate - float(self.source.target_fps)) / max(self.source.target_fps, 1) > 0.12:
+            stamped = max(15, int(round(rate)))
+            self.source.target_fps = stamped
+            logger.info("Elgato stamp adjusted to measured ~%dfps", stamped)
 
     def stop_recording(self) -> dict:
         """Stop record path, keep preview alive if it was running."""
@@ -219,6 +260,8 @@ class Pipeline:
             except Exception:  # noqa: BLE001
                 logger.exception("monitor.stop failed")
         report = self.report()
+        if hasattr(self, "_requested_fps"):
+            report["requested_fps"] = int(self._requested_fps)
         self._last_report = report
         if self.output_path:
             try:
@@ -229,12 +272,34 @@ class Pipeline:
                 logger.exception("could not write report json")
         logger.info("Recording stopped: %s", report)
         if expected_bag is not None and not self._bag_written:
-            raise RuntimeError(
-                f"MP4 was saved, but RealSense .bag was not "
-                f"(expected {Path(expected_bag).name}). "
-                "Close RealSense Viewer, use USB 3, Start preview with .bag checked, "
-                "then Record again."
+            # Last chance: bag file may exist even if stop helper returned None.
+            candidate = Path(expected_bag)
+            if candidate.exists() and candidate.stat().st_size > 0:
+                self._bag_written = candidate
+                report["bag_path"] = str(candidate)
+                report["bag_recorded"] = True
+                self._last_report = report
+            else:
+                raise RuntimeError(
+                    f"MP4 was saved, but RealSense .bag was not "
+                    f"(expected {Path(expected_bag).name}). "
+                    "Close RealSense Viewer, use USB 3, check Also save RealSense .bag, "
+                    "then Record again."
+                )
+        # Auto-fix Elgato/webcam playback when stamp still disagrees with delivery.
+        if (
+            self.recorder is not None
+            and report.get("fps_mismatch")
+            and (
+                getattr(self.source, "device_tag", "") == "elgato"
+                or bool(getattr(self.source, "allow_fps_remux", False))
             )
+        ):
+            try:
+                if self.convert_container_fps():
+                    report = self._last_report or self.report()
+            except Exception:  # noqa: BLE001
+                logger.exception("auto FPS convert failed")
         return report
 
     def stop(self) -> dict:
@@ -276,6 +341,7 @@ class Pipeline:
             "width": self.source.width,
             "height": self.source.height,
             "target_fps": self.source.target_fps,
+            "requested_fps": int(getattr(self, "_requested_fps", self.source.target_fps)),
             "measured_fps": recorder_summary.get("measured_fps", 0.0),
             "container_fps": recorder_summary.get("container_fps", self.source.target_fps),
             "fps_corrected": recorder_summary.get("fps_corrected", False),

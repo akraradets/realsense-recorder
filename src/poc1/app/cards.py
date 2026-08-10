@@ -145,8 +145,8 @@ class CameraCard(tk.Frame):
         self.bag_check.grid(row=3, column=1, columnspan=3, sticky="w", pady=(4, 0))
         tk.Label(
             form,
-            text="With this checked, Record writes MP4 and a stamped .bag together "
-            "(RealSense only). Close RealSense Viewer; use USB 3.",
+            text="Checked = MP4 + .bag together. Must stay checked on a [realsense] device. "
+            "Close RealSense Viewer; USB 3.",
             bg=PANEL,
             fg=MUTED,
             font=("Segoe UI", 8),
@@ -258,6 +258,7 @@ class CameraCard(tk.Frame):
             return
         try:
             slot = self.session.assign_camera(self.slot_id, cam_id)
+            self.bag_var.set(bool(slot.record_bag))
             self._load_modes(slot)
             self._refresh_bag_enabled()
             self.preview.configure(image="", text="Start preview to see live video")
@@ -293,12 +294,18 @@ class CameraCard(tk.Frame):
 
     def _refresh_bag_enabled(self, locked: bool = False) -> None:
         slot = self.session.slots[self.slot_id]
-        bag_ok = (not locked) and slot.camera is not None and slot.camera.kind == "realsense"
-        if not bag_ok and self.bag_var.get():
-            self.bag_var.set(False)
+        is_rs = slot.camera is not None and slot.camera.kind == "realsense"
+        # Only clear .bag when the device is not RealSense. Never clear it just
+        # because the UI is locked/busy — that wiped record_bag right before
+        # Record and produced MP4-only takes with bag_recorded=false.
+        if not is_rs:
+            if self.bag_var.get():
+                self.bag_var.set(False)
             slot.record_bag = False
         try:
-            self.bag_check.configure(state="normal" if bag_ok else "disabled")
+            self.bag_check.configure(
+                state="disabled" if locked or not is_rs else "normal"
+            )
         except tk.TclError:
             pass
 
@@ -352,7 +359,16 @@ class CameraCard(tk.Frame):
 
     def tick(self) -> None:
         slot = self.session.slots[self.slot_id]
-        self.status_label.configure(text=slot.status)
+        status = slot.status
+        src = slot.pipeline.source if slot.pipeline else None
+        if src is not None and getattr(src, "device_tag", "") == "elgato":
+            measured = float(getattr(src, "actual_fps", 0) or 0)
+            wanted = int(getattr(src, "target_fps", 0) or 0)
+            if measured > 1:
+                status = f"{status} | delivering ~{measured:.0f}fps"
+                if wanted >= 90 and measured < wanted * 0.85:
+                    status += " (HDMI source is not 120Hz)"
+        self.status_label.configure(text=status)
         try:
             if slot.pipeline and slot.pipeline.camera_handler.is_recording:
                 self.badge.configure(text="Recording", bg="#fecaca", fg="#7f1d1d")
