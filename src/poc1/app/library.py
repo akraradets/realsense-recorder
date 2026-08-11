@@ -52,8 +52,8 @@ class LibraryPage(tk.Frame):
         tip.pack(fill="x")
         tk.Label(
             tip,
-            text="Library: play MP4; export RealSense .bag/.db3 or ROS2 bags → MP4 "
-            "(H.264 / H.265 when available). Arm/Record live on Setup + Record.",
+            text="Library (v4): select MP4 → Play. Select RealSense .db3/.bag → Export to MP4 → Play. "
+            "Record already saves MP4 + .db3 together — matching .mp4 is preferred when present.",
             bg=SURFACE,
             fg=MUTED,
             font=("Segoe UI", 9),
@@ -227,10 +227,23 @@ class LibraryPage(tk.Frame):
             self.selected = self.files[int(idxs[0])]
         path = self.selected
         if path.suffix.lower() in {".bag", ".bd3", ".db3"}:
-            messagebox.showinfo(
+            sibling = path.with_suffix(".mp4")
+            if sibling.is_file() and sibling.stat().st_size > 32:
+                if messagebox.askyesno(
+                    "Playback",
+                    f"{path.name} is a RealSense SDK file.\n\n"
+                    f"A matching Record MP4 exists:\n{sibling.name}\n\n"
+                    "Play that MP4 now?\n\n"
+                    "(Cancel = stay here; use Export selected to convert the .db3.)",
+                ):
+                    self._start_playback(sibling)
+                return
+            if messagebox.askyesno(
                 "Playback",
-                "Export this file to MP4 first, then play the result.",
-            )
+                f"{path.name} cannot play directly.\n\n"
+                "Export it to MP4 now, then play?",
+            ):
+                self._run_export(path)
             return
         self._start_playback(path)
 

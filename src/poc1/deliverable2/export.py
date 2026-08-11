@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import cv2
 import numpy as np
@@ -147,6 +147,117 @@ def _open_writer(
     return None, fourcc_str
 
 
+def _sibling_record_mp4(source: Path) -> Optional[Path]:
+    """MP4 written beside a RealSense .bag/.db3 on the same Record take."""
+    source = Path(source)
+    candidate = source.with_suffix(".mp4")
+    if candidate.is_file() and candidate.stat().st_size > 32:
+        return candidate
+    return None
+
+
+def _copy_sibling_mp4(
+    sibling: Path,
+    output: Path,
+    label: str,
+    progress: Callable[[str], None],
+) -> ExportResult:
+    progress(f"Using matching Record MP4: {sibling.name}")
+    output = Path(output)
+    if sibling.resolve() == output.resolve():
+        return ExportResult(
+            True,
+            output,
+            label,
+            message=f"Matching Record MP4 already at {output.name}",
+        )
+    shutil.copy2(sibling, output)
+    return ExportResult(
+        True,
+        output,
+        label,
+        message=f"Copied matching Record MP4 → {output.name}",
+    )
+
+
+def _start_realsense_playback(rs: Any, source: Path):
+    """
+    Open a RealSense .bag/.db3 for playback.
+
+    Important: do not force color+depth together — Record usually writes color
+    only, and enabling a missing stream makes resolve() fail.
+    """
+    source_s = str(Path(source).resolve())
+    last_exc: Optional[BaseException] = None
+
+    strategies: list[tuple[str, Callable[[], Any]]] = []
+
+    def _cfg_file_only():
+        pipeline = rs.pipeline()
+        config = rs.config()
+        try:
+            rs.config.enable_device_from_file(config, source_s, repeat_playback=False)
+        except TypeError:
+            rs.config.enable_device_from_file(config, source_s)
+        return pipeline, pipeline.start(config)
+
+    def _cfg_color():
+        pipeline = rs.pipeline()
+        config = rs.config()
+        try:
+            rs.config.enable_device_from_file(config, source_s, repeat_playback=False)
+        except TypeError:
+            rs.config.enable_device_from_file(config, source_s)
+        config.enable_stream(rs.stream.color)
+        return pipeline, pipeline.start(config)
+
+    def _cfg_depth():
+        pipeline = rs.pipeline()
+        config = rs.config()
+        try:
+            rs.config.enable_device_from_file(config, source_s, repeat_playback=False)
+        except TypeError:
+            rs.config.enable_device_from_file(config, source_s)
+        config.enable_stream(rs.stream.depth)
+        return pipeline, pipeline.start(config)
+
+    def _load_device():
+        ctx = rs.context()
+        device = ctx.load_device(source_s)
+        pipeline = rs.pipeline()
+        config = rs.config()
+        # Bind to the loaded playback device by serial when available.
+        try:
+            serial = device.get_info(rs.camera_info.serial_number)
+            config.enable_device(serial)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            rs.config.enable_device_from_file(config, source_s, repeat_playback=False)
+        except TypeError:
+            try:
+                rs.config.enable_device_from_file(config, source_s)
+            except Exception:  # noqa: BLE001
+                pass
+        return pipeline, pipeline.start(config)
+
+    for name, fn in (
+        ("file-streams", _cfg_file_only),
+        ("color", _cfg_color),
+        ("depth", _cfg_depth),
+        ("load_device", _load_device),
+    ):
+        try:
+            pipeline, profile = fn()
+            logger.info("RealSense playback opened via %s: %s", name, source.name)
+            return pipeline, profile
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            logger.warning("RealSense playback %s failed for %s: %s", name, source.name, exc)
+
+    raise RuntimeError(str(last_exc) if last_exc else "Could not open RealSense recording")
+
+
 def _export_realsense_bag(
     source: Path,
     output: Path,
@@ -167,26 +278,19 @@ def _export_realsense_bag(
         )
 
     source = Path(source).resolve()
-    progress(f"Opening RealSense recording: {source.name}")
-    pipeline = rs.pipeline()
-    config = rs.config()
-    try:
-        rs.config.enable_device_from_file(config, str(source), repeat_playback=False)
-    except TypeError:
-        # Older pyrealsense2 bindings without repeat_playback kwarg.
-        rs.config.enable_device_from_file(config, str(source))
-    # Prefer color; enable depth as fallback for older bags.
-    try:
-        config.enable_stream(rs.stream.color)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        config.enable_stream(rs.stream.depth)
-    except Exception:  # noqa: BLE001
-        pass
+    if not source.is_file():
+        return ExportResult(False, None, label, message=f"File not found: {source}")
+    if source.stat().st_size < 64:
+        return ExportResult(
+            False,
+            None,
+            label,
+            message=f"{source.name} is empty/too small — re-Record with SDK file checked",
+        )
 
+    progress(f"Opening RealSense recording: {source.name}")
     try:
-        profile = pipeline.start(config)
+        pipeline, profile = _start_realsense_playback(rs, source)
     except Exception as exc:  # noqa: BLE001
         return ExportResult(
             False,
@@ -195,8 +299,11 @@ def _export_realsense_bag(
             message=f"Could not open RealSense recording: {exc}",
         )
 
-    playback = profile.get_device().as_playback()
-    playback.set_real_time(False)
+    try:
+        playback = profile.get_device().as_playback()
+        playback.set_real_time(False)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("as_playback failed (continuing): %s", exc)
 
     colorizer = rs.colorizer()
     writer: Optional[cv2.VideoWriter] = None
@@ -206,7 +313,6 @@ def _export_realsense_bag(
     fps = 30.0
 
     try:
-        # Probe FPS from color profile when present.
         try:
             color_prof = profile.get_stream(rs.stream.color).as_video_stream_profile()
             fps = float(color_prof.fps() or 30)
@@ -219,15 +325,22 @@ def _export_realsense_bag(
 
         while True:
             try:
-                frameset = pipeline.wait_for_frames(timeout_ms=2000)
+                frameset = pipeline.wait_for_frames(timeout_ms=2500)
             except RuntimeError:
                 break
             color = frameset.get_color_frame()
             if color:
                 frame = np.asanyarray(color.get_data())
-                # RealSense color is often RGB; OpenCV writer expects BGR.
                 if frame.ndim == 3 and frame.shape[2] == 3:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    # RealSense color frames are often RGB; OpenCV wants BGR.
+                    # Heuristic: if format reports bgr8, skip swap.
+                    try:
+                        fmt = color.get_profile().format()
+                        is_bgr = fmt == rs.format.bgr8
+                    except Exception:  # noqa: BLE001
+                        is_bgr = False
+                    if not is_bgr:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             else:
                 depth = frameset.get_depth_frame()
                 if not depth:
@@ -695,12 +808,17 @@ def _export_bd3_or_db3(
     """
     .bd3 / .db3 may be:
       - RealSense SDK recordings (newer librealsense) — play via pyrealsense2
+      - Matching Record MP4 beside the file (same take) — copy/reuse
       - ROS2 bags with sensor_msgs Image topics — play via rosbags
     """
     source = Path(source)
 
-    # 1) RealSense SDK first — POC1 Record writes RealSense .db3 this way.
-    #    Do NOT rename to .bag; modern SDK requires the .db3 extension for playback.
+    # 0) Same-take MP4 from Record — preferred for playback (already encoded).
+    sibling = _sibling_record_mp4(source)
+    if sibling is not None:
+        return _copy_sibling_mp4(sibling, output, label, progress)
+
+    # 1) RealSense SDK — do NOT rename to .bag (breaks modern librealsense).
     rs_try = _export_realsense_bag(source, output, fourcc, label, progress)
     if rs_try.ok:
         return rs_try
@@ -727,9 +845,10 @@ def _export_bd3_or_db3(
         f"OpenCV: {result.message}\n"
         f"ffmpeg: {ff.message}\n\n"
         "Tips:\n"
-        "  • RealSense recordings from this app need: uv sync --extra realsense\n"
-        "  • You can also play the matching .mp4 from the same Record take\n"
-        "  • True ROS2 bags need sensor_msgs/Image topics (uv sync for rosbags)\n"
-        "  • Or open the .db3 in Intel RealSense Viewer"
+        "  • Pull latest Poc1, then: uv sync --extra realsense && uv run poc1\n"
+        "  • Title must show sdk-record-v4 (old builds still fail on .db3)\n"
+        "  • Re-Record so MP4 + .db3 are saved together, then Export uses the MP4\n"
+        "  • Or open the .db3 in Intel RealSense Viewer\n"
+        "  • RealSense .db3 does not use ROS sensor_msgs/Image topics — that is normal"
     )
     return ExportResult(False, None, label, message=guidance)

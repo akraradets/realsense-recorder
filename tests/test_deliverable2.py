@@ -78,6 +78,17 @@ def test_export_bd3_unreadable_gives_clear_error(tmp_path: Path):
     assert "Could not convert" in result.message or "failed" in result.message.lower()
 
 
+def test_export_db3_uses_sibling_record_mp4(tmp_path: Path):
+    """When Record saved MP4 + .db3 together, Export reuses the MP4."""
+    db3 = tmp_path / "cam1_take.db3"
+    db3.write_bytes(b"not a real bag")
+    sibling = _write_tiny_mp4(tmp_path / "cam1_take.mp4", frames=8)
+    out = tmp_path / "cam1_take_h264.mp4"
+    result = export_to_mp4(db3, out, codec="h264")
+    assert result.ok, result.message
+    assert out.is_file() and out.stat().st_size > 32
+    assert "matching" in result.message.lower() or out.stat().st_size == sibling.stat().st_size
+
 def test_export_rosbag2_db3_to_mp4(tmp_path: Path):
     """R10: ROS2 .db3 with Image topic exports to a playable MP4."""
     pytest.importorskip("rosbags")
