@@ -145,10 +145,14 @@ class Pipeline:
             finally:
                 self.camera_handler.resume_reads()
 
-        # Capture cards often advertise 120 while HDMI only sends ~60. Stamp the
-        # MP4 at the real delivery rate so playback matches wall-clock time.
-        self._requested_fps = int(getattr(self.source, "target_fps", 30) or 30)
-        self._align_elgato_fps()
+        # Capture cards / UVC often advertise 120 while HDMI only sends ~60.
+        self._requested_fps = int(
+            getattr(self.source, "requested_fps", None)
+            or getattr(self.source, "target_fps", 30)
+            or 30
+        )
+        self.source.requested_fps = self._requested_fps
+        self._align_capture_fps()
 
         # Compression lives in the processor; recorder only accounts encoded tokens.
         self.processor.configure_output(
@@ -186,18 +190,17 @@ class Pipeline:
             getattr(self, "_requested_fps", self.source.target_fps),
         )
 
-    def _align_elgato_fps(self) -> None:
-        """Force Elgato stamp to measured HDMI rate before opening VideoWriter."""
-        if getattr(self.source, "device_tag", "") != "elgato":
+    def _align_capture_fps(self) -> None:
+        """Stamp MP4 at the real delivery rate. Never steal the live UVC handle."""
+        tag = str(getattr(self.source, "device_tag", "") or "")
+        if tag not in {"elgato", "uvc"}:
             return
-        measure = getattr(self.source, "_measure_delivery_fps", None)
-        if not callable(measure):
-            return
-        self.camera_handler.pause_reads()
-        try:
-            rate = float(measure(0.55) or 0.0)
-        finally:
-            self.camera_handler.resume_reads()
+        # Preview already owns VideoCapture. Reading it here while the capture
+        # thread is paused left Elgato at 0/0 after a working live preview.
+        rate = float(getattr(self.source, "actual_fps", 0) or 0)
+        hint = float(getattr(self, "_preview_fps_hint", 0) or 0)
+        if hint >= 5:
+            rate = max(rate, hint)
         if rate < 5:
             return
         self.source.actual_fps = rate
@@ -206,8 +209,9 @@ class Pipeline:
             stamped = int(round(rate / 5.0) * 5) or 60
             stamped = max(15, min(stamped, requested))
             logger.warning(
-                "Elgato Record stamp %dfps → %dfps (measured ~%.1f). "
+                "%s Record stamp %dfps → %dfps (measured ~%.1f). "
                 "Set HDMI source to 1080p120 for true 120.",
+                tag,
                 requested,
                 stamped,
                 rate,
@@ -216,7 +220,10 @@ class Pipeline:
         elif abs(rate - float(self.source.target_fps)) / max(self.source.target_fps, 1) > 0.12:
             stamped = max(15, int(round(rate)))
             self.source.target_fps = stamped
-            logger.info("Elgato stamp adjusted to measured ~%dfps", stamped)
+            logger.info("%s stamp adjusted to measured ~%dfps", tag, stamped)
+
+    def _align_elgato_fps(self) -> None:
+        self._align_capture_fps()
 
     def stop_recording(self) -> dict:
         """Stop record path, keep preview alive if it was running."""
@@ -265,7 +272,13 @@ class Pipeline:
         self._last_report = report
         if self.output_path:
             try:
-                report_path = self.output_path.with_suffix(".report.json")
+                if self.monitor_csv is not None:
+                    report_path = Path(self.monitor_csv).with_name(
+                        f"{self.output_path.stem}.report.json"
+                    )
+                else:
+                    report_path = self.output_path.with_suffix(".report.json")
+                report_path.parent.mkdir(parents=True, exist_ok=True)
                 report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
                 report["report_path"] = str(report_path)
             except Exception:  # noqa: BLE001
@@ -327,6 +340,26 @@ class Pipeline:
         dropped_proc = self.camera_handler.processor_queue.dropped_count
         dropped_rec = recorder_summary["dropped_before_recorder"]
         proc_summary = self.processor.summary()
+        no_drops = (
+            read > 0
+            and read == written
+            and not gaps
+            and dropped_proc == 0
+            and dropped_rec == 0
+        )
+        no_capture = read == 0
+        requested = int(getattr(self, "_requested_fps", self.source.target_fps) or 30)
+        measured = float(recorder_summary.get("measured_fps") or 0)
+        if measured < 5:
+            measured = float(getattr(self.source, "actual_fps", 0) or 0)
+        container = recorder_summary.get("container_fps", self.source.target_fps)
+        tag = str(getattr(self.source, "device_tag", "") or "")
+        r7_120_ok = bool(
+            tag == "elgato"
+            and no_drops
+            and measured >= 110.0
+        )
+        hdmi_not_120 = bool(tag == "elgato" and requested >= 90 and measured < requested * 0.85)
         return {
             "frames_read_by_camera": read,
             "frames_processed": self.processor.frames_processed,
@@ -341,9 +374,9 @@ class Pipeline:
             "width": self.source.width,
             "height": self.source.height,
             "target_fps": self.source.target_fps,
-            "requested_fps": int(getattr(self, "_requested_fps", self.source.target_fps)),
-            "measured_fps": recorder_summary.get("measured_fps", 0.0),
-            "container_fps": recorder_summary.get("container_fps", self.source.target_fps),
+            "requested_fps": requested,
+            "measured_fps": measured,
+            "container_fps": container,
             "fps_corrected": recorder_summary.get("fps_corrected", False),
             "fps_mismatch": recorder_summary.get("fps_mismatch", False),
             "suggested_container_fps": recorder_summary.get(
@@ -354,13 +387,11 @@ class Pipeline:
             "compression_stage": "processor",
             "bag_path": str(self._bag_written) if self._bag_written else "",
             "bag_recorded": bool(self._bag_written),
-            "no_frame_drops": (
-                read > 0
-                and read == written
-                and not gaps
-                and dropped_proc == 0
-                and dropped_rec == 0
-            ),
+            "no_frame_drops": no_drops,
+            "no_capture": no_capture,
+            "r7_120_ok": r7_120_ok,
+            "hdmi_not_120hz": hdmi_not_120,
+            "device_tag": tag,
         }
 
     def convert_container_fps(self) -> bool:
@@ -370,7 +401,13 @@ class Pipeline:
         ok = self.recorder.convert_container_fps()
         if ok and self.output_path:
             report = self.report()
-            report_path = self.output_path.with_suffix(".report.json")
+            if self.monitor_csv is not None:
+                report_path = Path(self.monitor_csv).with_name(
+                    f"{self.output_path.stem}.report.json"
+                )
+            else:
+                report_path = self.output_path.with_suffix(".report.json")
+            report_path.parent.mkdir(parents=True, exist_ok=True)
             report["report_path"] = str(report_path)
             report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
             self._last_report = report

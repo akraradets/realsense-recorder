@@ -20,11 +20,11 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
-import cv2
 from PIL import Image, ImageTk
 
 from poc1.app.cards import CameraCard
 from poc1.app.library import LibraryPage
+from poc1.preview_draw import bgr_to_rgb_fill, hud_lines_for_source, overlay_hud
 from poc1.app.theme import (
     ACCENT,
     ACCENT_SOFT,
@@ -42,6 +42,7 @@ from poc1.app.theme import (
     button,
 )
 from poc1.deliverable1.session import MultiCamSession
+from poc1.deliverable1.devices import is_fhd_high_rate, too_many_1080p120
 from poc1.deliverable2.review import show_review_prompt
 from poc1.quiet import configure_app_logging, silence_opencv
 
@@ -208,8 +209,9 @@ class UnifiedApp:
         adv.pack(fill="x", padx=8, pady=(4, 0))
         tk.Label(
             adv,
-            text="Files are compressed MP4 (+ optional RealSense .bag/.db3). "
-            "System usage CSV and JSON reports are written next to each take. "
+            text="MP4 + optional RealSense .db3/.bag stay in the save folder. "
+            "JSON reports and sysmon CSV go in a meta/ subfolder. "
+            "Close RealSense Viewer before Record so Elgato is not locked. "
             "Library can export bags to MP4.",
             fg=MUTED,
             font=("Segoe UI", 8),
@@ -241,6 +243,17 @@ class UnifiedApp:
     def _build_record(self) -> None:
         tip = tk.Frame(self.record_page, bg=SURFACE, padx=16, pady=10)
         tip.pack(fill="x", padx=4, pady=(4, 0))
+        tk.Label(
+            tip,
+            text="Multi-cam: RealSense/webcam @30 (or @60 if the device has it) + Elgato 1080p120 together. "
+            "Do not arm two 1080p@120 cameras. HDMI must be 1080p120 for true Elgato 120.",
+            bg=SURFACE,
+            fg=INK,
+            font=("Segoe UI Semibold", 9),
+            anchor="w",
+            wraplength=1000,
+            justify="left",
+        ).pack(fill="x")
         self.record_tip = tk.StringVar()
         tk.Label(
             tip,
@@ -397,13 +410,88 @@ class UnifiedApp:
         if self.busy:
             return
         self._sync_all()
+        self._set_busy(True)
+        self.set_status("Opening cameras… (UI stays responsive)")
+        for card in self.cards:
+            if self.session.slots[card.slot_id].pipeline is None:
+                card.preview.configure(image="", text="Opening camera…")
+
+        def worker() -> None:
+            error: Optional[str] = None
+            try:
+                self.session.start_previews()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("start_previews failed")
+                error = str(exc)
+            self.root.after(0, lambda err=error: self._previews_started(err))
+
+        threading.Thread(target=worker, name="app-preview-start", daemon=True).start()
+
+    def start_slot_preview_async(self, slot_id: int) -> None:
+        if self.busy:
+            return
         try:
-            self.session.start_previews()
-            running = len([s for s in self.session.slots if s.pipeline])
+            self.cards[slot_id].sync_controls()
+        except Exception:  # noqa: BLE001
+            pass
+        self._set_busy(True)
+        self.set_status(f"Opening camera {slot_id + 1}…")
+        try:
+            self.cards[slot_id].preview.configure(image="", text="Opening camera…")
+        except Exception:  # noqa: BLE001
+            pass
+
+        def worker() -> None:
+            error: Optional[str] = None
+            try:
+                self.session.start_slot_preview(slot_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("start_slot_preview failed")
+                error = str(exc)
+            self.root.after(0, lambda err=error, sid=slot_id: self._slot_preview_started(sid, err))
+
+        threading.Thread(
+            target=worker, name=f"app-preview-slot{slot_id}", daemon=True
+        ).start()
+
+    def _previews_started(self, error: Optional[str]) -> None:
+        self._set_busy(False)
+        running = len([s for s in self.session.slots if s.pipeline])
+        if error:
+            self.set_status(f"{running} preview(s) live. Some failed.")
+            messagebox.showerror(
+                "Preview",
+                error + "\n\nClose Zoom/Teams/Camera and extra POC1 windows, "
+                "pick 1280x720@30 mjpg for the laptop webcam, then try one camera at a time.",
+            )
+        else:
             self.set_status(f"{running} preview(s) live. Open Record when ready.")
-            self.refresh_record_gate()
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Preview", str(exc))
+        self.refresh_record_gate()
+
+    def _slot_preview_started(self, slot_id: int, error: Optional[str]) -> None:
+        self._set_busy(False)
+        if error:
+            self.set_status(f"Camera {slot_id + 1} preview failed.")
+            messagebox.showerror(
+                f"Camera {slot_id + 1}",
+                f"{error}\n\nClose other camera apps, use 1280x720@30 mjpg, then try again.",
+            )
+        else:
+            self.set_status(f"Camera {slot_id + 1} is live.")
+            self.root.after(3500, lambda: self._warn_slot_if_no_frames(slot_id))
+        self.refresh_record_gate()
+
+    def _warn_slot_if_no_frames(self, slot_id: int) -> None:
+        if slot_id >= len(self.session.slots):
+            return
+        slot = self.session.slots[slot_id]
+        if slot.pipeline is None or slot.get_preview_frame() is not None:
+            return
+        messagebox.showwarning(
+            f"Camera {slot_id + 1}",
+            "Opened, but no image yet. Close other camera apps, check the webcam, "
+            "then Start preview again.",
+        )
 
     def stop_all_previews(self) -> None:
         if self.busy:
@@ -434,6 +522,46 @@ class UnifiedApp:
         if waiting:
             return False, "Need live preview before Record: " + "; ".join(waiting)
         return True, f"Ready to record {len(armed)} camera(s)."
+
+    def _elgato_live_lines(self) -> list[str]:
+        lines: list[str] = []
+        for slot in self.session.slots:
+            if not slot.armed or slot.pipeline is None:
+                continue
+            src = slot.pipeline.source
+            if getattr(src, "device_tag", "") != "elgato":
+                continue
+            measured = float(getattr(src, "actual_fps", 0) or 0)
+            requested = int(
+                getattr(src, "requested_fps", 0)
+                or getattr(src, "target_fps", 0)
+                or 0
+            )
+            stamp = int(getattr(src, "target_fps", 0) or 0)
+            if measured < 1:
+                continue
+            line = (
+                f"{slot.prefix}: requested {requested} fps, delivering ~{measured:.0f}"
+            )
+            if requested >= 90 and measured < requested * 0.85:
+                line += f" (HDMI source is not 120Hz; playback stamp ~{stamp})"
+            lines.append(line)
+        return lines
+
+    def _prepare_high_rate_solo(self) -> bool:
+        """Refuse two 1080p@≥90 takes. Allow one 120 + @30/@60 companions."""
+        armed = [s for s in self.session.slots if s.armed]
+        if too_many_1080p120([s.mode for s in armed]):
+            high = [s.prefix for s in armed if is_fhd_high_rate(s.mode)]
+            messagebox.showerror(
+                "Too many 1080p@120 cameras",
+                "Only one 1920x1080@90+ camera per Record.\n"
+                f"Currently: {', '.join(high)}.\n\n"
+                "Keep Elgato (or fake) 1080p120, and set the others to @30 or @60. "
+                "Webcam + fake 1080p120 together drops frames.",
+            )
+            return False
+        return True
 
     def refresh_record_gate(self) -> None:
         if self.busy or self.session.is_recording:
@@ -484,8 +612,10 @@ class UnifiedApp:
                 fg="#94a3b8",
                 text="No preview",
                 font=("Segoe UI", 10),
+                bd=0,
+                highlightthickness=0,
             )
-            tile.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+            tile.pack(fill="both", expand=True, padx=4, pady=(0, 4))
             self._record_tiles.append(tile)
             self._record_photos.append(None)
 
@@ -498,17 +628,14 @@ class UnifiedApp:
             frame = slot.get_preview_frame()
             if frame is None:
                 continue
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w = rgb.shape[:2]
-            max_w = max(tile.winfo_width(), 240)
-            max_h = max(tile.winfo_height(), 160)
-            scale = min(max_w / max(w, 1), max_h / max(h, 1), 1.0)
-            if scale < 1.0:
-                rgb = cv2.resize(
-                    rgb,
-                    (max(1, int(w * scale)), max(1, int(h * scale))),
-                    interpolation=cv2.INTER_AREA,
-                )
+            tw = tile.winfo_width()
+            th = tile.winfo_height()
+            if tw < 40 or th < 40:
+                continue
+            rgb = bgr_to_rgb_fill(frame, tw, th)
+            src = slot.pipeline.source if slot.pipeline else None
+            if src is not None:
+                rgb = overlay_hud(rgb, hud_lines_for_source(slot, src))
             photo = ImageTk.PhotoImage(Image.fromarray(rgb))
             self._record_photos[i] = photo
             tile.configure(image=photo, text="")
@@ -561,6 +688,8 @@ class UnifiedApp:
         if not ok:
             messagebox.showinfo("Not ready", tip)
             return
+        if not self._prepare_high_rate_solo():
+            return
         try:
             self._sync_all()
         except Exception as exc:  # noqa: BLE001
@@ -585,7 +714,7 @@ class UnifiedApp:
         ]
         if len(armed) >= 2 and heavy:
             self.set_status(
-                "High-rate multi-cam — recording at configured FPS (encoder may drop if overloaded)."
+                "High-rate multi-cam — encode will finish every queued frame on Stop."
             )
 
         self._set_busy(True)
@@ -615,7 +744,12 @@ class UnifiedApp:
             messagebox.showerror("Recording", error)
             return
         self._set_busy(False, recording=True)
-        self.record_tip.set(f"Recording {len(paths)} camera(s)…")
+        n = max(1, len(paths))
+        extra = self._elgato_live_lines()
+        tip = f"Recording {n} camera(s)…"
+        if extra:
+            tip += "  " + "  ·  ".join(extra)
+        self.record_tip.set(tip)
         bags = [
             s.prefix
             for s in self.session.slots
@@ -691,6 +825,22 @@ class UnifiedApp:
             if ok
             else "Saved. Check Last report if something looks off."
         )
+        hdmi = [r for r in valid if r.get("hdmi_not_120hz")]
+        if hdmi:
+            bits = []
+            for report in hdmi:
+                bits.append(
+                    f"requested {report.get('requested_fps')} → measured "
+                    f"~{float(report.get('measured_fps') or 0):.0f}, "
+                    f"file stamped {report.get('container_fps')}"
+                )
+            status += (
+                " HDMI source is not 120Hz ("
+                + "; ".join(bits)
+                + ") — playback stamp is measured rate, not a drop."
+            )
+        if any(r.get("r7_120_ok") for r in valid):
+            status += " Elgato ~120 with no software drops."
         if bag_ok:
             status += f" .bag saved: {', '.join(p for p, _ in bag_ok)}."
         self.set_status(status)
@@ -703,10 +853,29 @@ class UnifiedApp:
                 + "\n\nClose RealSense Viewer, use USB 3, keep .bag checked, Record again.",
             )
 
+        no_capture = []
+        for slot in self.session.slots:
+            report = reports.get(slot.prefix) or {}
+            if "error" in report:
+                continue
+            if int(report.get("frames_read_by_camera") or 0) == 0:
+                no_capture.append(slot.prefix)
+        if no_capture:
+            messagebox.showerror(
+                "No frames captured",
+                "Preview was live but Record counted 0 frames on:\n"
+                + ", ".join(no_capture)
+                + "\n\nThis is not a slow-PC / skipped-encode problem.\n"
+                "Close Intel RealSense Viewer and Elgato 4K Capture Utility, "
+                "confirm HDMI is on, then Start preview again and Record.\n"
+                "Title bar must show sdk-record-v10 (not v4).",
+            )
+
         mismatched = [
             (slot, reports.get(slot.prefix, {}))
             for slot in self.session.slots
             if reports.get(slot.prefix, {}).get("fps_mismatch")
+            and int(reports.get(slot.prefix, {}).get("frames_read_by_camera") or 0) > 0
         ]
         # Auto-fix remaining mismatches (Elgato already auto-fixed in pipeline).
         if mismatched:
@@ -731,17 +900,23 @@ class UnifiedApp:
                 report = reports.get(slot.prefix) or {}
                 if report.get("no_frame_drops", True):
                     continue
+                if report.get("hdmi_not_120hz"):
+                    continue
+                if int(report.get("frames_read_by_camera") or 0) == 0:
+                    continue
                 drop_notes.append(
                     f"{slot.prefix}: wrote {report.get('frames_written')} of "
-                    f"{report.get('frames_read_by_camera')} frames"
+                    f"{report.get('frames_read_by_camera')} frames "
+                    f"(requested {report.get('requested_fps')}, "
+                    f"measured ~{float(report.get('measured_fps') or 0):.0f})"
                 )
             if drop_notes:
                 messagebox.showwarning(
                     "Some frames were skipped",
-                    "The PC couldn’t keep up with encode on:\n\n"
+                    "Encode could not keep up (read ≠ written) on:\n\n"
                     + "\n".join(drop_notes)
-                    + "\n\nTip: for a clean FHD@120 proof, record only the synthetic "
-                    "fake camera (or run poc1.proof).",
+                    + "\n\nHDMI ~60 is not this error. Keep companions at @30/@60; "
+                    "only one 1080p@120 (Elgato) per take.",
                 )
 
         saved: list[Path] = []
@@ -823,6 +998,10 @@ class UnifiedApp:
                 key: report.get(key)
                 for key in (
                     "no_frame_drops",
+                    "no_capture",
+                    "r7_120_ok",
+                    "hdmi_not_120hz",
+                    "device_tag",
                     "frames_read_by_camera",
                     "frames_written",
                     "width",
@@ -861,16 +1040,25 @@ class UnifiedApp:
     def _tick(self) -> None:
         if self._closing:
             return
-        for card in self.cards:
-            card.tick()
         try:
-            if self.notebook.select() == str(self.record_page):
-                self._tick_record_tiles()
-                if not self.busy and not self.session.is_recording:
-                    self.refresh_record_gate()
+            page = self.notebook.select()
         except tk.TclError:
-            pass
-        self.root.after(50, self._tick)
+            page = ""
+        # Only redraw the visible page — Setup+Record both converting HD frames
+        # was freezing Tk ("Not Responding").
+        if page == str(self.setup_page):
+            for card in self.cards:
+                card.tick()
+        elif page == str(self.record_page):
+            self._tick_record_tiles()
+            if self.session.is_recording:
+                extra = self._elgato_live_lines()
+                if extra:
+                    self.record_tip.set("Recording…  " + "  ·  ".join(extra))
+            elif not self.busy:
+                self.refresh_record_gate()
+        delay_ms = 80
+        self.root.after(delay_ms, self._tick)
 
     def _on_close(self) -> None:
         if self.busy:

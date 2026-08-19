@@ -5,7 +5,6 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import TYPE_CHECKING, Optional
 
-import cv2
 from PIL import Image, ImageTk
 
 from poc1.app.theme import (
@@ -20,6 +19,7 @@ from poc1.app.theme import (
     SURFACE,
     button,
 )
+from poc1.preview_draw import bgr_to_rgb_fill, hud_lines_for_source, overlay_hud
 from poc1.deliverable1.devices import StreamMode
 from poc1.deliverable1.session import CameraSlot
 
@@ -153,7 +153,7 @@ class CameraCard(tk.Frame):
         ).grid(row=4, column=1, columnspan=3, sticky="w", pady=(0, 4))
 
         self.preview_shell = tk.Frame(
-            self, bg="#0b1220", height=200, highlightbackground=BORDER, highlightthickness=1
+            self, bg="#0b1220", height=260, highlightbackground=BORDER, highlightthickness=1
         )
         self.preview_shell.pack(fill="x", padx=14, pady=(0, 8))
         self.preview_shell.pack_propagate(False)
@@ -289,6 +289,10 @@ class CameraCard(tk.Frame):
         self.session.set_armed(self.slot_id, self.armed_var.get())
         self.app.refresh_record_gate()
 
+    def set_armed_ui(self, armed: bool) -> None:
+        self.armed_var.set(bool(armed))
+        self.session.set_armed(self.slot_id, bool(armed))
+
     def _sync_bag(self) -> None:
         self.session.slots[self.slot_id].record_bag = self.bag_var.get()
 
@@ -330,16 +334,7 @@ class CameraCard(tk.Frame):
     def start_preview(self) -> None:
         if self.app.busy:
             return
-        try:
-            self.session.start_slot_preview(self.slot_id)
-            self.app.set_status(f"Camera {self.slot_id + 1} is live.")
-            self.app.root.after(3500, self._warn_if_no_preview_frames)
-            self.app.refresh_record_gate()
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror(
-                f"Camera {self.slot_id + 1}",
-                f"{exc}\n\nClose other camera apps, check USB/HDMI, then try again.",
-            )
+        self.app.start_slot_preview_async(self.slot_id)
 
     def _warn_if_no_preview_frames(self) -> None:
         slot = self.session.slots[self.slot_id]
@@ -376,11 +371,13 @@ class CameraCard(tk.Frame):
         src = slot.pipeline.source if slot.pipeline else None
         if src is not None and getattr(src, "device_tag", "") == "elgato":
             measured = float(getattr(src, "actual_fps", 0) or 0)
-            wanted = int(getattr(src, "target_fps", 0) or 0)
+            wanted = int(
+                getattr(src, "requested_fps", 0) or getattr(src, "target_fps", 0) or 0
+            )
             if measured > 1:
                 status = f"{status} | delivering ~{measured:.0f}fps"
                 if wanted >= 90 and measured < wanted * 0.85:
-                    status += " (HDMI source is not 120Hz)"
+                    status += " (HDMI source is not 120Hz; stamp ~measured, not a drop)"
         self.status_label.configure(text=status)
         try:
             if slot.pipeline and slot.pipeline.camera_handler.is_recording:
@@ -395,16 +392,10 @@ class CameraCard(tk.Frame):
         frame = slot.get_preview_frame()
         if frame is None:
             return
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
-        max_w = max(self.preview_shell.winfo_width() - 6, 280)
-        max_h = 190
-        scale = min(max_w / max(w, 1), max_h / max(h, 1), 1.0)
-        if scale < 1.0:
-            rgb = cv2.resize(
-                rgb,
-                (max(1, int(w * scale)), max(1, int(h * scale))),
-                interpolation=cv2.INTER_AREA,
-            )
+        tw = max(self.preview_shell.winfo_width() - 4, 280)
+        th = max(self.preview_shell.winfo_height() - 4, 160)
+        rgb = bgr_to_rgb_fill(frame, tw, th)
+        if src is not None:
+            rgb = overlay_hud(rgb, hud_lines_for_source(slot, src))
         self._photo = ImageTk.PhotoImage(Image.fromarray(rgb))
         self.preview.configure(image=self._photo, text="")

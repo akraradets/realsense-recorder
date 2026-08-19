@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+from poc1.preview_draw import PREVIEW_HZ, downscale_for_preview
 from poc1.bag_recorder import clear_bag_on_source, with_sdk_record_suffix
 from poc1.camera_handler import FrameEnvelope
 from poc1.deliverable1.devices import (
@@ -27,7 +28,7 @@ from poc1.pipeline import Pipeline
 
 logger = logging.getLogger("poc1.d1.session")
 
-DEFAULT_PREFIXES = ("cam1", "cam2", "m", "r")
+DEFAULT_PREFIXES = ("m", "r")
 
 
 def _default_prefix(index: int) -> str:
@@ -53,12 +54,21 @@ class CameraSlot:
     record_bag: bool = False
     _frame_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _preview_ts: list[float] = field(default_factory=list, repr=False)
+    _preview_draw_t: float = field(default=0.0, repr=False)
 
     def on_preview(self, env: FrameEnvelope) -> None:
+        # Preview is display-only. Do not copy full 1080p@120 onto the UI path.
+        now = time.monotonic()
+        min_dt = 1.0 / PREVIEW_HZ
+        if now - self._preview_draw_t < min_dt:
+            return
+        if env.frame is None:
+            return
+        small = downscale_for_preview(env.frame)
+        self._preview_draw_t = now
         with self._frame_lock:
-            self.last_frame = env.frame.copy() if env.frame is not None else None
-            now = time.time()
-            self._preview_ts.append(now)
+            self.last_frame = small
+            self._preview_ts.append(time.time())
             if len(self._preview_ts) > 90:
                 self._preview_ts = self._preview_ts[-90:]
 
@@ -66,7 +76,7 @@ class CameraSlot:
         with self._frame_lock:
             if self.last_frame is None:
                 return None
-            return self.last_frame.copy()
+            return self.last_frame
 
     def estimate_preview_fps(self) -> Optional[float]:
         """Recent live preview rate (informational only — never changes record stamp)."""
@@ -207,7 +217,7 @@ class MultiCamSession:
 
     def set_prefix(self, slot_id: int, prefix: str) -> None:
         """R4 — naming prefix for this slot's files."""
-        p = (prefix or "").strip() or f"cam{slot_id + 1}"
+        p = (prefix or "").strip() or _default_prefix(slot_id)
         self.slots[slot_id].prefix = p
 
     def set_armed(self, slot_id: int, armed: bool) -> None:
@@ -332,19 +342,24 @@ class MultiCamSession:
             if len(prefixes) != len(set(prefixes)):
                 raise RuntimeError(
                     "Armed cameras must use different naming prefixes "
-                    "(for example cam1 and cam2)"
+                    "(for example m and r)"
                 )
 
             self.out_dir.mkdir(parents=True, exist_ok=True)
             if not self.out_dir.is_dir():
                 raise RuntimeError(f"Save folder is not a directory: {self.out_dir}")
+            meta_dir = self.out_dir / "meta"
+            meta_dir.mkdir(parents=True, exist_ok=True)
             stamp = stamp or datetime.now().strftime("%Y%m%d_%H%M%S")
             paths: list[Path] = []
             started: list[CameraSlot] = []
             try:
                 for s in armed:
+                    hint = s.estimate_preview_fps()
+                    if hint and s.pipeline is not None:
+                        s.pipeline._preview_fps_hint = float(hint)
                     mp4 = self.out_dir / f"{s.prefix}_{stamp}.mp4"
-                    csv = self.out_dir / f"{s.prefix}_{stamp}_sysmon.csv"
+                    csv = meta_dir / f"{s.prefix}_{stamp}_sysmon.csv"
                     bag = None
                     want_bag = bool(intent.get(s.slot_id, s.record_bag))
                     if want_bag:

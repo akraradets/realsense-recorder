@@ -50,6 +50,9 @@ def test_fake_pipeline_no_drops(tmp_path: Path):
     assert report["dropped_processor_queue"] == 0
     assert report["dropped_recorder_queue"] == 0
     assert report["no_frame_drops"] is True
+    assert report.get("requested_fps") == 60
+    assert report.get("r7_120_ok") is False
+    assert "container_fps" in report
     assert report.get("compression_stage") == "processor"
     assert mp4.exists() and mp4.stat().st_size > 0
     assert csv.exists()
@@ -78,6 +81,8 @@ def test_fake_120_short_burst(tmp_path: Path):
     report = pipe.stop()
 
     assert report["no_frame_drops"], report
+    assert report.get("r7_120_ok") is False
+    assert report.get("requested_fps") == 120
     assert report["frames_written"] >= 90, report
     assert report.get("compression_stage") == "processor"
     result = verify_mp4(

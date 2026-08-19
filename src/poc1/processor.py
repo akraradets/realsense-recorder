@@ -113,28 +113,35 @@ class Processor:
 
     def stop(self) -> None:
         """
-        Finalize the writer quickly.
+        Stop accepting new work, then encode every frame still in the queue.
 
-        After Stop we discard raw frames still waiting in the input queue.
-        Encoding that backlog on a slow mp4v path can take minutes and makes
-        Stop look frozen. Frames already encoded remain in the file.
+        Discarding the backlog made Stop feel instant but failed the no-drop
+        proof (e.g. 400 written of 477 read). Drain is the correct Stop.
         """
         self._running.clear()
-        discarded = self.in_queue.discard_all()
-        if discarded:
-            logger.info(
-                "processor stop: discarded %d pending raw frame(s) for a fast Stop",
-                discarded,
-            )
         if self._thread:
-            self._thread.join(timeout=15.0)
+            self._thread.join(timeout=8.0)
             if self._thread.is_alive():
-                logger.error("processor thread still alive after join timeout")
-                self.in_queue.discard_all()
-                self._thread.join(timeout=5.0)
+                logger.warning("processor thread still encoding; continuing drain")
             self._thread = None
-        else:
-            self.in_queue.discard_all()
+        drained = 0
+        deadline = time.perf_counter() + 60.0
+        while time.perf_counter() < deadline:
+            env = self.in_queue.get(timeout=0.05)
+            if env is None:
+                if self.in_queue.qsize() == 0:
+                    break
+                continue
+            self._encode(env)
+            drained += 1
+        leftover = self.in_queue.discard_all()
+        if drained:
+            logger.info("processor stop: encoded %d queued frame(s)", drained)
+        if leftover:
+            logger.error(
+                "processor stop: %d frame(s) still pending after drain timeout",
+                leftover,
+            )
         with self._encode_lock:
             if self._writer is not None:
                 try:

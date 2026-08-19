@@ -60,6 +60,7 @@ class DropCountingQueue:
 
     def __init__(self, maxsize: int, drop_oldest: bool, name: str):
         self._q: "queue.Queue[Any]" = queue.Queue(maxsize=maxsize)
+        self.maxsize = maxsize
         self._drop_oldest = drop_oldest
         self._name = name
         self.dropped_count = 0
@@ -90,6 +91,22 @@ class DropCountingQueue:
                     self._name, getattr(item, "seq", "?"), self.dropped_count,
                 )
 
+    def put_live(self, item: Any) -> None:
+        """
+        Keep capture realtime unless the queue is nearly full.
+
+        Near overflow we wait instead of dropping (no-drop). Otherwise put_nowait
+        so live preview does not wait on encode.
+        """
+        if self._drop_oldest:
+            self.put(item)
+            return
+        high = max(1, int(self.maxsize * 0.90)) if self.maxsize > 0 else 0
+        if self.maxsize > 0 and self.qsize() >= high:
+            self.put_block(item, timeout=2.0)
+        else:
+            self.put(item)
+
     def put_block(self, item: Any, timeout: float = 2.0) -> bool:
         """
         Block until there is room (no-drop path for synthetic R7 proofs).
@@ -111,6 +128,8 @@ class DropCountingQueue:
 
     def get(self, timeout: Optional[float] = None) -> Optional[Any]:
         try:
+            if timeout == 0:
+                return self._q.get_nowait()
             return self._q.get(timeout=timeout)
         except queue.Empty:
             return None
@@ -145,7 +164,7 @@ class DropCountingQueue:
 @dataclass
 class CameraHandler:
     source: FrameSource
-    viewer_queue_size: int = 4          # small: only latest few matter
+    viewer_queue_size: int = 2          # small: only latest few matter
     processor_queue_size: int = 512     # generous buffer against jitter at 120fps
 
     def __post_init__(self) -> None:
@@ -153,7 +172,8 @@ class CameraHandler:
         fps = int(getattr(self.source, "target_fps", 30) or 30)
         mode = str(getattr(self.source, "mode", "") or "")
         if mode == "fake" or fps >= 60:
-            self.processor_queue_size = max(self.processor_queue_size, 2048)
+            # ~30s at 120fps plus margin so Stop can drain without mid-take drops.
+            self.processor_queue_size = max(self.processor_queue_size, 4800)
         self.viewer_queue = DropCountingQueue(
             self.viewer_queue_size, drop_oldest=True, name="viewer"
         )
@@ -169,7 +189,9 @@ class CameraHandler:
         self._seq = 0
         self.frames_read = 0
         self.frames_to_recorder = 0
-        self._block_processor_puts = mode == "fake"
+        # Do not block capture on encode — that made live Record look slow-mo.
+        # No-drop is a deep queue + drain on Stop (processor.stop).
+        self._block_processor_puts = False
 
     def start(self) -> None:
         self.source.start()
@@ -261,13 +283,9 @@ class CameraHandler:
                     # the source's own overlay raced with reset_sequence().
                     embed_seq_barcode(owned, seq)
                     env = FrameEnvelope(seq=seq, capture_ts=time.time(), frame=owned)
+                    # Live preview is drop-oldest and must not wait on encode.
                     self.viewer_queue.put(env)
-                    if self._block_processor_puts:
-                        # Prefer read==write for synthetic R7 proofs: wait for
-                        # the encoder instead of discarding frames when full.
-                        self.processor_queue.put_block(env, timeout=2.0)
-                    else:
-                        self.processor_queue.put(env)
+                    self.processor_queue.put_live(env)
                 else:
                     env = FrameEnvelope(seq=-1, capture_ts=time.time(), frame=owned)
                     self.viewer_queue.put(env)

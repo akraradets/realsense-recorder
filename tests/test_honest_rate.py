@@ -1,0 +1,46 @@
+"""Honest FPS listing, report flags, and overflow-only backpressure."""
+from __future__ import annotations
+
+from poc1.camera_handler import DropCountingQueue
+from poc1.deliverable1.devices import (
+    StreamMode,
+    is_fhd_high_rate,
+    list_realsense_modes,
+    too_many_1080p120,
+)
+
+
+def test_realsense_modes_default_30_no_invented_color_120() -> None:
+    modes = list_realsense_modes(serial="no-such-serial-poc1")
+    color = [m for m in modes if m.pixel_format in {"bgr8", "rgb8", "yuyv"}]
+    assert color, modes
+    assert all(m.fps <= 60 for m in color)
+    assert all(m.fps < 90 for m in color)
+    assert any(m.fps == 30 for m in color)
+    assert not any(m.width >= 1920 and m.fps >= 90 for m in color)
+
+
+def test_fhd_high_rate_helper() -> None:
+    assert is_fhd_high_rate(StreamMode(1920, 1080, 120, "mjpg"))
+    assert not is_fhd_high_rate(StreamMode(1920, 1080, 30, "bgr8"))
+    assert not is_fhd_high_rate(StreamMode(1280, 720, 120, "bgr8"))
+
+
+def test_one_elgato_120_plus_30_companions_allowed() -> None:
+    elgato120 = StreamMode(1920, 1080, 120, "mjpg")
+    rs30 = StreamMode(1280, 720, 30, "bgr8")
+    cam30 = StreamMode(1280, 720, 30, "mjpg")
+    assert not too_many_1080p120([elgato120, rs30, cam30])
+    assert too_many_1080p120(
+        [elgato120, StreamMode(1920, 1080, 120, "bgr8")]
+    )
+
+
+def test_put_live_blocks_near_full_instead_of_drop() -> None:
+    q = DropCountingQueue(10, drop_oldest=False, name="t")
+    for i in range(9):
+        q.put_live(i)
+    assert q.dropped_count == 0
+    q.put_live(9)
+    assert q.qsize() == 10
+    assert q.dropped_count == 0

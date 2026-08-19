@@ -37,15 +37,17 @@ logger = logging.getLogger("poc1.d1.devices")
 
 # Sensible presets when the driver does not expose a full mode list.
 _UVC_PRESET_MODES: list[tuple[int, int, int, str]] = [
-    (1920, 1080, 120, "bgr8"),
-    (1920, 1080, 60, "bgr8"),
-    (1920, 1080, 30, "bgr8"),
-    (1280, 720, 60, "bgr8"),
+    (1280, 720, 30, "mjpg"),
+    (640, 480, 30, "mjpg"),
+    (1280, 720, 30, "yuyv"),
+    (640, 480, 30, "yuyv"),
     (1280, 720, 30, "bgr8"),
     (640, 480, 30, "bgr8"),
     (1920, 1080, 30, "mjpg"),
-    (1280, 720, 30, "mjpg"),
-    (1280, 720, 30, "yuyv"),
+    (1920, 1080, 30, "bgr8"),
+    (1280, 720, 60, "mjpg"),
+    (1920, 1080, 60, "mjpg"),
+    (1920, 1080, 120, "mjpg"),
 ]
 
 
@@ -105,6 +107,18 @@ class StreamMode:
         elif self.pixel_format == "y8":
             kind = " ir"
         return f"{self.width}x{self.height}@{self.fps} {self.pixel_format}{kind}"
+
+
+def is_fhd_high_rate(mode: Optional[StreamMode]) -> bool:
+    """True for 1920x1080 (or larger) at >=90 fps — Elgato/fake 120, not RealSense @30."""
+    if mode is None:
+        return False
+    return int(mode.width) >= 1920 and int(mode.height) >= 1080 and int(mode.fps) >= 90
+
+
+def too_many_1080p120(modes: list[Optional[StreamMode]]) -> bool:
+    """Two or more 1080p@≥90 encodes in one take — refuse. One 120 + @30/@60 is OK."""
+    return sum(1 for m in modes if is_fhd_high_rate(m)) >= 2
 
 
 def _opencv_backends() -> list[tuple[int, str]]:
@@ -440,9 +454,8 @@ def list_realsense_modes(serial: Optional[str] = None) -> list[StreamMode]:
     if not realsense_available():
         return [
             StreamMode(1280, 720, 30, "bgr8"),
-            StreamMode(1280, 720, 60, "bgr8"),
+            StreamMode(1920, 1080, 30, "bgr8"),
             StreamMode(640, 480, 30, "bgr8"),
-            StreamMode(640, 480, 60, "bgr8"),
             StreamMode(848, 480, 90, "z16"),
             StreamMode(640, 480, 90, "z16"),
         ]
@@ -462,10 +475,8 @@ def list_realsense_modes(serial: Optional[str] = None) -> list[StreamMode]:
         )
         return [
             StreamMode(1280, 720, 30, "bgr8"),
-            StreamMode(1280, 720, 60, "bgr8"),
-            StreamMode(640, 480, 30, "bgr8"),
-            StreamMode(640, 480, 60, "bgr8"),
             StreamMode(1920, 1080, 30, "bgr8"),
+            StreamMode(640, 480, 30, "bgr8"),
             StreamMode(848, 480, 90, "z16"),
         ]
 
@@ -510,6 +521,9 @@ def list_realsense_modes(serial: Optional[str] = None) -> list[StreamMode]:
             if st == rs.stream.color:
                 if fmt not in {"bgr8", "rgb8", "yuyv", "y8"}:
                     continue
+                # D400 color is 30 (sometimes 60). Never invent 90/120 for RGB.
+                if fps > 60:
+                    continue
             elif st == rs.stream.depth:
                 # Depth is recorded/previewed via colorizer → BGR for MP4.
                 fmt = "z16"
@@ -527,16 +541,13 @@ def list_realsense_modes(serial: Optional[str] = None) -> list[StreamMode]:
             seen.add(key)
             modes.append(StreamMode(w, h, fps, fmt))
 
-    # Always offer common color presets so the dropdown is never "30-only"
-    # when the SDK probe is incomplete (USB2 / driver quirks).
+    # Extra color presets at 30fps only. Do not advertise 120 for D400 color —
+    # the SDK list above already includes 60 if the device supports it.
     for preset in (
         StreamMode(1920, 1080, 30, "bgr8"),
         StreamMode(1280, 720, 30, "bgr8"),
-        StreamMode(1280, 720, 60, "bgr8"),
-        StreamMode(848, 480, 60, "bgr8"),
         StreamMode(848, 480, 30, "bgr8"),
         StreamMode(640, 480, 30, "bgr8"),
-        StreamMode(640, 480, 60, "bgr8"),
         StreamMode(640, 480, 90, "z16"),
         StreamMode(848, 480, 90, "z16"),
         StreamMode(1280, 720, 30, "z16"),
@@ -552,11 +563,12 @@ def list_realsense_modes(serial: Optional[str] = None) -> list[StreamMode]:
             StreamMode(640, 480, 30, "bgr8"),
         ]
 
-    # Sort: color first, then by resolution, then FPS high→low so 60/90 are visible.
+    # Sort: color first, 30fps color preferred, then resolution.
     def mode_priority(mode: StreamMode) -> tuple:
         is_color = 0 if mode.pixel_format in {"bgr8", "rgb8", "yuyv"} else 1
         pixels = mode.width * mode.height
-        return (is_color, -pixels, -mode.fps, mode.pixel_format)
+        fps_bias = 0 if mode.fps == 30 else (1 if mode.fps < 90 else 2)
+        return (is_color, fps_bias, -pixels, -mode.fps, mode.pixel_format)
 
     modes.sort(key=mode_priority)
     logger.info(
@@ -588,15 +600,13 @@ def list_uvc_modes(camera: ConnectedCamera) -> list[StreamMode]:
         # Prefer modest defaults first. Many UVC webcams cannot sustain FHD@120,
         # and selecting that as the first option caused confusing recordings.
         preferred = [
-            StreamMode(1280, 720, 30, "bgr8"),
-            StreamMode(640, 480, 30, "bgr8"),
-            StreamMode(1280, 720, 60, "bgr8"),
-            StreamMode(1920, 1080, 30, "bgr8"),
-            StreamMode(1920, 1080, 60, "bgr8"),
-            StreamMode(1920, 1080, 120, "bgr8"),
             StreamMode(1280, 720, 30, "mjpg"),
-            StreamMode(1920, 1080, 30, "mjpg"),
+            StreamMode(640, 480, 30, "mjpg"),
             StreamMode(1280, 720, 30, "yuyv"),
+            StreamMode(640, 480, 30, "bgr8"),
+            StreamMode(1280, 720, 30, "bgr8"),
+            StreamMode(1920, 1080, 30, "mjpg"),
+            StreamMode(1280, 720, 60, "mjpg"),
         ]
     modes = list(preferred)
     for w, h, fps, fmt in _UVC_PRESET_MODES:
@@ -627,12 +637,55 @@ def list_stream_modes(camera: ConnectedCamera) -> list[StreamMode]:
         return list_realsense_modes(camera.serial)
     if camera.kind == "fake":
         return [
-            StreamMode(1920, 1080, 120, "bgr8"),
-            StreamMode(1280, 720, 120, "bgr8"),
+            StreamMode(1280, 720, 30, "bgr8"),
             StreamMode(1280, 720, 60, "bgr8"),
             StreamMode(640, 480, 30, "bgr8"),
+            StreamMode(1920, 1080, 30, "bgr8"),
+            StreamMode(1280, 720, 120, "bgr8"),
+            StreamMode(1920, 1080, 120, "bgr8"),
         ]
     return list_uvc_modes(camera)
+
+
+def _looks_like_packed_yuyv(bgr: np.ndarray) -> bool:
+    """True when YUY2 was likely decoded as BGR (fine zebra / chroma stripes)."""
+    if bgr is None or bgr.ndim != 3 or bgr.shape[2] != 3:
+        return False
+    h, w = bgr.shape[:2]
+    if w < 16 or h < 8:
+        return False
+    sample = bgr[h // 4 : 3 * h // 4 : 4, : min(w, 320)]
+    even = sample[:, 0::2].astype(np.int16)
+    odd = sample[:, 1::2].astype(np.int16)
+    cols = min(even.shape[1], odd.shape[1])
+    if cols < 4:
+        return False
+    delta = float(np.mean(np.abs(even[:, :cols] - odd[:, :cols])))
+    return delta > 48.0
+
+
+def _open_uvc_timeout(target: Any, backend: int, timeout_s: float = 3.0) -> cv2.VideoCapture:
+    """Open VideoCapture with a deadline so a locked webcam cannot freeze Tk."""
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(cv2.VideoCapture, target, backend)
+        try:
+            cap = future.result(timeout=timeout_s)
+        except FuturesTimeout as exc:
+            raise RuntimeError(
+                f"Camera open timed out ({target!r}). Close Zoom/Teams/Camera "
+                "and any other POC1 window, then Refresh."
+            ) from exc
+    if cap is None or not cap.isOpened():
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:  # noqa: BLE001
+                pass
+        raise RuntimeError(f"Could not open {target!r} backend={backend}")
+    return cap
 
 
 def _apply_uvc_fourcc(cap: cv2.VideoCapture, pixel_format: str) -> None:
@@ -699,7 +752,7 @@ class FormattedUvcSource(CvCaptureSource):
         last_error = "unknown"
         for target, backend in attempts:
             try:
-                cap = cv2.VideoCapture(target, backend)
+                cap = _open_uvc_timeout(target, backend, timeout_s=3.0)
             except Exception as exc:  # noqa: BLE001
                 last_error = str(exc)
                 continue
@@ -734,8 +787,10 @@ class FormattedUvcSource(CvCaptureSource):
         except Exception:  # noqa: BLE001
             pass
         # Warm up: capture cards often emit a few empty/black frames first.
+        # Keep this short so a locked webcam cannot freeze the UI for seconds.
+        warm = 8 if getattr(self, "device_tag", "") == "elgato" else 4
         frame = None
-        for _ in range(15):
+        for _ in range(warm):
             ok, candidate = cap.read()
             if ok and candidate is not None:
                 frame = candidate
@@ -761,33 +816,27 @@ class FormattedUvcSource(CvCaptureSource):
         with quiet_opencv():
             wanted_w, wanted_h = self.width, self.height
             wanted_fps = self.target_fps if self.target_fps > 0 else 30
-            wanted_fmt = self.pixel_format
+            self.requested_fps = wanted_fps
+            wanted_fmt = (self.pixel_format or "bgr8").lower()
+            is_elgato = self.device_tag == "elgato"
 
-            if self.device_tag == "elgato":
+            if is_elgato:
                 profiles = [
                     (wanted_w, wanted_h, wanted_fps, wanted_fmt),
                     (wanted_w, wanted_h, wanted_fps, "mjpg"),
                     (1920, 1080, wanted_fps, "mjpg"),
-                    (1280, 720, wanted_fps, "mjpg"),
-                ]
-                if wanted_fps > 60:
-                    profiles += [
-                        (wanted_w, wanted_h, 60, "mjpg"),
-                        (1920, 1080, 60, "mjpg"),
-                        (1280, 720, 60, "mjpg"),
-                    ]
-                else:
-                    profiles += [
-                        (1920, 1080, 30, "mjpg"),
-                        (1280, 720, 30, "mjpg"),
-                        (640, 480, 30, "bgr8"),
-                    ]
-            else:
-                profiles = [
-                    (wanted_w, wanted_h, wanted_fps, wanted_fmt),
-                    (wanted_w, wanted_h, wanted_fps, "mjpg"),
                     (1280, 720, 30, "mjpg"),
-                    (1280, 720, 30, "bgr8"),
+                ]
+            else:
+                # Laptop UVC almost never delivers real bgr8. MJPG first avoids
+                # YUY2-as-BGR zebra stripes. Keep the list tiny so start() cannot
+                # freeze Tk for tens of seconds.
+                cam_fps = 30 if wanted_fmt == "bgr8" else min(wanted_fps, 30)
+                profiles = [
+                    (wanted_w, wanted_h, cam_fps, "mjpg"),
+                    (wanted_w, wanted_h, cam_fps, wanted_fmt),
+                    (1280, 720, 30, "mjpg"),
+                    (640, 480, 30, "yuyv"),
                     (640, 480, 30, "bgr8"),
                 ]
 
@@ -805,15 +854,15 @@ class FormattedUvcSource(CvCaptureSource):
 
             open_targets: list[tuple[Any, int]] = []
             if self.open_path and sys.platform == "win32":
-                open_targets += [
-                    (self.open_path, cv2.CAP_DSHOW),
-                    (self.open_path, cv2.CAP_MSMF),
-                ]
-            if sys.platform == "win32" and self.device_tag == "elgato":
+                open_targets.append((self.open_path, cv2.CAP_DSHOW))
+            if sys.platform == "win32" and is_elgato:
                 for path in dshow_open_paths_for_tag("elgato"):
-                    open_targets += [(path, cv2.CAP_DSHOW), (path, cv2.CAP_MSMF)]
-            open_targets += [(self.device_index, self._backend)]
-            if self._backend == cv2.CAP_DSHOW:
+                    open_targets.append((path, cv2.CAP_DSHOW))
+            elif sys.platform == "win32" and self.device_tag == "uvc" and not self.open_path:
+                for path in dshow_open_paths_for_tag("uvc"):
+                    open_targets.append((path, cv2.CAP_DSHOW))
+            open_targets.append((self.device_index, self._backend))
+            if is_elgato and self._backend == cv2.CAP_DSHOW:
                 open_targets.append((self.device_index, cv2.CAP_MSMF))
 
             seen_open: set[tuple[str, int]] = set()
@@ -823,15 +872,13 @@ class FormattedUvcSource(CvCaptureSource):
                     continue
                 seen_open.add(ok_key)
                 try:
-                    cap = cv2.VideoCapture(target, backend)
+                    cap = _open_uvc_timeout(target, backend, timeout_s=3.0)
                 except Exception as exc:  # noqa: BLE001
-                    last_exc = exc
-                    continue
-                if not cap.isOpened():
-                    cap.release()
+                    last_exc = exc if isinstance(exc, Exception) else Exception(str(exc))
+                    logger.warning("UVC open skipped %s: %s", target, exc)
                     continue
 
-                matched_high = False
+                got_any = False
                 for width, height, fps, fmt in unique_profiles:
                     try:
                         frame = self._configure_and_grab(cap, width, height, fps, fmt)
@@ -840,42 +887,46 @@ class FormattedUvcSource(CvCaptureSource):
                         continue
                     if frame is None:
                         continue
+                    if fmt == "bgr8" and _looks_like_packed_yuyv(frame):
+                        logger.warning(
+                            "Rejecting %dx%d bgr8 — looks like packed YUY2 stripes",
+                            width,
+                            height,
+                        )
+                        continue
+                    got_any = True
                     self._cap = cap
                     owned = np.ascontiguousarray(frame)
                     self._pending_frame = owned
-                    measured = self._measure_delivery_fps(0.6 if fps >= 90 else 0.4)
+                    if is_elgato and fps >= 90:
+                        measured = self._measure_delivery_fps(0.45)
+                    else:
+                        measured = 0.0
                     reported = float(cap.get(cv2.CAP_PROP_FPS) or 0)
                     rate = measured if measured > 1 else (
                         reported if reported > 0 else float(fps)
                     )
                     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
                     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
-                    if chosen is None or rate > chosen[0]:
-                        if chosen is not None and chosen[5] is not cap:
-                            try:
-                                chosen[5].release()
-                            except Exception:  # noqa: BLE001
-                                pass
-                        chosen = (rate, w, h, fps, fmt, cap, owned)
-                    if fps >= 90 and rate >= fps * 0.85:
-                        matched_high = True
-                        break
-
-                if matched_high:
+                    chosen = (rate, w, h, fps, fmt, cap, owned)
                     break
-                if chosen is None or chosen[5] is not cap:
-                    try:
-                        cap.release()
-                    except Exception:  # noqa: BLE001
-                        pass
+
+                if chosen is not None:
+                    break
+                try:
+                    cap.release()
+                except Exception:  # noqa: BLE001
+                    pass
+                if not got_any:
+                    last_exc = last_exc or RuntimeError("no frames")
 
             if chosen is None:
                 detail = f" ({last_exc})" if last_exc else ""
                 hint = (
-                    " For Elgato: HDMI source ON, close Elgato app, set source to "
-                    "1080p120 if you need 120fps, then Refresh."
-                    if self.device_tag == "elgato"
-                    else " Close other camera apps, reconnect USB, Refresh."
+                    " For Elgato: HDMI source ON, close Elgato app, then Refresh."
+                    if is_elgato
+                    else " Close Zoom/Teams/Camera and other POC1 windows, then Refresh. "
+                    "Use 1280x720@30 mjpg for the laptop webcam."
                 )
                 raise RuntimeError(
                     f"UVC device opened but delivered no frames{detail}.{hint}"
@@ -891,7 +942,7 @@ class FormattedUvcSource(CvCaptureSource):
             self.actual_height = h
             self._pending_frame = frame
 
-            if req_fps >= 90 and rate < req_fps * 0.85:
+            if is_elgato and req_fps >= 90 and rate < req_fps * 0.85:
                 stamped = int(round(rate / 5.0) * 5) or 60
                 stamped = max(15, min(stamped, req_fps))
                 logger.warning(
@@ -952,7 +1003,12 @@ class ConfiguredRealSenseSource:
         self.width = width
         self.height = height
         self.target_fps = fps if fps > 0 else 30
+        self.requested_fps = self.target_fps
         self.pixel_format = pixel_format.lower()
+        self.device_tag = "realsense"
+        self.actual_fps = float(self.target_fps)
+        self.actual_width = width
+        self.actual_height = height
         self.bag_path: Optional[Any] = None
         self._bag_path: Optional[Any] = None
         self._bag_final_path: Optional[Any] = None
@@ -1158,6 +1214,9 @@ class ConfiguredRealSenseSource:
             self.width = stream.width()
             self.height = stream.height()
             self.target_fps = int(stream.fps())
+            self.actual_width = self.width
+            self.actual_height = self.height
+            self.actual_fps = float(self.target_fps)
         except Exception as exc:  # noqa: BLE001
             self.stop()
             raise RuntimeError(f"Could not read RealSense stream profile: {exc}") from exc

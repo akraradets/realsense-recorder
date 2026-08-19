@@ -98,6 +98,7 @@ class FakeFrameSource:
     def __post_init__(self) -> None:
         self._frame_idx = 0
         self._t0 = None
+        self._last_emit = 0.0
         self._running = False
         self._base_frame = self._make_base_frame()
 
@@ -117,12 +118,14 @@ class FakeFrameSource:
 
     def start(self) -> None:
         self._t0 = time.perf_counter()
+        self._last_emit = self._t0
         self._frame_idx = 0
         self._running = True
 
     def reset_sequence(self) -> None:
         """Restart frame index + pacing clock (called when recording arms)."""
         self._t0 = time.perf_counter()
+        self._last_emit = self._t0
         self._frame_idx = 0
 
     def stop(self) -> None:
@@ -132,10 +135,14 @@ class FakeFrameSource:
         if not self._running:
             return None
 
-        target_t = self._t0 + (self._frame_idx / self.target_fps)
+        # Pace from the last emit, never "catch up" with a burst. Bursting after
+        # a slow encode is what flooded the queue and caused 400/477 drops.
+        min_dt = 1.0 / max(int(self.target_fps), 1)
         now = time.perf_counter()
-        if target_t > now:
-            time.sleep(target_t - now)
+        due = (self._last_emit or now) + min_dt
+        if due > now:
+            time.sleep(due - now)
+        self._last_emit = time.perf_counter()
 
         frame = (
             np.random.randint(0, 256, (self.height, self.width, 3), dtype=np.uint8)

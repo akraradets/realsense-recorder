@@ -52,8 +52,8 @@ class LibraryPage(tk.Frame):
         tip.pack(fill="x")
         tk.Label(
             tip,
-            text="Library (v4): select MP4 → Play. Select RealSense .db3/.bag → Export to MP4 → Play. "
-            "Record already saves MP4 + .db3 together — matching .mp4 is preferred when present.",
+            text="Library: select MP4 → Play. Select RealSense .db3/.bag → Export to MP4 → Play. "
+            "Record saves MP4 + .db3 in the folder; JSON/CSV are in meta/.",
             bg=SURFACE,
             fg=MUTED,
             font=("Segoe UI", 9),

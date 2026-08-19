@@ -138,12 +138,20 @@ def test_win_names_classify_elgato_and_realsense():
     assert classify_capture_name("USB2.0 HD UVC WebCam") == "uvc"
 
 
+def test_default_prefixes_are_m_and_r():
+    session = MultiCamSession(n_slots=2)
+    assert session.slots[0].prefix == "m"
+    assert session.slots[1].prefix == "r"
+    session.set_prefix(1, "r")
+    assert session.slots[1].prefix == "r"
+
+
 def test_dynamic_slots_add_and_remove():
     session = MultiCamSession(n_slots=2)
     added = session.add_slot()
     assert len(session.slots) == 3
     assert added.slot_id == 2
-    assert added.prefix == "m"
+    assert added.prefix == "cam3"
     session.remove_slot(1)
     assert len(session.slots) == 2
     assert [slot.slot_id for slot in session.slots] == [0, 1]
@@ -191,6 +199,10 @@ def test_multicam_two_fakes_preview_and_armed_record(tmp_path: Path):
     assert reports["cam2"]["no_frame_drops"] is True
     assert (tmp_path / "cam1_teststamp.mp4").exists()
     assert (tmp_path / "cam2_teststamp.mp4").exists()
+    assert not (tmp_path / "cam1_teststamp.report.json").exists()
+    assert not (tmp_path / "cam1_teststamp_sysmon.csv").exists()
+    assert (tmp_path / "meta" / "cam1_teststamp.report.json").exists()
+    assert (tmp_path / "meta" / "cam1_teststamp_sysmon.csv").exists()
     assert reports["cam1"]["frames_written"] > 0
     assert reports["cam2"]["frames_written"] > 0
 

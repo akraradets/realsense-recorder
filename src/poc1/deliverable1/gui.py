@@ -13,6 +13,7 @@ from typing import Optional
 import cv2
 from PIL import Image, ImageTk
 
+from poc1.preview_draw import bgr_to_rgb_fill
 from poc1.deliverable1.devices import StreamMode
 from poc1.deliverable1.session import CameraSlot, MultiCamSession
 from poc1.deliverable2.review import show_review_prompt
@@ -373,22 +374,7 @@ class CameraCard(tk.Frame):
     def start_preview(self) -> None:
         if self.app.busy:
             return
-        try:
-            self.session.start_slot_preview(self.slot_id)
-            self.app.set_status(f"Camera {self.slot_id + 1} preview started.")
-            # Hardware devices can open successfully yet never deliver frames
-            # (busy USB, no HDMI, wrong profile). Surface that instead of a
-            # permanent black LIVE panel.
-            self.app.root.after(3500, lambda: self._warn_if_no_preview_frames())
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror(
-                f"Camera {self.slot_id + 1} preview failed",
-                f"{exc}\n\nTips:\n"
-                "• Close RealSense Viewer / Elgato app / OBS if they hold the device\n"
-                "• Use USB 3 for RealSense; HDMI signal ON for Elgato\n"
-                "• Click Refresh, pick the named device, try 1280x720@30\n"
-                "• Select another advertised configuration and try again",
-            )
+        self.app.start_slot_preview_async(self.slot_id)
 
     def _warn_if_no_preview_frames(self) -> None:
         slot = self.session.slots[self.slot_id]
@@ -435,17 +421,9 @@ class CameraCard(tk.Frame):
         frame = slot.get_preview_frame()
         if frame is None:
             return
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
-        viewport_width = max(self.preview_shell.winfo_width() - 6, 320)
-        max_w, max_h = viewport_width, 255
-        scale = min(max_w / max(w, 1), max_h / max(h, 1), 1.0)
-        if scale < 1.0:
-            rgb = cv2.resize(
-                rgb,
-                (max(1, int(w * scale)), max(1, int(h * scale))),
-                interpolation=cv2.INTER_AREA,
-            )
+        tw = max(self.preview_shell.winfo_width() - 4, 320)
+        th = max(self.preview_shell.winfo_height() - 4, 180)
+        rgb = bgr_to_rgb_fill(frame, tw, th)
         self._photo = ImageTk.PhotoImage(Image.fromarray(rgb))
         self.preview.configure(image=self._photo, text="")
 
@@ -742,15 +720,79 @@ class Deliverable1App:
         if self.busy:
             return
         self._sync_all()
+        self._set_busy(True)
+        self.set_status("Opening cameras…")
+        for card in self.cards:
+            if self.session.slots[card.slot_id].pipeline is None:
+                card.preview.configure(image="", text="Opening camera…")
+
+        def worker() -> None:
+            error: Optional[str] = None
+            try:
+                self.session.start_previews()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("start_previews failed")
+                error = str(exc)
+            self.root.after(0, lambda err=error: self._previews_started(err))
+
+        threading.Thread(target=worker, name="d1-preview-start", daemon=True).start()
+
+    def start_slot_preview_async(self, slot_id: int) -> None:
+        if self.busy:
+            return
         try:
-            self.session.start_previews()
-            running = len([s for s in self.session.slots if s.pipeline])
-            self.set_status(f"{running} preview(s) running. Arm cameras, then Record.")
-        except Exception as exc:  # noqa: BLE001
+            self.cards[slot_id].sync_controls()
+        except Exception:  # noqa: BLE001
+            pass
+        self._set_busy(True)
+        self.set_status(f"Opening camera {slot_id + 1}…")
+        try:
+            self.cards[slot_id].preview.configure(image="", text="Opening camera…")
+        except Exception:  # noqa: BLE001
+            pass
+
+        def worker() -> None:
+            error: Optional[str] = None
+            try:
+                self.session.start_slot_preview(slot_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("start_slot_preview failed")
+                error = str(exc)
+            self.root.after(0, lambda err=error, sid=slot_id: self._slot_preview_started(sid, err))
+
+        threading.Thread(
+            target=worker, name=f"d1-preview-slot{slot_id}", daemon=True
+        ).start()
+
+    def _previews_started(self, error: Optional[str]) -> None:
+        self._set_busy(False)
+        running = len([s for s in self.session.slots if s.pipeline])
+        if error:
+            self.set_status(f"{running} preview(s) running. Some failed.")
             messagebox.showerror(
                 "Some previews could not start",
-                f"{exc}\n\nWorking previews remain active. Check each camera card.",
+                f"{error}\n\nWorking previews remain active. Close other camera apps, "
+                "use 1280x720@30 mjpg for webcams.",
             )
+        else:
+            self.set_status(f"{running} preview(s) running. Arm cameras, then Record.")
+
+    def _slot_preview_started(self, slot_id: int, error: Optional[str]) -> None:
+        self._set_busy(False)
+        if error:
+            self.set_status(f"Camera {slot_id + 1} preview failed.")
+            messagebox.showerror(
+                f"Camera {slot_id + 1} preview failed",
+                f"{error}\n\nClose other camera apps and try 1280x720@30 mjpg.",
+            )
+            return
+        self.set_status(f"Camera {slot_id + 1} preview started.")
+        self.root.after(3500, lambda sid=slot_id: self._warn_slot_if_no_frames(sid))
+
+    def _warn_slot_if_no_frames(self, slot_id: int) -> None:
+        if slot_id >= len(self.cards):
+            return
+        self.cards[slot_id]._warn_if_no_preview_frames()
 
     def stop_all_previews(self) -> None:
         if self.busy:
@@ -1159,7 +1201,7 @@ class Deliverable1App:
                 card.tick()
             except Exception:  # noqa: BLE001
                 pass
-        self.root.after(33, self._tick)
+        self.root.after(80, self._tick)
 
     def _on_close(self) -> None:
         if self.busy:
