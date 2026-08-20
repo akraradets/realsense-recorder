@@ -23,6 +23,7 @@ from poc1.deliverable1.devices import (
     build_frame_source,
     list_all_cameras,
     list_stream_modes,
+    prefix_for_camera,
 )
 from poc1.pipeline import Pipeline
 
@@ -163,6 +164,7 @@ class MultiCamSession:
         include_fake: bool = True,
         probe_uvc: bool = True,
         probe_realsense: bool = True,
+        refresh_name_cache: bool = True,
     ) -> list[ConnectedCamera]:
         """R1 — rescan UVC + RealSense (+ optional fake for demos/tests)."""
         if self.previews_running:
@@ -171,6 +173,7 @@ class MultiCamSession:
             include_fake=include_fake,
             probe_uvc=probe_uvc,
             probe_realsense=probe_realsense,
+            refresh_name_cache=refresh_name_cache,
         )
         logger.info("D1 devices: %d found", len(self.devices))
         return list(self.devices)
@@ -202,8 +205,20 @@ class MultiCamSession:
         slot.mode = slot.available_modes[0] if slot.available_modes else StreamMode(
             1280, 720, 30, "bgr8"
         )
-        # RealSense: default .bag ON so MP4+.bag is the normal path unless unchecked.
-        slot.record_bag = cam.kind == "realsense"
+        wanted = prefix_for_camera(cam)
+        used = {
+            s.prefix.casefold()
+            for s in self.slots
+            if s.slot_id != slot_id and s.camera is not None
+        }
+        prefix = wanted
+        n = 2
+        while prefix.casefold() in used:
+            prefix = f"{wanted}{n}"
+            n += 1
+        slot.prefix = prefix
+        # RealSense SDK file + Elgato ROS2 color bag default ON.
+        slot.record_bag = cam.kind == "realsense" or cam.device_tag == "elgato"
         slot.status = f"assigned {cam.label()}"
         return slot
 
@@ -363,21 +378,29 @@ class MultiCamSession:
                     bag = None
                     want_bag = bool(intent.get(s.slot_id, s.record_bag))
                     if want_bag:
-                        if not s.camera or s.camera.kind != "realsense":
+                        if not s.camera:
                             raise RuntimeError(
                                 f"Camera {s.slot_id + 1} ({s.prefix}): "
-                                "RealSense .bag is checked but this is not a "
-                                "[realsense] device. Uncheck .bag or pick RealSense."
+                                ".bag is checked but no device is assigned."
                             )
-                        src = s.pipeline.source if s.pipeline else None
-                        if getattr(src, "mode", "") != "hardware":
+                        if s.camera.kind == "realsense":
+                            src = s.pipeline.source if s.pipeline else None
+                            if getattr(src, "mode", "") != "hardware":
+                                raise RuntimeError(
+                                    f"Camera {s.slot_id + 1} ({s.prefix}): "
+                                    "RealSense .bag needs a live hardware stream."
+                                )
+                            bag = with_sdk_record_suffix(
+                                self.out_dir / f"{s.prefix}_{stamp}.bag"
+                            )
+                        elif s.camera.device_tag == "elgato":
+                            # ROS2 color bag (JPEG), not Intel SDK .bag.
+                            bag = self.out_dir / f"{s.prefix}_{stamp}_color"
+                        else:
                             raise RuntimeError(
                                 f"Camera {s.slot_id + 1} ({s.prefix}): "
-                                "RealSense .bag needs a live hardware stream."
+                                "SDK/ROS bag is only for RealSense or Elgato."
                             )
-                        bag = with_sdk_record_suffix(
-                            self.out_dir / f"{s.prefix}_{stamp}.bag"
-                        )
                         s.record_bag = True
                     assert s.pipeline is not None
                     logger.info(
@@ -404,7 +427,7 @@ class MultiCamSession:
                             f"{s.pipeline.source.height}@"
                             f"{s.pipeline.source.target_fps}: {exc}"
                         ) from exc
-                    if bag is not None and (
+                    if bag is not None and s.camera and s.camera.kind == "realsense" and (
                         s.pipeline._bag_path is None
                         or not Path(bag).exists()
                         or Path(bag).stat().st_size <= 0

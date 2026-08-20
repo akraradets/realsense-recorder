@@ -164,7 +164,8 @@ class LibraryPage(tk.Frame):
         )
         tk.Label(
             export,
-            text="If H.264/H.265 aren’t available on this PC, export uses a compatible fallback.",
+            text="Export selected bag → NEW {name}_h264.mp4 (decoded). "
+            "The original Record MP4 is kept. H.264/H.265 fall back to mp4v if needed.",
             bg=PANEL,
             fg=MUTED,
             font=("Segoe UI", 8),
@@ -231,17 +232,18 @@ class LibraryPage(tk.Frame):
             if sibling.is_file() and sibling.stat().st_size > 32:
                 if messagebox.askyesno(
                     "Playback",
-                    f"{path.name} is a RealSense SDK file.\n\n"
+                    f"{path.name} is a bag/SDK file and cannot play directly.\n\n"
                     f"A matching Record MP4 exists:\n{sibling.name}\n\n"
-                    "Play that MP4 now?\n\n"
-                    "(Cancel = stay here; use Export selected to convert the .db3.)",
+                    "Play that original MP4 now?\n\n"
+                    "(Cancel = stay here. Export selected decodes the .db3 to a NEW mp4 "
+                    "and does not replace the Record file.)",
                 ):
                     self._start_playback(sibling)
                 return
             if messagebox.askyesno(
                 "Playback",
                 f"{path.name} cannot play directly.\n\n"
-                "Export it to MP4 now, then play?",
+                "Export it to a NEW MP4 (decoded from the bag; Record MP4 is kept), then play?",
             ):
                 self._run_export(path)
             return

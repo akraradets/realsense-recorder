@@ -85,6 +85,11 @@ def list_media_files(folder: Path) -> list[Path]:
         p for p in sorted(folder.iterdir())
         if p.is_file() and p.suffix.lower() in exts
     ]
+    for p in sorted(folder.iterdir()):
+        if p.is_dir() and (
+            p.name.endswith("_color") or (p / "metadata.yaml").is_file()
+        ):
+            out.append(p)
     return out
 
 
@@ -95,17 +100,19 @@ def export_to_mp4(
     codec: str = "h264",
     on_progress: ProgressCb = None,
 ) -> ExportResult:
-    """Convert .bag / .bd3 / .db3 (or re-encode video) to MP4."""
+    """Decode .bag / .bd3 / .db3 (or ROS2 folder) to a NEW MP4. Never overwrite Record MP4."""
     source = Path(source)
-    if not source.is_file():
+    if not source.exists():
         return ExportResult(False, None, "", message=f"File not found: {source}")
 
     ext = source.suffix.lower()
-    fourcc, label = resolve_export_fourcc(codec)
+    codec_key = (codec or "h264").strip().lower()
+    fourcc, label = resolve_export_fourcc(codec_key)
     if output is None:
-        output = source.with_name(f"{source.stem}_{codec.lower()}.mp4")
+        output = source.with_name(f"{source.stem}_{codec_key}.mp4")
     else:
         output = Path(output)
+    output = _avoid_overwriting_record_mp4(source, output, codec_key)
     output.parent.mkdir(parents=True, exist_ok=True)
 
     def progress(msg: str) -> None:
@@ -113,12 +120,28 @@ def export_to_mp4(
         if on_progress:
             on_progress(msg)
 
+    if source.is_dir():
+        return _export_bd3_or_db3(source, output, fourcc, label, progress)
     if ext == ".bag":
         return _export_realsense_bag(source, output, fourcc, label, progress)
     if ext in {".bd3", ".db3"}:
         return _export_bd3_or_db3(source, output, fourcc, label, progress)
     # Allow re-encoding existing MP4/AVI through the same path (handy in browser).
     return _export_via_opencv(source, output, fourcc, label, progress)
+
+
+def _avoid_overwriting_record_mp4(source: Path, output: Path, codec: str) -> Path:
+    """Keep the original Record {stem}.mp4; write {stem}_{codec}.mp4 instead."""
+    record = source.with_suffix(".mp4") if source.is_file() else None
+    if source.is_dir():
+        name = source.name
+        record = source.parent / (f"{name[:-6]}.mp4" if name.endswith("_color") else f"{name}.mp4")
+    if record is not None and output.resolve() == record.resolve():
+        alt = source.with_name(f"{source.stem}_{codec}.mp4")
+        if alt.resolve() == record.resolve():
+            alt = source.with_name(f"{source.stem}_export_{codec}.mp4")
+        return alt
+    return output
 
 
 def _open_writer(
@@ -148,36 +171,29 @@ def _open_writer(
 
 
 def _sibling_record_mp4(source: Path) -> Optional[Path]:
-    """MP4 written beside a RealSense .bag/.db3 on the same Record take."""
+    """MP4 written beside a RealSense .bag/.db3 or Elgato ROS2 folder on the same take."""
     source = Path(source)
-    candidate = source.with_suffix(".mp4")
-    if candidate.is_file() and candidate.stat().st_size > 32:
-        return candidate
+    candidates: list[Path] = [source.with_suffix(".mp4")]
+    if source.is_dir():
+        name = source.name
+        if name.endswith("_color"):
+            candidates.append(source.parent / f"{name[:-6]}.mp4")
+        candidates.append(source.parent / f"{source.name}.mp4")
+    else:
+        stem = source.stem
+        if stem.endswith("_color"):
+            candidates.append(source.parent / f"{stem[:-6]}.mp4")
+            candidates.append(source.parent.parent / f"{stem[:-6]}.mp4")
+        candidates.append(source.parent / f"{stem}.mp4")
+    seen: set[Path] = set()
+    for candidate in candidates:
+        key = candidate.resolve() if candidate.exists() else candidate
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.is_file() and candidate.stat().st_size > 32:
+            return candidate
     return None
-
-
-def _copy_sibling_mp4(
-    sibling: Path,
-    output: Path,
-    label: str,
-    progress: Callable[[str], None],
-) -> ExportResult:
-    progress(f"Using matching Record MP4: {sibling.name}")
-    output = Path(output)
-    if sibling.resolve() == output.resolve():
-        return ExportResult(
-            True,
-            output,
-            label,
-            message=f"Matching Record MP4 already at {output.name}",
-        )
-    shutil.copy2(sibling, output)
-    return ExportResult(
-        True,
-        output,
-        label,
-        message=f"Copied matching Record MP4 → {output.name}",
-    )
 
 
 def _start_realsense_playback(rs: Any, source: Path):
@@ -312,6 +328,28 @@ def _export_realsense_bag(
     width = height = 0
     fps = 30.0
 
+    def to_bgr(color_frame) -> Optional[np.ndarray]:
+        arr = np.asanyarray(color_frame.get_data())
+        fmt = None
+        try:
+            fmt = color_frame.get_profile().format()
+        except Exception:  # noqa: BLE001
+            pass
+        if arr.ndim == 3 and arr.shape[2] == 3:
+            if fmt == rs.format.bgr8:
+                return arr
+            return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        if arr.ndim == 3 and arr.shape[2] == 2:
+            return cv2.cvtColor(arr, cv2.COLOR_YUV2BGR_YUY2)
+        if arr.ndim == 2:
+            if fmt == rs.format.yuyv:
+                return cv2.cvtColor(arr, cv2.COLOR_YUV2BGR_YUY2)
+            if arr.dtype == np.uint16:
+                scaled = cv2.convertScaleAbs(arr, alpha=255.0 / 65535.0)
+                return cv2.cvtColor(scaled, cv2.COLOR_GRAY2BGR)
+            return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+        return None
+
     try:
         try:
             color_prof = profile.get_stream(rs.stream.color).as_video_stream_profile()
@@ -323,25 +361,21 @@ def _export_realsense_bag(
             except Exception:  # noqa: BLE001
                 fps = 30.0
 
+        idle = 0
         while True:
             try:
-                frameset = pipeline.wait_for_frames(timeout_ms=2500)
+                frameset = pipeline.wait_for_frames(timeout_ms=5000)
             except RuntimeError:
-                break
+                idle += 1
+                if idle >= 4:
+                    break
+                continue
+            idle = 0
             color = frameset.get_color_frame()
+            frame = None
             if color:
-                frame = np.asanyarray(color.get_data())
-                if frame.ndim == 3 and frame.shape[2] == 3:
-                    # RealSense color frames are often RGB; OpenCV wants BGR.
-                    # Heuristic: if format reports bgr8, skip swap.
-                    try:
-                        fmt = color.get_profile().format()
-                        is_bgr = fmt == rs.format.bgr8
-                    except Exception:  # noqa: BLE001
-                        is_bgr = False
-                    if not is_bgr:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            else:
+                frame = to_bgr(color)
+            if frame is None:
                 depth = frameset.get_depth_frame()
                 if not depth:
                     continue
@@ -806,29 +840,29 @@ def _export_bd3_or_db3(
     progress: Callable[[str], None],
 ) -> ExportResult:
     """
-    .bd3 / .db3 may be:
-      - RealSense SDK recordings (newer librealsense) — play via pyrealsense2
-      - Matching Record MP4 beside the file (same take) — copy/reuse
-      - ROS2 bags with sensor_msgs Image topics — play via rosbags
+    Decode .bd3 / .db3 / ROS2 folder to a NEW MP4.
+
+    RealSense SDK recordings → pyrealsense2 playback.
+    Elgato/UVC ROS2 bags (Image / CompressedImage) → rosbags.
+    Never copy the sibling Record MP4.
     """
     source = Path(source)
+    looks_ros = source.is_dir() or (
+        source.is_file() and _looks_like_ros2_db3(source)
+    )
 
-    # 0) Same-take MP4 from Record — preferred for playback (already encoded).
-    sibling = _sibling_record_mp4(source)
-    if sibling is not None:
-        return _copy_sibling_mp4(sibling, output, label, progress)
+    rs_try = ExportResult(
+        False, None, label, message="Skipped RealSense SDK (file looks like ROS 2 sqlite)"
+    )
+    if not looks_ros:
+        rs_try = _export_realsense_bag(source, output, fourcc, label, progress)
+        if rs_try.ok:
+            return rs_try
 
-    # 1) RealSense SDK — do NOT rename to .bag (breaks modern librealsense).
-    rs_try = _export_realsense_bag(source, output, fourcc, label, progress)
-    if rs_try.ok:
-        return rs_try
-
-    # 2) Standard ROS2 bags with Image / CompressedImage topics.
     ros_try = _export_rosbag2_to_mp4(source, output, fourcc, label, progress)
     if ros_try.ok:
         return ros_try
 
-    # 3) Generic video containers mislabeled as .db3/.bd3.
     result = _export_via_opencv(source, output, fourcc, label, progress)
     if result.ok:
         return result
@@ -838,17 +872,32 @@ def _export_bd3_or_db3(
     if ff.ok:
         return ff
 
+    if looks_ros:
+        lead = (
+            f"Could not decode ROS 2 bag {source.name} to MP4.\n"
+            f"{ros_try.message}\n"
+        )
+    else:
+        lead = (
+            f"Could not decode RealSense recording {source.name} to MP4.\n"
+            f"SDK playback: {rs_try.message}\n"
+            "This is an Intel RealSense .db3/.bag, not a ROS Image bag "
+            "(“no image topics” is expected and is not the real failure).\n"
+        )
+        if "version" in (rs_try.message or "").lower():
+            lead += (
+                "This PC’s librealsense cannot play that file "
+                "(often recorded with a different SDK).\n"
+            )
     guidance = (
-        f"Could not convert {source.name} to MP4.\n\n"
-        f"RealSense SDK: {rs_try.message}\n"
-        f"ROS bag path: {ros_try.message}\n"
-        f"OpenCV: {result.message}\n"
-        f"ffmpeg: {ff.message}\n\n"
+        lead
+        + f"\nROS bag path: {ros_try.message}\n"
+        + f"OpenCV: {result.message}\n"
+        + f"ffmpeg: {ff.message}\n\n"
         "Tips:\n"
-        "  • Pull latest Poc1, then: uv sync --extra realsense && uv run poc1\n"
-        "  • Title must show sdk-record-v4 (old builds still fail on .db3)\n"
-        "  • Re-Record so MP4 + .db3 are saved together, then Export uses the MP4\n"
-        "  • Or open the .db3 in Intel RealSense Viewer\n"
-        "  • RealSense .db3 does not use ROS sensor_msgs/Image topics — that is normal"
+        "  • Record MP4 is unchanged — play that file in Library.\n"
+        f"  • Export writes a NEW {source.stem}_h264.mp4 decoded from the bag.\n"
+        "  • uv sync --extra realsense && uv run poc1 (title sdk-record-v14+)\n"
+        "  • Elgato ROS2 bags are folders named *_color with metadata.yaml"
     )
     return ExportResult(False, None, label, message=guidance)

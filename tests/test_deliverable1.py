@@ -6,9 +6,13 @@ from pathlib import Path
 
 from poc1.deliverable1.devices import (
     ConfiguredRealSenseSource,
+    ConnectedCamera,
     StreamMode,
     list_all_cameras,
     list_stream_modes,
+    list_uvc_cameras,
+    list_uvc_modes,
+    pick_auto_camera_for_slot,
 )
 from poc1.deliverable1.session import MultiCamSession
 
@@ -132,10 +136,87 @@ def test_win_names_classify_elgato_and_realsense():
     from poc1.deliverable1.win_names import classify_capture_name
 
     assert classify_capture_name("Elgato HD60 S+") == "elgato"
+    assert classify_capture_name("Elgato 4K X") == "elgato"
     assert classify_capture_name("Game Capture HD60") == "elgato"
     assert classify_capture_name("Intel RealSense D435") == "realsense-uvc"
     assert classify_capture_name("OBS Virtual Camera") == "virtual"
     assert classify_capture_name("USB2.0 HD UVC WebCam") == "uvc"
+
+
+def test_elgato_modes_are_mjpg_only_with_1080p120_default():
+    cam = ConnectedCamera(
+        cam_id="uvc:0:DSHOW",
+        kind="uvc",
+        name="Elgato / capture card — Elgato 4K X",
+        index=0,
+        backend=0,
+        backend_name="DSHOW",
+        device_tag="elgato",
+    )
+    modes = list_uvc_modes(cam)
+    assert modes
+    assert modes[0] == StreamMode(1920, 1080, 120, "mjpg")
+    assert all(m.pixel_format == "mjpg" for m in modes)
+
+
+def test_pick_auto_camera_assigns_realsense_then_elgato():
+    rs = ConnectedCamera(
+        cam_id="realsense:ABC",
+        kind="realsense",
+        name="Intel RealSense D435",
+        serial="ABC",
+        device_tag="realsense",
+    )
+    elg = ConnectedCamera(
+        cam_id="uvc:elgato:Elgato 4K X:DSHOW",
+        kind="uvc",
+        name="Elgato / capture card — Elgato 4K X",
+        index=0,
+        device_tag="elgato",
+    )
+    devices = [rs, elg]
+    slot0 = pick_auto_camera_for_slot(0, devices, set())
+    assert slot0 is not None and slot0.kind == "realsense"
+    slot1 = pick_auto_camera_for_slot(1, devices, {slot0.cam_id})
+    assert slot1 is not None and slot1.device_tag == "elgato"
+
+
+def test_list_uvc_cameras_ensures_elgato_when_probe_misses(monkeypatch):
+    from poc1.deliverable1 import devices as dev
+
+    cleared: list[bool] = []
+
+    monkeypatch.setattr(dev, "clear_name_cache", lambda: cleared.append(True))
+    monkeypatch.setattr(
+        dev, "_probe_uvc_index_safe", lambda *args, **kwargs: (None, "missing")
+    )
+    monkeypatch.setattr(dev, "_opencv_backends", lambda **kwargs: [(0, "DSHOW")])
+    monkeypatch.setattr(
+        dev, "list_windows_capture_names", lambda: ["Elgato 4K X"]
+    )
+    monkeypatch.setattr(dev, "_merge_windows_named_cameras", lambda *a, **k: None)
+
+    cams = dev.list_uvc_cameras(max_index=1, refresh_name_cache=True)
+    assert cleared
+    elgato = [c for c in cams if c.device_tag == "elgato"]
+    assert len(elgato) == 1
+    assert "Elgato 4K X" in elgato[0].name
+
+
+def test_refresh_devices_refreshes_windows_name_cache(monkeypatch):
+    seen: list[bool] = []
+
+    def fake_list_all(**kwargs):
+        if kwargs.get("refresh_name_cache"):
+            seen.append(True)
+        return []
+
+    monkeypatch.setattr(
+        "poc1.deliverable1.session.list_all_cameras", fake_list_all
+    )
+    session = MultiCamSession(n_slots=2)
+    session.refresh_devices(include_fake=False, probe_uvc=True, probe_realsense=False)
+    assert seen == [True]
 
 
 def test_default_prefixes_are_m_and_r():

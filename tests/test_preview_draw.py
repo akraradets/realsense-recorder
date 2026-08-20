@@ -1,5 +1,6 @@
-from poc1.preview_draw import bgr_to_rgb_fill, downscale_for_preview, fill_bgr, overlay_hud
+from poc1.preview_draw import bgr_to_rgb_fill, downscale_for_preview, fill_bgr, hud_lines_for_source, overlay_hud
 from poc1.deliverable1.devices import _looks_like_packed_yuyv
+from poc1.deliverable1.session import CameraSlot
 import numpy as np
 
 
@@ -36,6 +37,31 @@ def test_packed_yuyv_heuristic() -> None:
 
 def test_overlay_hud_keeps_shape() -> None:
     rgb = np.zeros((180, 320, 3), dtype=np.uint8)
-    out = overlay_hud(rgb, ["realsense  1280x720@30", "requested 30  delivering ~30"])
+    out = overlay_hud(rgb, ["realsense  1280x720@30", "requested 30  camera ~30 fps"])
     assert out.shape == rgb.shape
     assert out.dtype == rgb.dtype
+
+
+def test_hud_separates_camera_and_preview_fps() -> None:
+    slot = CameraSlot(slot_id=0, prefix="m")
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    import time
+
+    base = time.time()
+    for i in range(12):
+        with slot._frame_lock:
+            slot._preview_ts.append(base + i * 0.08)
+            slot.last_frame = frame
+
+    class Src:
+        device_tag = "elgato"
+        actual_width = 1920
+        actual_height = 1080
+        target_fps = 120
+        requested_fps = 120
+        actual_fps = 118.0
+
+    lines = hud_lines_for_source(slot, Src())
+    assert any("camera ~118" in line for line in lines)
+    assert any("preview redraw" in line for line in lines)
+    assert not any("delivering" in line for line in lines)

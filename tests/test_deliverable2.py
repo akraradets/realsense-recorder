@@ -75,19 +75,33 @@ def test_export_bd3_unreadable_gives_clear_error(tmp_path: Path):
     junk.write_bytes(b"not a video container")
     result = export_to_mp4(junk, codec="h264")
     assert not result.ok
-    assert "Could not convert" in result.message or "failed" in result.message.lower()
+    assert "Could not decode" in result.message or "Could not convert" in result.message or "failed" in result.message.lower()
 
 
-def test_export_db3_uses_sibling_record_mp4(tmp_path: Path):
-    """When Record saved MP4 + .db3 together, Export reuses the MP4."""
+def test_export_db3_does_not_copy_sibling_record_mp4(tmp_path: Path):
+    """Junk Intel-like .db3 must not succeed by copying the Record MP4."""
     db3 = tmp_path / "cam1_take.db3"
     db3.write_bytes(b"not a real bag")
     sibling = _write_tiny_mp4(tmp_path / "cam1_take.mp4", frames=8)
+    sibling_size = sibling.stat().st_size
     out = tmp_path / "cam1_take_h264.mp4"
     result = export_to_mp4(db3, out, codec="h264")
-    assert result.ok, result.message
-    assert out.is_file() and out.stat().st_size > 32
-    assert "matching" in result.message.lower() or out.stat().st_size == sibling.stat().st_size
+    assert not result.ok, result.message
+    assert sibling.is_file() and sibling.stat().st_size == sibling_size
+    assert "RealSense" in result.message or "SDK" in result.message or "decode" in result.message.lower()
+    assert "no image topics" not in result.message.split("\n")[0].lower()
+
+
+def test_export_elgato_color_folder_does_not_copy_sibling(tmp_path: Path):
+    bag_dir = tmp_path / "m_take_color"
+    bag_dir.mkdir()
+    (bag_dir / "metadata.yaml").write_text("rosbag2_bagfile_information:\n", encoding="utf-8")
+    sibling = _write_tiny_mp4(tmp_path / "m_take.mp4", frames=6)
+    size = sibling.stat().st_size
+    out = tmp_path / "m_take_h264.mp4"
+    result = export_to_mp4(bag_dir, out, codec="h264")
+    assert not result.ok, result.message
+    assert sibling.stat().st_size == size
 
 def test_export_rosbag2_db3_to_mp4(tmp_path: Path):
     """R10: ROS2 .db3 with Image topic exports to a playable MP4."""
@@ -127,11 +141,16 @@ def test_export_rosbag2_db3_to_mp4(tmp_path: Path):
             )
 
     db3 = next(bag_dir.glob("*.db3"))
+    sibling = _write_tiny_mp4(tmp_path / f"{db3.stem}.mp4", frames=3)
+    sibling_size = sibling.stat().st_size
     out = tmp_path / "from_db3.mp4"
     result = export_to_mp4(db3, out, codec="h264")
     assert result.ok, result.message
     assert out.is_file() and out.stat().st_size > 32
     assert result.frames >= 1
+    assert sibling.is_file() and sibling.stat().st_size == sibling_size
+    assert "matching" not in result.message.lower()
+    assert "copied" not in result.message.lower()
 
 
 def test_show_review_prompt_behavior():

@@ -342,7 +342,7 @@ class UnifiedApp:
             card.grid(row=index // 2, column=index % 2, sticky="nsew", padx=6, pady=6)
             self.cards.append(card)
         for card in self.cards:
-            card.load_devices(auto_assign=auto_assign and card.slot_id == 0)
+            card.load_devices(auto_assign=auto_assign)
         self.count_var.set(f"{len(self.session.slots)} cameras")
         self._rebuild_record_tiles()
         self.refresh_record_gate()
@@ -380,17 +380,62 @@ class UnifiedApp:
             ):
                 return
             self.session.stop_previews()
-        try:
-            devices = self.session.refresh_devices(include_fake=True)
-            self.rebuild_cards(auto_assign=initial)
-            real = [d for d in devices if d.kind != "fake"]
-            names = ", ".join(d.name for d in real[:5]) or "none yet"
-            self.set_status(
-                f"Found {len(real)} camera(s): {names}. "
-                "Start preview on each camera you plan to record."
+        self._set_busy(True)
+        self.set_status("Scanning cameras… (UI stays responsive)")
+
+        def worker() -> None:
+            devices: list = []
+            error: Optional[str] = None
+            try:
+                devices = self.session.refresh_devices(include_fake=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("camera refresh failed")
+                error = str(exc)
+            self.root.after(
+                0,
+                lambda d=devices, err=error, init=initial: self._refresh_cameras_done(
+                    d, err, init
+                ),
             )
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Camera scan failed", str(exc))
+
+        threading.Thread(target=worker, name="app-refresh-cameras", daemon=True).start()
+
+    def _refresh_cameras_done(
+        self, devices: list, error: Optional[str], initial: bool
+    ) -> None:
+        self._set_busy(False)
+        if error:
+            messagebox.showerror("Camera scan failed", error)
+            return
+        self.rebuild_cards(auto_assign=initial)
+        real = [d for d in devices if d.kind != "fake"]
+        rs_n = sum(1 for d in real if d.kind == "realsense")
+        elg_n = sum(1 for d in real if d.device_tag == "elgato")
+        uvc_n = sum(
+            1
+            for d in real
+            if d.kind == "uvc" and d.device_tag not in {"elgato", "realsense-uvc"}
+        )
+        parts = []
+        if rs_n:
+            parts.append(f"RealSense×{rs_n}")
+        if elg_n:
+            parts.append(f"Elgato×{elg_n}")
+        if uvc_n:
+            parts.append(f"UVC×{uvc_n}")
+        summary = ", ".join(parts) or "none yet"
+        names = ", ".join(d.name for d in real[:4]) or "none yet"
+        self.set_status(
+            f"Found {len(real)} camera(s) ({summary}): {names}. "
+            "Start preview on each camera you plan to record."
+        )
+
+    def _live_preview_count(self) -> int:
+        return sum(
+            1
+            for s in self.session.slots
+            if s.pipeline is not None and s.get_preview_frame() is not None
+        )
 
     def browse_folder(self) -> None:
         if self.busy:
@@ -456,16 +501,24 @@ class UnifiedApp:
 
     def _previews_started(self, error: Optional[str]) -> None:
         self._set_busy(False)
-        running = len([s for s in self.session.slots if s.pipeline])
+        live = self._live_preview_count()
+        opened = len([s for s in self.session.slots if s.pipeline])
+        waiting = opened - live
         if error:
-            self.set_status(f"{running} preview(s) live. Some failed.")
+            msg = f"{live} preview(s) showing video"
+            if waiting > 0:
+                msg += f" ({waiting} opened but no frames yet)"
+            self.set_status(f"{msg}. Some failed.")
             messagebox.showerror(
                 "Preview",
                 error + "\n\nClose Zoom/Teams/Camera and extra POC1 windows, "
                 "pick 1280x720@30 mjpg for the laptop webcam, then try one camera at a time.",
             )
         else:
-            self.set_status(f"{running} preview(s) live. Open Record when ready.")
+            msg = f"{live} preview(s) showing video"
+            if waiting > 0:
+                msg += f" ({waiting} opened but no frames yet — wait or restart preview)"
+            self.set_status(f"{msg}. Open Record when ready.")
         self.refresh_record_gate()
 
     def _slot_preview_started(self, slot_id: int, error: Optional[str]) -> None:
@@ -486,6 +539,23 @@ class UnifiedApp:
             return
         slot = self.session.slots[slot_id]
         if slot.pipeline is None or slot.get_preview_frame() is not None:
+            return
+        cam = slot.camera
+        if cam is not None and cam.kind == "realsense":
+            messagebox.showwarning(
+                f"Camera {slot_id + 1}",
+                "RealSense opened but no image arrived.\n\n"
+                "Close Intel RealSense Viewer, use USB 3, pick 1280x720@30 bgr8, "
+                "then Start preview again.",
+            )
+            return
+        if cam is not None and cam.device_tag == "elgato":
+            messagebox.showwarning(
+                f"Camera {slot_id + 1}",
+                "Elgato opened but no image yet.\n\n"
+                "Use 1920x1080@120 mjpg (not bgr8), confirm HDMI is on, "
+                "close Elgato 4K Capture Utility, then Start preview again.",
+            )
             return
         messagebox.showwarning(
             f"Camera {slot_id + 1}",

@@ -121,10 +121,23 @@ def too_many_1080p120(modes: list[Optional[StreamMode]]) -> bool:
     return sum(1 for m in modes if is_fhd_high_rate(m)) >= 2
 
 
-def _opencv_backends() -> list[tuple[int, str]]:
+def prefix_for_camera(camera: ConnectedCamera) -> str:
+    """SL naming: Elgato/mirrorless = m, RealSense = r."""
+    if camera.kind == "realsense":
+        return "r"
+    if camera.device_tag == "elgato":
+        return "m"
+    if camera.kind == "fake":
+        return "f"
+    return "c"
+
+
+def _opencv_backends(*, include_msmf: bool = False) -> list[tuple[int, str]]:
     backends: list[tuple[int, str]] = []
     if sys.platform == "win32":
-        backends = [(cv2.CAP_DSHOW, "DSHOW"), (cv2.CAP_MSMF, "MSMF")]
+        backends = [(cv2.CAP_DSHOW, "DSHOW")]
+        if include_msmf:
+            backends.append((cv2.CAP_MSMF, "MSMF"))
     elif sys.platform == "darwin":
         if hasattr(cv2, "CAP_AVFOUNDATION"):
             backends.append((cv2.CAP_AVFOUNDATION, "AVFOUNDATION"))
@@ -326,18 +339,71 @@ def _merge_windows_named_cameras(
         logger.info("Added Windows-named UVC device missed by OpenCV probe: %s", name)
 
 
-def list_uvc_cameras(max_index: int = 6) -> list[ConnectedCamera]:
+def _ensure_elgato_entries(
+    found_by_index: dict[int, ConnectedCamera],
+    default_backend: int,
+    default_backend_name: str,
+) -> None:
+    """Always expose Elgato capture cards from Windows names even when probe times out."""
+    if sys.platform != "win32":
+        return
+    names = [
+        n for n in list_windows_capture_names() if classify_capture_name(n) == "elgato"
+    ]
+    if not names:
+        return
+    claimed_paths = {c.open_path for c in found_by_index.values() if c.open_path}
+    for i, name in enumerate(names):
+        path = f"video={name}"
+        if path in claimed_paths:
+            continue
+        index = 200 + i
+        while index in found_by_index:
+            index += 1
+        found_by_index[index] = ConnectedCamera(
+            cam_id=f"uvc:elgato:{name}:{default_backend_name}",
+            kind="uvc",
+            name=f"Elgato / capture card — {name}",
+            index=i,
+            backend=default_backend,
+            backend_name=default_backend_name,
+            open_path=path,
+            device_tag="elgato",
+        )
+        claimed_paths.add(path)
+        logger.info("Ensured Elgato entry from Windows name: %s", name)
+
+
+def _windows_has_elgato_name() -> bool:
+    if sys.platform != "win32":
+        return False
+    return any(
+        classify_capture_name(n) == "elgato" for n in list_windows_capture_names()
+    )
+
+
+def list_uvc_cameras(
+    max_index: int = 6,
+    *,
+    include_msmf: bool = False,
+    refresh_name_cache: bool = False,
+) -> list[ConnectedCamera]:
     """R1 — enumerate OpenCV/UVC devices (webcam, Elgato, virtual cam, …)."""
-    clear_name_cache()
+    if refresh_name_cache:
+        clear_name_cache()
     found_by_index: dict[int, ConnectedCamera] = {}
     timed_out: set[int] = set()
-    backends = _opencv_backends()
+    backends = _opencv_backends(include_msmf=include_msmf)
+    elgato_expected = _windows_has_elgato_name()
     for backend, bname in backends:
         for i in range(max_index):
             if i in found_by_index:
                 continue
-            # Built-in webcams are often slow/locked on first open after boot.
-            timeout_s = 4.0 if i == 0 else 2.5
+            # Built-in webcams / capture cards on index 0 are often slow or locked.
+            if i == 0 and elgato_expected:
+                timeout_s = 3.5
+            else:
+                timeout_s = 2.0 if i == 0 else 1.0
             cam, status = _probe_uvc_index_safe(i, backend, bname, timeout_s=timeout_s)
             if cam is not None:
                 found_by_index[i] = cam
@@ -362,6 +428,7 @@ def list_uvc_cameras(max_index: int = 6) -> list[ConnectedCamera]:
 
     if backends:
         _merge_windows_named_cameras(found_by_index, backends[0][0], backends[0][1])
+        _ensure_elgato_entries(found_by_index, backends[0][0], backends[0][1])
 
     return [found_by_index[i] for i in sorted(found_by_index)]
 
@@ -393,11 +460,14 @@ def list_all_cameras(
     include_fake: bool = False,
     probe_uvc: bool = True,
     probe_realsense: bool = True,
+    refresh_name_cache: bool = False,
 ) -> list[ConnectedCamera]:
     """R1 — unified UVC + RealSense inventory."""
     cams: list[ConnectedCamera] = []
     if probe_uvc:
-        cams.extend(list_uvc_cameras())
+        cams.extend(
+            list_uvc_cameras(refresh_name_cache=refresh_name_cache)
+        )
     rs_cams: list[ConnectedCamera] = []
     if probe_realsense:
         rs_cams = list_realsense_cameras()
@@ -426,6 +496,38 @@ def list_all_cameras(
             )
         )
     return cams
+
+
+def pick_auto_camera_for_slot(
+    slot_id: int,
+    devices: list[ConnectedCamera],
+    used_cam_ids: set[str],
+) -> Optional[ConnectedCamera]:
+    """Slot 0 → RealSense, slot 1 → Elgato when both are in the device list."""
+    slot_order: dict[int, tuple[str, ...]] = {
+        0: ("realsense", "uvc", "fake"),
+        1: ("elgato", "uvc", "fake"),
+    }
+    prefer = slot_order.get(slot_id, ("realsense", "elgato", "uvc", "fake"))
+    for kind in prefer:
+        for d in devices:
+            if d.cam_id in used_cam_ids:
+                continue
+            if "busy at scan" in d.name.lower() and kind in {"uvc", "elgato"}:
+                continue
+            if kind == "realsense" and d.kind == "realsense":
+                return d
+            if kind == "elgato" and d.device_tag == "elgato":
+                return d
+            if (
+                kind == "uvc"
+                and d.kind == "uvc"
+                and d.device_tag not in {"virtual", "realsense-uvc"}
+            ):
+                return d
+            if kind == "fake" and d.kind == "fake":
+                return d
+    return None
 
 
 def _rs_format_name(fmt: Any) -> str:
@@ -563,12 +665,17 @@ def list_realsense_modes(serial: Optional[str] = None) -> list[StreamMode]:
             StreamMode(640, 480, 30, "bgr8"),
         ]
 
-    # Sort: color first, 30fps color preferred, then resolution.
+    # Sort: color first, 30fps color preferred, bgr8 before rgb8, then resolution.
     def mode_priority(mode: StreamMode) -> tuple:
         is_color = 0 if mode.pixel_format in {"bgr8", "rgb8", "yuyv"} else 1
         pixels = mode.width * mode.height
         fps_bias = 0 if mode.fps == 30 else (1 if mode.fps < 90 else 2)
-        return (is_color, fps_bias, -pixels, -mode.fps, mode.pixel_format)
+        fmt_pref = (
+            0
+            if mode.pixel_format == "bgr8"
+            else (1 if mode.pixel_format == "rgb8" else 2)
+        )
+        return (is_color, fps_bias, fmt_pref, -pixels, -mode.fps)
 
     modes.sort(key=mode_priority)
     logger.info(
@@ -615,7 +722,13 @@ def list_uvc_modes(camera: ConnectedCamera) -> list[StreamMode]:
             modes.append(candidate)
     if camera.index is None or camera.backend is None:
         return modes
-    # Prepend the currently negotiated mode if we can open briefly.
+    # Do not prepend a probed 720p bgr8 mode for Elgato — that made HDMI look
+    # worse than RealSense. Keep 1080p mjpg first; hide bgr8/yuyv (green screen).
+    if camera.device_tag == "elgato":
+        modes = [m for m in modes if m.pixel_format == "mjpg"]
+        if not modes:
+            modes = [StreamMode(1920, 1080, 120, "mjpg")]
+        return modes
     with quiet_opencv():
         cap = cv2.VideoCapture(camera.index, camera.backend)
         if cap.isOpened():
@@ -662,6 +775,17 @@ def _looks_like_packed_yuyv(bgr: np.ndarray) -> bool:
         return False
     delta = float(np.mean(np.abs(even[:, :cols] - odd[:, :cols])))
     return delta > 48.0
+
+
+def _looks_like_solid_green(bgr: np.ndarray) -> bool:
+    """True when the buffer is almost only green (wrong FOURCC / 10-bit HDMI)."""
+    if bgr is None or bgr.ndim != 3 or bgr.shape[2] != 3:
+        return False
+    sample = bgr[:: max(1, bgr.shape[0] // 24), :: max(1, bgr.shape[1] // 24)]
+    b = sample[:, :, 0].astype(np.float32)
+    g = sample[:, :, 1].astype(np.float32)
+    r = sample[:, :, 2].astype(np.float32)
+    return float(g.mean()) > 160.0 and float(b.mean()) < 55.0 and float(r.mean()) < 55.0
 
 
 def _open_uvc_timeout(target: Any, backend: int, timeout_s: float = 3.0) -> cv2.VideoCapture:
@@ -732,7 +856,8 @@ class FormattedUvcSource(CvCaptureSource):
         attempts: list[tuple[Any, int]] = []
         if self.open_path and sys.platform == "win32":
             attempts.append((self.open_path, cv2.CAP_DSHOW))
-            attempts.append((self.open_path, cv2.CAP_MSMF))
+            if self.device_tag != "elgato":
+                attempts.append((self.open_path, cv2.CAP_MSMF))
         # Extra named Elgato / webcam paths help when index mapping is ambiguous.
         if sys.platform == "win32":
             if self.device_tag == "elgato":
@@ -743,8 +868,8 @@ class FormattedUvcSource(CvCaptureSource):
                 for path in dshow_open_paths_for_tag("uvc"):
                     if path != self.open_path:
                         attempts.append((path, cv2.CAP_DSHOW))
-        attempts.append((self.device_index, self._backend))
-        if self._backend == cv2.CAP_DSHOW:
+        attempts.append((self.device_index, self._backend if self.device_tag != "elgato" else cv2.CAP_DSHOW))
+        if self.device_tag != "elgato" and self._backend == cv2.CAP_DSHOW:
             attempts.append((self.device_index, cv2.CAP_MSMF))
         if self._backend != cv2.CAP_ANY:
             attempts.append((self.device_index, cv2.CAP_ANY))
@@ -822,9 +947,10 @@ class FormattedUvcSource(CvCaptureSource):
 
             if is_elgato:
                 profiles = [
-                    (wanted_w, wanted_h, wanted_fps, wanted_fmt),
+                    (1920, 1080, 120, "mjpg"),
+                    (1920, 1080, 60, "mjpg"),
                     (wanted_w, wanted_h, wanted_fps, "mjpg"),
-                    (1920, 1080, wanted_fps, "mjpg"),
+                    (1280, 720, 60, "mjpg"),
                     (1280, 720, 30, "mjpg"),
                 ]
             else:
@@ -861,8 +987,10 @@ class FormattedUvcSource(CvCaptureSource):
             elif sys.platform == "win32" and self.device_tag == "uvc" and not self.open_path:
                 for path in dshow_open_paths_for_tag("uvc"):
                     open_targets.append((path, cv2.CAP_DSHOW))
-            open_targets.append((self.device_index, self._backend))
-            if is_elgato and self._backend == cv2.CAP_DSHOW:
+            open_targets.append((self.device_index, self._backend if not is_elgato else cv2.CAP_DSHOW))
+            if is_elgato:
+                pass
+            elif self.device_tag == "uvc" and self._backend == cv2.CAP_DSHOW:
                 open_targets.append((self.device_index, cv2.CAP_MSMF))
 
             seen_open: set[tuple[str, int]] = set()
@@ -886,6 +1014,14 @@ class FormattedUvcSource(CvCaptureSource):
                         last_exc = exc
                         continue
                     if frame is None:
+                        continue
+                    if _looks_like_solid_green(frame):
+                        logger.warning(
+                            "Rejecting %dx%d %s — solid green (wrong format / 10-bit HDMI)",
+                            width,
+                            height,
+                            fmt,
+                        )
                         continue
                     if fmt == "bgr8" and _looks_like_packed_yuyv(frame):
                         logger.warning(
@@ -1416,7 +1552,9 @@ def build_frame_source(
         )
 
     backend = camera.backend
-    if backend is None:
+    if camera.device_tag == "elgato" and sys.platform == "win32":
+        backend = cv2.CAP_DSHOW
+    elif backend is None:
         backend = _opencv_backends()[0][0]
     src = FormattedUvcSource(
         device_index=int(camera.index or 0),

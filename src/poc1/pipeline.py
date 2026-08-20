@@ -110,6 +110,7 @@ class Pipeline:
         self._last_report: dict = {}
         self._bag_path: Optional[Path] = None
         self._bag_written: Optional[Path] = None
+        self._uvc_bag = None
 
     def start_preview(self) -> None:
         if self._preview_started:
@@ -131,19 +132,29 @@ class Pipeline:
         self.monitor_csv = monitor_csv
         self._bag_path = None
         self._bag_written = None
+        self._uvc_bag = None
+        self.processor.sidecar_bag = None
 
         # Fresh queues so a previous take cannot leak frames into this one.
         self.camera_handler.processor_queue.clear()
         self.processor.out_queue.clear()
 
-        # When .bag is requested it is required: arm or raise (no soft-skip).
         if bag_path is not None:
-            self.camera_handler.pause_reads()
-            try:
-                active = start_bag_recording(self.source, bag_path)
-                self._bag_path = Path(active)
-            finally:
-                self.camera_handler.resume_reads()
+            tag = str(getattr(self.source, "device_tag", "") or "")
+            if tag == "elgato":
+                from poc1.uvc_rosbag import UvcRos2Bag
+
+                self._uvc_bag = UvcRos2Bag(Path(bag_path))
+                self._uvc_bag.start()
+                self._bag_path = Path(bag_path)
+                self.processor.sidecar_bag = self._uvc_bag
+            else:
+                self.camera_handler.pause_reads()
+                try:
+                    active = start_bag_recording(self.source, bag_path)
+                    self._bag_path = Path(active)
+                finally:
+                    self.camera_handler.resume_reads()
 
         # Capture cards / UVC often advertise 120 while HDMI only sends ~60.
         self._requested_fps = int(
@@ -238,24 +249,32 @@ class Pipeline:
             self.camera_handler.disable_recording()
         except Exception:  # noqa: BLE001
             logger.exception("disable_recording failed")
-        try:
-            self.camera_handler.pause_reads()
+        if self._uvc_bag is None:
             try:
-                self._bag_written = stop_bag_recording(self.source)
-            finally:
-                self.camera_handler.resume_reads()
-        except Exception:  # noqa: BLE001
-            logger.exception("stop_bag_recording failed")
-            self._bag_written = None
-            try:
-                self.camera_handler.resume_reads()
+                self.camera_handler.pause_reads()
+                try:
+                    self._bag_written = stop_bag_recording(self.source)
+                finally:
+                    self.camera_handler.resume_reads()
             except Exception:  # noqa: BLE001
-                pass
+                logger.exception("stop_bag_recording failed")
+                self._bag_written = None
+                try:
+                    self.camera_handler.resume_reads()
+                except Exception:  # noqa: BLE001
+                    pass
         if self.processor:
             try:
                 self.processor.stop()
             except Exception:  # noqa: BLE001
                 logger.exception("processor.stop failed")
+        if self._uvc_bag is not None:
+            try:
+                self._bag_written = self._uvc_bag.stop() or self._bag_path
+            except Exception:  # noqa: BLE001
+                logger.exception("UVC ROS2 bag stop failed")
+            self._uvc_bag = None
+            self.processor.sidecar_bag = None
         if self.recorder:
             try:
                 self.recorder.stop()
@@ -284,7 +303,8 @@ class Pipeline:
             except Exception:  # noqa: BLE001
                 logger.exception("could not write report json")
         logger.info("Recording stopped: %s", report)
-        if expected_bag is not None and not self._bag_written:
+        is_uvc_bag = str(getattr(self.source, "device_tag", "") or "") == "elgato"
+        if expected_bag is not None and not self._bag_written and not is_uvc_bag:
             # Last chance: bag file may exist even if stop helper returned None.
             candidate = Path(expected_bag)
             if candidate.exists() and candidate.stat().st_size > 0:

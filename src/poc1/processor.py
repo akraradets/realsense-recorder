@@ -56,6 +56,7 @@ class Processor:
         self.codec_label = "MPEG-4 (mp4v)"
         self._slow_encodes = 0
         self._slow_encode_ms_max = 0.0
+        self.sidecar_bag = None
 
     def configure_output(
         self,
@@ -167,6 +168,12 @@ class Processor:
             t0 = time.perf_counter()
             self._writer.write(frame)
             encode_ms = (time.perf_counter() - t0) * 1000.0
+            sidecar = getattr(self, "sidecar_bag", None)
+            if sidecar is not None:
+                try:
+                    sidecar.submit(frame, env.capture_ts)
+                except Exception:  # noqa: BLE001
+                    logger.exception("sidecar bag submit failed")
             budget = (1000.0 / max(self.fps, 1)) * 2
             if encode_ms > budget:
                 self._slow_encodes += 1

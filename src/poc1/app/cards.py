@@ -20,7 +20,7 @@ from poc1.app.theme import (
     button,
 )
 from poc1.preview_draw import bgr_to_rgb_fill, hud_lines_for_source, overlay_hud
-from poc1.deliverable1.devices import StreamMode
+from poc1.deliverable1.devices import StreamMode, pick_auto_camera_for_slot
 from poc1.deliverable1.session import CameraSlot
 
 if TYPE_CHECKING:
@@ -132,7 +132,7 @@ class CameraCard(tk.Frame):
         # Written on Record only (never on Start preview). New SDKs save .db3.
         self.bag_check = tk.Checkbutton(
             form,
-            text="Also save RealSense SDK file (.db3/.bag) with MP4",
+            text="Also save bag with MP4 (RealSense SDK .db3/.bag, Elgato ROS2 color .db3)",
             variable=self.bag_var,
             command=self._sync_bag,
             bg=PANEL,
@@ -145,8 +145,8 @@ class CameraCard(tk.Frame):
         self.bag_check.grid(row=3, column=1, columnspan=3, sticky="w", pady=(4, 0))
         tk.Label(
             form,
-            text="On Record only (not preview). This PC’s SDK usually writes .db3. "
-            "Close RealSense Viewer; use USB 3.",
+            text="On Record only. RealSense: Intel .db3/.bag (USB3, close Viewer). "
+            "Elgato: ROS2 color bag for SL (not Intel format). HDMI 8-bit 1080p, close 4K Capture Utility.",
             bg=PANEL,
             fg=MUTED,
             font=("Segoe UI", 8),
@@ -203,38 +203,9 @@ class CameraCard(tk.Frame):
                 for s in self.session.slots
                 if s.slot_id != self.slot_id and s.camera is not None
             }
-            candidate = None
-            for prefer in ("realsense", "elgato", "uvc", "fake"):
-                for d in self.session.devices:
-                    if d.cam_id in used:
-                        continue
-                    if "busy at scan" in d.name.lower() and prefer == "uvc":
-                        continue
-                    if prefer == "realsense" and d.kind == "realsense":
-                        candidate = d
-                        break
-                    if prefer == "elgato" and d.device_tag == "elgato":
-                        candidate = d
-                        break
-                    if (
-                        prefer == "uvc"
-                        and d.kind == "uvc"
-                        and d.device_tag not in {"virtual", "realsense-uvc"}
-                    ):
-                        candidate = d
-                        break
-                    if prefer == "fake" and d.kind == "fake":
-                        candidate = d
-                        break
-                if candidate:
-                    break
-            if candidate is None:
-                for d in self.session.devices:
-                    if d.cam_id in used:
-                        continue
-                    if d.kind == "uvc" and d.device_tag != "virtual":
-                        candidate = d
-                        break
+            candidate = pick_auto_camera_for_slot(
+                self.slot_id, self.session.devices, used
+            )
             if candidate:
                 self.device_var.set(candidate.label())
                 self._on_device()
@@ -258,6 +229,7 @@ class CameraCard(tk.Frame):
             return
         try:
             slot = self.session.assign_camera(self.slot_id, cam_id)
+            self.prefix_var.set(slot.prefix)
             self.bag_var.set(bool(slot.record_bag))
             self._load_modes(slot)
             self._refresh_bag_enabled()
@@ -302,7 +274,9 @@ class CameraCard(tk.Frame):
         want = bool(slot.record_bag) or bool(
             getattr(self.session, "bag_intent", {}).get(self.slot_id, False)
         )
-        if slot.camera is None or slot.camera.kind != "realsense":
+        if slot.camera is None or not (
+            slot.camera.kind == "realsense" or slot.camera.device_tag == "elgato"
+        ):
             want = False
         slot.record_bag = want
         try:
@@ -313,15 +287,16 @@ class CameraCard(tk.Frame):
 
     def _refresh_bag_enabled(self, locked: bool = False) -> None:
         slot = self.session.slots[self.slot_id]
-        is_rs = slot.camera is not None and slot.camera.kind == "realsense"
-        # Never clear .bag because the UI is locked/busy.
-        if not is_rs:
+        is_bag = slot.camera is not None and (
+            slot.camera.kind == "realsense" or slot.camera.device_tag == "elgato"
+        )
+        if not is_bag:
             if self.bag_var.get():
                 self.bag_var.set(False)
             slot.record_bag = False
         try:
             self.bag_check.configure(
-                state="disabled" if locked or not is_rs else "normal"
+                state="disabled" if locked or not is_bag else "normal"
             )
         except tk.TclError:
             pass

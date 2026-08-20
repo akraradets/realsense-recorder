@@ -71,12 +71,13 @@ def hud_lines_for_source(slot, src) -> list[str]:
     requested = int(
         getattr(src, "requested_fps", 0) or getattr(src, "target_fps", 0) or 0
     )
-    delivering = float(getattr(src, "actual_fps", 0) or 0)
+    camera_fps = float(getattr(src, "actual_fps", 0) or 0)
+    preview_fps = 0.0
     est = getattr(slot, "estimate_preview_fps", None)
     if callable(est):
         live = est()
         if live and live > 1:
-            delivering = float(live)
+            preview_fps = float(live)
     rec = ""
     try:
         if slot.pipeline and slot.pipeline.camera_handler.is_recording:
@@ -86,8 +87,10 @@ def hud_lines_for_source(slot, src) -> list[str]:
     line1 = f"{tag}  {w}x{h}@{opened_fps}"
     if rec:
         line1 = f"{rec}  {line1}"
-    lines = [line1, f"requested {requested}  delivering ~{delivering:.0f}"]
-    if requested >= 90 and delivering < requested * 0.85:
+    lines = [line1, f"requested {requested}  camera ~{camera_fps:.0f} fps"]
+    if preview_fps > 1:
+        lines.append(f"preview redraw ~{preview_fps:.0f} fps (display only)")
+    if requested >= 90 and camera_fps < requested * 0.85 and tag == "elgato":
         lines.append("HDMI source is not 120Hz")
     elif kind == "realsense" and requested >= 90:
         lines.append("D400 color is not 120fps")
