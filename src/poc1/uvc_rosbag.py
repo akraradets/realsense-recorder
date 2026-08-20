@@ -5,6 +5,7 @@ import logging
 import queue
 import shutil
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -24,7 +25,8 @@ class UvcRos2Bag:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
-        self._q: queue.Queue[Optional[tuple[bytes, int]]] = queue.Queue(maxsize=256)
+        # ~4s at 120fps — overflow still increments ``dropped`` (honest report).
+        self._q: queue.Queue[Optional[tuple[bytes, int]]] = queue.Queue(maxsize=512)
         self._thread: Optional[threading.Thread] = None
         self._ready = threading.Event()
         self._error: Optional[str] = None
@@ -56,9 +58,22 @@ class UvcRos2Bag:
             self.dropped += 1
 
     def stop(self) -> Optional[Path]:
-        self._q.put(None)
+        # Let the worker finish queued JPEGs before sentinel (no software loss
+        # at Stop when encode can keep up).
+        deadline = time.monotonic() + 25.0
+        while not self._q.empty() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        try:
+            self._q.put(None, timeout=5.0)
+        except queue.Full:
+            logger.warning("ROS2 bag queue full at stop — forcing sentinel")
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                pass
+            self._q.put_nowait(None)
         if self._thread:
-            self._thread.join(timeout=30.0)
+            self._thread.join(timeout=45.0)
             self._thread = None
         db3 = None
         if self.path.is_dir():
@@ -118,4 +133,4 @@ class UvcRos2Bag:
                 try:
                     writer.close()
                 except Exception:  # noqa: BLE001
-                    logger.exception("ROS2 bag close failed")
+                    pass

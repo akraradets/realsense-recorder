@@ -194,5 +194,39 @@ def dshow_open_paths_for_tag(tag: str) -> list[str]:
     return out
 
 
+def ffmpeg_available() -> bool:
+    """True when ffmpeg is on PATH (needed for index-aligned DirectShow names)."""
+    if sys.platform != "win32":
+        return True
+    names, aligned = _windows_capture_inventory()
+    return bool(aligned and names)
+
+
+def elgato_open_name_paths(*, prefer_ffmpeg: bool = True) -> list[str]:
+    """
+    DirectShow ``video=<name>`` candidates for Elgato.
+
+    Prefer ffmpeg DSHOW names (index-aligned). PnP labels are included as a
+    fallback but often fail to open under OpenCV.
+    """
+    if sys.platform != "win32":
+        return []
+    names, aligned = _windows_capture_inventory()
+    out: list[str] = []
+    for name in names:
+        if _classify(name) != "elgato":
+            continue
+        path = f"video={name}"
+        if path not in out:
+            out.append(path)
+    if prefer_ffmpeg and not aligned and out:
+        logger.warning(
+            "Elgato open paths are PnP labels only (ffmpeg missing). "
+            "Install ffmpeg on PATH for reliable DirectShow names: %s",
+            out,
+        )
+    return out
+
+
 def clear_name_cache() -> None:
     _windows_capture_inventory.cache_clear()

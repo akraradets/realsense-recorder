@@ -425,10 +425,37 @@ class UnifiedApp:
             parts.append(f"UVC×{uvc_n}")
         summary = ", ".join(parts) or "none yet"
         names = ", ".join(d.name for d in real[:4]) or "none yet"
-        self.set_status(
+        status = (
             f"Found {len(real)} camera(s) ({summary}): {names}. "
             "Start preview on each camera you plan to record."
         )
+        if elg_n and sys.platform == "win32":
+            try:
+                from poc1.deliverable1.win_names import ffmpeg_available
+
+                if not ffmpeg_available():
+                    status += (
+                        " Warning: ffmpeg missing — Elgato open may fail; "
+                        "install ffmpeg on PATH, then Refresh."
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+        self.set_status(status)
+
+    def _clear_opening_placeholders(self) -> None:
+        for card in self.cards:
+            slot = self.session.slots[card.slot_id]
+            if slot.pipeline is not None:
+                continue
+            try:
+                text = str(card.preview.cget("text") or "")
+            except Exception:  # noqa: BLE001
+                continue
+            if "Opening" in text:
+                card.preview.configure(
+                    image="", text="Start preview to see live video"
+                )
+                card._photo = None
 
     def _live_preview_count(self) -> int:
         return sum(
@@ -501,6 +528,7 @@ class UnifiedApp:
 
     def _previews_started(self, error: Optional[str]) -> None:
         self._set_busy(False)
+        self._clear_opening_placeholders()
         live = self._live_preview_count()
         opened = len([s for s in self.session.slots if s.pipeline])
         waiting = opened - live
@@ -511,8 +539,9 @@ class UnifiedApp:
             self.set_status(f"{msg}. Some failed.")
             messagebox.showerror(
                 "Preview",
-                error + "\n\nClose Zoom/Teams/Camera and extra POC1 windows, "
-                "pick 1280x720@30 mjpg for the laptop webcam, then try one camera at a time.",
+                error + "\n\nClose Zoom/Teams/Camera, Elgato 4K Capture Utility, "
+                "and extra POC1 windows. For Elgato: HDMI ON, install ffmpeg, "
+                "Refresh, then try Camera 2 Start preview alone.",
             )
         else:
             msg = f"{live} preview(s) showing video"
@@ -523,11 +552,12 @@ class UnifiedApp:
 
     def _slot_preview_started(self, slot_id: int, error: Optional[str]) -> None:
         self._set_busy(False)
+        self._clear_opening_placeholders()
         if error:
             self.set_status(f"Camera {slot_id + 1} preview failed.")
             messagebox.showerror(
                 f"Camera {slot_id + 1}",
-                f"{error}\n\nClose other camera apps, use 1280x720@30 mjpg, then try again.",
+                f"{error}\n\nClose other camera apps, then try again.",
             )
         else:
             self.set_status(f"Camera {slot_id + 1} is live.")
@@ -739,12 +769,17 @@ class UnifiedApp:
             self.refresh_record_gate()
 
     def _capture_bag_intent(self) -> dict[int, bool]:
-        """Read .bag checkboxes directly from the UI (not a possibly-stale slot flag)."""
+        """Read bag checkboxes: RealSense SDK .db3/.bag or Elgato ROS2 *_color."""
         intent: dict[int, bool] = {}
         for card in self.cards:
             slot = self.session.slots[card.slot_id]
             want = bool(card.bag_var.get())
-            if slot.camera is None or slot.camera.kind != "realsense":
+            cam = slot.camera
+            if cam is None:
+                want = False
+            elif cam.kind == "realsense" or cam.device_tag == "elgato":
+                pass  # keep checkbox
+            else:
                 want = False
             intent[card.slot_id] = want
             slot.record_bag = want
@@ -768,13 +803,24 @@ class UnifiedApp:
 
         # Capture checkbox state BEFORE busy/lock — this is what Record will use.
         bag_intent = self._capture_bag_intent()
-        rs_bag = [
-            self.session.slots[i].prefix
-            for i, want in bag_intent.items()
-            if want and self.session.slots[i].armed
-        ]
-        if rs_bag:
-            self.set_status(f"Recording with RealSense .bag: {', '.join(rs_bag)}")
+        rs_bag = []
+        elgato_bag = []
+        for i, want in bag_intent.items():
+            if not want or not self.session.slots[i].armed:
+                continue
+            cam = self.session.slots[i].camera
+            prefix = self.session.slots[i].prefix
+            if cam and cam.kind == "realsense":
+                rs_bag.append(prefix)
+            elif cam and cam.device_tag == "elgato":
+                elgato_bag.append(prefix)
+        if rs_bag or elgato_bag:
+            bits = []
+            if rs_bag:
+                bits.append(f"RealSense .db3/.bag: {', '.join(rs_bag)}")
+            if elgato_bag:
+                bits.append(f"Elgato ROS2 *_color: {', '.join(elgato_bag)}")
+            self.set_status("Recording with " + " · ".join(bits))
 
         armed = [s for s in self.session.slots if s.armed]
         heavy = [
@@ -821,12 +867,22 @@ class UnifiedApp:
             tip += "  " + "  ·  ".join(extra)
         self.record_tip.set(tip)
         bags = [
-            s.prefix
+            s
             for s in self.session.slots
             if s.armed and self.session.bag_intent.get(s.slot_id)
         ]
         if bags:
-            self.set_status(f"Recording — .bag ON for {', '.join(bags)}. Press Stop when finished.")
+            bits = []
+            for s in bags:
+                if s.camera and s.camera.kind == "realsense":
+                    bits.append(f"{s.prefix} (.db3/.bag)")
+                elif s.camera and s.camera.device_tag == "elgato":
+                    bits.append(f"{s.prefix} (*_color ROS2)")
+                else:
+                    bits.append(s.prefix)
+            self.set_status(
+                f"Recording — bag ON for {', '.join(bits)}. Press Stop when finished."
+            )
         else:
             self.set_status("Recording — press Stop when finished.")
         self.notebook.select(self.record_page)
@@ -913,6 +969,17 @@ class UnifiedApp:
             status += " Elgato ~120 with no software drops."
         if bag_ok:
             status += f" .bag saved: {', '.join(p for p, _ in bag_ok)}."
+        bag_drops = [
+            (prefix, int(r.get("bag_dropped") or 0))
+            for prefix, r in reports.items()
+            if int(r.get("bag_dropped") or 0) > 0
+        ]
+        if bag_drops:
+            status += (
+                " Elgato ROS2 bag queue dropped frames: "
+                + ", ".join(f"{p}×{n}" for p, n in bag_drops)
+                + " (MP4 path separate)."
+            )
         self.set_status(status)
         self.record_tip.set("Recording stopped. Arm cameras and start previews to record again.")
         if bag_missing:
@@ -1082,6 +1149,8 @@ class UnifiedApp:
                     "fps_mismatch",
                     "container_fps",
                     "bag_recorded",
+                    "bag_dropped",
+                    "bag_frames_written",
                     "bag_path",
                     "output_path",
                 )

@@ -847,14 +847,25 @@ def _export_bd3_or_db3(
     Never copy the sibling Record MP4.
     """
     source = Path(source)
-    looks_ros = source.is_dir() or (
-        source.is_file() and _looks_like_ros2_db3(source)
+    # ROS2 bags are folders (or a .db3 beside metadata.yaml). Lone Intel .db3
+    # files can also be sqlite and falsely match _looks_like_ros2_db3 — always
+    # try RealSense SDK first for those.
+    is_ros_folder = source.is_dir() or (
+        source.is_file()
+        and (source.parent / "metadata.yaml").is_file()
     )
+    looks_ros_sqlite = source.is_file() and _looks_like_ros2_db3(source)
+    looks_ros = is_ros_folder or looks_ros_sqlite
 
     rs_try = ExportResult(
-        False, None, label, message="Skipped RealSense SDK (file looks like ROS 2 sqlite)"
+        False, None, label, message="Skipped RealSense SDK (ROS 2 bag folder)"
     )
-    if not looks_ros:
+    prefer_sdk_first = source.is_file() and source.suffix.lower() in {
+        ".bag",
+        ".bd3",
+        ".db3",
+    } and not is_ros_folder
+    if prefer_sdk_first or not looks_ros:
         rs_try = _export_realsense_bag(source, output, fourcc, label, progress)
         if rs_try.ok:
             return rs_try
@@ -862,6 +873,12 @@ def _export_bd3_or_db3(
     ros_try = _export_rosbag2_to_mp4(source, output, fourcc, label, progress)
     if ros_try.ok:
         return ros_try
+
+    # If we skipped SDK because looks_ros was true but ROS failed, try SDK once.
+    if looks_ros and not prefer_sdk_first and source.is_file():
+        rs_try = _export_realsense_bag(source, output, fourcc, label, progress)
+        if rs_try.ok:
+            return rs_try
 
     result = _export_via_opencv(source, output, fourcc, label, progress)
     if result.ok:
@@ -872,23 +889,39 @@ def _export_bd3_or_db3(
     if ff.ok:
         return ff
 
-    if looks_ros:
+    # Lone Intel .db3 next to Record MP4: lead with SDK failure, never ROS first.
+    if prefer_sdk_first or (source.is_file() and not is_ros_folder):
+        lead = (
+            f"Could not decode RealSense recording {source.name} to MP4.\n"
+            f"SDK playback: {rs_try.message}\n"
+            "This is an Intel RealSense .db3/.bag, not a ROS Image bag "
+            "(“no image topics” is expected and is not the real failure).\n"
+            "Play the Record MP4 in Library. Export needs matching librealsense "
+            "(uv sync --extra realsense).\n"
+        )
+        if "version" in (rs_try.message or "").lower() or "sdk" in (rs_try.message or "").lower():
+            lead += (
+                "This PC’s librealsense/pyrealsense2 cannot play that file "
+                "(often recorded with a different SDK build). "
+                "Run: uv sync --extra realsense  ·  Play the Record MP4 instead. "
+                "Export cannot invent frames if the SDK cannot open the .db3.\n"
+            )
+    elif is_ros_folder or looks_ros:
         lead = (
             f"Could not decode ROS 2 bag {source.name} to MP4.\n"
             f"{ros_try.message}\n"
         )
     else:
         lead = (
-            f"Could not decode RealSense recording {source.name} to MP4.\n"
-            f"SDK playback: {rs_try.message}\n"
-            "This is an Intel RealSense .db3/.bag, not a ROS Image bag "
-            "(“no image topics” is expected and is not the real failure).\n"
+            f"Could not decode {source.name} to MP4.\n"
+            f"SDK: {rs_try.message}\n"
+            f"ROS: {ros_try.message}\n"
         )
-        if "version" in (rs_try.message or "").lower():
-            lead += (
-                "This PC’s librealsense cannot play that file "
-                "(often recorded with a different SDK).\n"
-            )
+    ff_extra = ""
+    if "ffmpeg not found" in (ff.message or "").lower():
+        ff_extra = (
+            "\n  • Install ffmpeg on PATH (helps export fallbacks and Elgato names).\n"
+        )
     guidance = (
         lead
         + f"\nROS bag path: {ros_try.message}\n"
@@ -897,7 +930,8 @@ def _export_bd3_or_db3(
         "Tips:\n"
         "  • Record MP4 is unchanged — play that file in Library.\n"
         f"  • Export writes a NEW {source.stem}_h264.mp4 decoded from the bag.\n"
-        "  • uv sync --extra realsense && uv run poc1 (title sdk-record-v14+)\n"
+        "  • uv sync --extra realsense && uv run poc1 (title sdk-record-v18+)\n"
         "  • Elgato ROS2 bags are folders named *_color with metadata.yaml"
+        + ff_extra
     )
     return ExportResult(False, None, label, message=guidance)

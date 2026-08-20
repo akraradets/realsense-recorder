@@ -132,7 +132,7 @@ class CameraCard(tk.Frame):
         # Written on Record only (never on Start preview). New SDKs save .db3.
         self.bag_check = tk.Checkbutton(
             form,
-            text="Also save bag with MP4 (RealSense SDK .db3/.bag, Elgato ROS2 color .db3)",
+            text="Also save bag with MP4 (RealSense: Intel .db3/.bag · Elgato: ROS2 *_color)",
             variable=self.bag_var,
             command=self._sync_bag,
             bg=PANEL,
@@ -145,8 +145,9 @@ class CameraCard(tk.Frame):
         self.bag_check.grid(row=3, column=1, columnspan=3, sticky="w", pady=(4, 0))
         tk.Label(
             form,
-            text="On Record only. RealSense: Intel .db3/.bag (USB3, close Viewer). "
-            "Elgato: ROS2 color bag for SL (not Intel format). HDMI 8-bit 1080p, close 4K Capture Utility.",
+            text="On Record only. RealSense: Intel SDK .db3/.bag (USB3, close Viewer). "
+            "Elgato: ROS2 color folder *_color (not Intel .bag). "
+            "For true 120fps set mirrorless HDMI to 1080p120.",
             bg=PANEL,
             fg=MUTED,
             font=("Segoe UI", 8),
@@ -350,9 +351,12 @@ class CameraCard(tk.Frame):
                 getattr(src, "requested_fps", 0) or getattr(src, "target_fps", 0) or 0
             )
             if measured > 1:
-                status = f"{status} | delivering ~{measured:.0f}fps"
+                status = f"{status} | camera ~{measured:.0f}fps"
                 if wanted >= 90 and measured < wanted * 0.85:
-                    status += " (HDMI source is not 120Hz; stamp ~measured, not a drop)"
+                    status += (
+                        f" (HDMI ~{measured:.0f}; set camera to 1080p120 for true 120"
+                        " — not a software drop)"
+                    )
         self.status_label.configure(text=status)
         try:
             if slot.pipeline and slot.pipeline.camera_handler.is_recording:

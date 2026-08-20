@@ -21,8 +21,11 @@ from poc1.deliverable1.win_names import (
     clear_name_cache,
     dshow_open_path,
     dshow_open_paths_for_tag,
+    elgato_open_name_paths,
+    ffmpeg_available,
     friendly_name_for_index,
     list_windows_capture_names,
+    names_are_index_aligned,
 )
 from poc1.device_enum import quiet_opencv
 from poc1.frame_source import FakeFrameSource
@@ -691,17 +694,17 @@ def list_uvc_modes(camera: ConnectedCamera) -> list[StreamMode]:
     """R2 — preset + lightly probed modes for a UVC device."""
     # Capture cards (Elgato) usually need MJPG for high-res; webcams vary.
     if camera.device_tag == "elgato":
+        # Common HDMI first (60), then 120 when the mirrorless HDMI is 1080p120.
         preferred = [
-            StreamMode(1920, 1080, 120, "mjpg"),
             StreamMode(1920, 1080, 60, "mjpg"),
-            StreamMode(1280, 720, 120, "mjpg"),
-            StreamMode(1280, 720, 60, "mjpg"),
+            StreamMode(1920, 1080, 120, "mjpg"),
+            StreamMode(1920, 1080, 50, "mjpg"),
             StreamMode(1920, 1080, 30, "mjpg"),
+            StreamMode(1280, 720, 60, "mjpg"),
+            StreamMode(1280, 720, 120, "mjpg"),
             StreamMode(1280, 720, 30, "mjpg"),
-            StreamMode(1920, 1080, 60, "bgr8"),
-            StreamMode(1920, 1080, 30, "bgr8"),
-            StreamMode(1280, 720, 30, "bgr8"),
-            StreamMode(640, 480, 30, "bgr8"),
+            StreamMode(1920, 1080, 25, "mjpg"),
+            StreamMode(640, 480, 30, "mjpg"),
         ]
     else:
         # Prefer modest defaults first. Many UVC webcams cannot sustain FHD@120,
@@ -727,7 +730,7 @@ def list_uvc_modes(camera: ConnectedCamera) -> list[StreamMode]:
     if camera.device_tag == "elgato":
         modes = [m for m in modes if m.pixel_format == "mjpg"]
         if not modes:
-            modes = [StreamMode(1920, 1080, 120, "mjpg")]
+            modes = [StreamMode(1920, 1080, 60, "mjpg")]
         return modes
     with quiet_opencv():
         cap = cv2.VideoCapture(camera.index, camera.backend)
@@ -785,7 +788,25 @@ def _looks_like_solid_green(bgr: np.ndarray) -> bool:
     b = sample[:, :, 0].astype(np.float32)
     g = sample[:, :, 1].astype(np.float32)
     r = sample[:, :, 2].astype(np.float32)
-    return float(g.mean()) > 160.0 and float(b.mean()) < 55.0 and float(r.mean()) < 55.0
+    # Slightly looser thresholds — Station B Elgato often showed full green
+    # with mean-G ~150–180 while R/B stayed low.
+    return float(g.mean()) > 140.0 and float(b.mean()) < 70.0 and float(r.mean()) < 70.0
+
+
+def _frame_is_unusable_elgato(bgr: np.ndarray) -> bool:
+    """Reject solid green / near-empty buffers before accepting an Elgato profile."""
+    if bgr is None or bgr.size == 0:
+        return True
+    if _looks_like_solid_green(bgr):
+        return True
+    mean = float(np.mean(bgr))
+    if mean < 1.5:
+        return True
+    # Nearly uniform green-dominant frame (low variance).
+    std = float(np.std(bgr))
+    if std < 8.0 and float(np.mean(bgr[:, :, 1])) > 120.0:
+        return True
+    return False
 
 
 def _open_uvc_timeout(target: Any, backend: int, timeout_s: float = 3.0) -> cv2.VideoCapture:
@@ -810,6 +831,87 @@ def _open_uvc_timeout(target: Any, backend: int, timeout_s: float = 3.0) -> cv2.
                 pass
         raise RuntimeError(f"Could not open {target!r} backend={backend}")
     return cap
+
+
+def _elgato_open_targets(
+    open_path: Optional[str],
+    device_index: int,
+    *,
+    max_index: int = 8,
+) -> list[tuple[Any, int]]:
+    """
+    Ordered OpenCV open attempts for Elgato 4K X / HD60.
+
+    Prefer ffmpeg DirectShow names, then scan indices (PnP index is unreliable),
+    then MSMF by name/index, then CAP_ANY.
+    """
+    targets: list[tuple[Any, int]] = []
+    name_paths = list(elgato_open_name_paths())
+    if open_path and open_path not in name_paths:
+        name_paths.insert(0, open_path)
+
+    # 1) DirectShow by friendly name (ffmpeg-aligned preferred).
+    for path in name_paths:
+        targets.append((path, cv2.CAP_DSHOW))
+
+    # 2) Scan OpenCV indices — do not trust PnP/synthetic index alone.
+    indices = list(range(max_index))
+    if device_index not in indices and 0 <= device_index < 100:
+        indices.insert(0, device_index)
+    for idx in indices:
+        targets.append((idx, cv2.CAP_DSHOW))
+
+    # 3) MSMF last-resort for Elgato 4K X when DSHOW fails on Station A.
+    for path in name_paths:
+        targets.append((path, cv2.CAP_MSMF))
+    for idx in indices[:4]:
+        targets.append((idx, cv2.CAP_MSMF))
+
+    # 4) CAP_ANY
+    for idx in indices[:4]:
+        targets.append((idx, cv2.CAP_ANY))
+
+    return targets
+
+
+def _uvc_open_failure_message(
+    *,
+    is_elgato: bool,
+    opened_once: bool,
+    last_exc: Optional[BaseException],
+) -> str:
+    """Distinguish could-not-open vs opened-but-no-frames for Station A dialogs."""
+    detail = f" ({last_exc})" if last_exc else ""
+    if is_elgato:
+        ff_hint = ""
+        if not ffmpeg_available():
+            ff_hint = (
+                " ffmpeg is missing — install ffmpeg on PATH so Refresh uses "
+                "DirectShow device names (PnP labels often fail to open)."
+            )
+        if opened_once:
+            return (
+                f"Elgato opened but delivered no frames{detail}."
+                " HDMI source ON (1080p60/120), close Elgato 4K Capture Utility / OBS,"
+                " then Start preview again."
+                + ff_hint
+            )
+        return (
+            f"Could not open Elgato capture card{detail}."
+            " Close Elgato 4K Capture Utility, OBS, Zoom, Teams, and Windows Camera."
+            " Confirm HDMI is on, click Refresh, then Start preview on Camera 2 alone."
+            + ff_hint
+        )
+    if opened_once:
+        return (
+            f"UVC device opened but delivered no frames{detail}."
+            " Close Zoom/Teams/Camera and other POC1 windows, then Refresh."
+            " Use 1280x720@30 mjpg for the laptop webcam."
+        )
+    return (
+        f"Could not open UVC device{detail}."
+        " Close other camera apps and click Refresh."
+    )
 
 
 def _apply_uvc_fourcc(cap: cv2.VideoCapture, pixel_format: str) -> None:
@@ -912,8 +1014,7 @@ class FormattedUvcSource(CvCaptureSource):
         except Exception:  # noqa: BLE001
             pass
         # Warm up: capture cards often emit a few empty/black frames first.
-        # Keep this short so a locked webcam cannot freeze the UI for seconds.
-        warm = 8 if getattr(self, "device_tag", "") == "elgato" else 4
+        warm = 20 if getattr(self, "device_tag", "") == "elgato" else 4
         frame = None
         for _ in range(warm):
             ok, candidate = cap.read()
@@ -946,10 +1047,17 @@ class FormattedUvcSource(CvCaptureSource):
             is_elgato = self.device_tag == "elgato"
 
             if is_elgato:
+                if not ffmpeg_available():
+                    logger.warning(
+                        "ffmpeg not available — Elgato open may fail with PnP-only names. "
+                        "Install ffmpeg on PATH, then Refresh."
+                    )
+                # Try 60 first (common HDMI), then 120 when the source can do it.
                 profiles = [
-                    (1920, 1080, 120, "mjpg"),
                     (1920, 1080, 60, "mjpg"),
+                    (1920, 1080, 120, "mjpg"),
                     (wanted_w, wanted_h, wanted_fps, "mjpg"),
+                    (1920, 1080, 50, "mjpg"),
                     (1280, 720, 60, "mjpg"),
                     (1280, 720, 30, "mjpg"),
                 ]
@@ -974,24 +1082,27 @@ class FormattedUvcSource(CvCaptureSource):
                     unique_profiles.append(prof)
 
             last_exc: Optional[Exception] = None
+            opened_once = False
             chosen: Optional[
                 tuple[float, int, int, int, str, cv2.VideoCapture, np.ndarray]
             ] = None
 
-            open_targets: list[tuple[Any, int]] = []
-            if self.open_path and sys.platform == "win32":
-                open_targets.append((self.open_path, cv2.CAP_DSHOW))
-            if sys.platform == "win32" and is_elgato:
-                for path in dshow_open_paths_for_tag("elgato"):
-                    open_targets.append((path, cv2.CAP_DSHOW))
-            elif sys.platform == "win32" and self.device_tag == "uvc" and not self.open_path:
-                for path in dshow_open_paths_for_tag("uvc"):
-                    open_targets.append((path, cv2.CAP_DSHOW))
-            open_targets.append((self.device_index, self._backend if not is_elgato else cv2.CAP_DSHOW))
             if is_elgato:
-                pass
-            elif self.device_tag == "uvc" and self._backend == cv2.CAP_DSHOW:
-                open_targets.append((self.device_index, cv2.CAP_MSMF))
+                open_targets = _elgato_open_targets(
+                    self.open_path, int(self.device_index or 0)
+                )
+                open_timeout = 6.0
+            else:
+                open_targets = []
+                if self.open_path and sys.platform == "win32":
+                    open_targets.append((self.open_path, cv2.CAP_DSHOW))
+                if sys.platform == "win32" and self.device_tag == "uvc" and not self.open_path:
+                    for path in dshow_open_paths_for_tag("uvc"):
+                        open_targets.append((path, cv2.CAP_DSHOW))
+                open_targets.append((self.device_index, self._backend))
+                if self.device_tag == "uvc" and self._backend == cv2.CAP_DSHOW:
+                    open_targets.append((self.device_index, cv2.CAP_MSMF))
+                open_timeout = 3.0
 
             seen_open: set[tuple[str, int]] = set()
             for target, backend in open_targets:
@@ -1000,12 +1111,13 @@ class FormattedUvcSource(CvCaptureSource):
                     continue
                 seen_open.add(ok_key)
                 try:
-                    cap = _open_uvc_timeout(target, backend, timeout_s=3.0)
+                    cap = _open_uvc_timeout(target, backend, timeout_s=open_timeout)
                 except Exception as exc:  # noqa: BLE001
                     last_exc = exc if isinstance(exc, Exception) else Exception(str(exc))
                     logger.warning("UVC open skipped %s: %s", target, exc)
                     continue
 
+                opened_once = True
                 got_any = False
                 for width, height, fps, fmt in unique_profiles:
                     try:
@@ -1015,7 +1127,15 @@ class FormattedUvcSource(CvCaptureSource):
                         continue
                     if frame is None:
                         continue
-                    if _looks_like_solid_green(frame):
+                    if is_elgato and _frame_is_unusable_elgato(frame):
+                        logger.warning(
+                            "Rejecting %dx%d %s — unusable Elgato frame (green/empty)",
+                            width,
+                            height,
+                            fmt,
+                        )
+                        continue
+                    if not is_elgato and _looks_like_solid_green(frame):
                         logger.warning(
                             "Rejecting %dx%d %s — solid green (wrong format / 10-bit HDMI)",
                             width,
@@ -1032,6 +1152,11 @@ class FormattedUvcSource(CvCaptureSource):
                         continue
                     got_any = True
                     self._cap = cap
+                    self._backend = backend
+                    if isinstance(target, str) and target.startswith("video="):
+                        self.open_path = target
+                    elif isinstance(target, int):
+                        self.device_index = target
                     owned = np.ascontiguousarray(frame)
                     self._pending_frame = owned
                     if is_elgato and fps >= 90:
@@ -1045,6 +1170,15 @@ class FormattedUvcSource(CvCaptureSource):
                     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
                     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
                     chosen = (rate, w, h, fps, fmt, cap, owned)
+                    logger.info(
+                        "UVC opened via target=%r backend=%s %dx%d@%d %s",
+                        target,
+                        backend,
+                        w,
+                        h,
+                        fps,
+                        fmt,
+                    )
                     break
 
                 if chosen is not None:
@@ -1054,18 +1188,15 @@ class FormattedUvcSource(CvCaptureSource):
                 except Exception:  # noqa: BLE001
                     pass
                 if not got_any:
-                    last_exc = last_exc or RuntimeError("no frames")
+                    last_exc = last_exc or RuntimeError("no frames after open")
 
             if chosen is None:
-                detail = f" ({last_exc})" if last_exc else ""
-                hint = (
-                    " For Elgato: HDMI source ON, close Elgato app, then Refresh."
-                    if is_elgato
-                    else " Close Zoom/Teams/Camera and other POC1 windows, then Refresh. "
-                    "Use 1280x720@30 mjpg for the laptop webcam."
-                )
                 raise RuntimeError(
-                    f"UVC device opened but delivered no frames{detail}.{hint}"
+                    _uvc_open_failure_message(
+                        is_elgato=is_elgato,
+                        opened_once=opened_once,
+                        last_exc=last_exc,
+                    )
                 )
 
             rate, w, h, req_fps, fmt, cap, frame = chosen
@@ -1118,7 +1249,6 @@ class FormattedUvcSource(CvCaptureSource):
             self._pending_frame = None
             return frame
         return super().read()
-
 
 
 class ConfiguredRealSenseSource:

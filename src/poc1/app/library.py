@@ -165,10 +165,13 @@ class LibraryPage(tk.Frame):
         tk.Label(
             export,
             text="Export selected bag → NEW {name}_h264.mp4 (decoded). "
-            "The original Record MP4 is kept. H.264/H.265 fall back to mp4v if needed.",
+            "RealSense = .db3/.bag via SDK. Elgato = *_color folder. "
+            "Record MP4 is kept. Install ffmpeg for fallbacks.",
             bg=PANEL,
             fg=MUTED,
             font=("Segoe UI", 8),
+            wraplength=900,
+            justify="left",
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
         self.export_status = tk.Label(
             export, text="", bg=PANEL, fg=MUTED, font=("Segoe UI", 8), anchor="w"
@@ -178,6 +181,15 @@ class LibraryPage(tk.Frame):
     def sync_folder(self, folder: Path) -> None:
         self.folder_var.set(str(Path(folder).resolve()))
         self.refresh_list()
+        try:
+            from poc1.deliverable2.export import _find_ffmpeg
+
+            if _find_ffmpeg() is None:
+                self.export_status.configure(
+                    text="Note: ffmpeg not on PATH — install it for export fallbacks / Elgato names."
+                )
+        except Exception:  # noqa: BLE001
+            pass
 
     def browse_folder(self) -> None:
         chosen = filedialog.askdirectory(initialdir=self.folder_var.get() or ".")

@@ -89,7 +89,59 @@ def test_export_db3_does_not_copy_sibling_record_mp4(tmp_path: Path):
     assert not result.ok, result.message
     assert sibling.is_file() and sibling.stat().st_size == sibling_size
     assert "RealSense" in result.message or "SDK" in result.message or "decode" in result.message.lower()
-    assert "no image topics" not in result.message.split("\n")[0].lower()
+    # Lead with RealSense/SDK — not ROS "no image topics" as the main failure.
+    first = result.message.split("\n")[0].lower()
+    assert "no image topics" not in first
+    assert "ros 2 bag" not in first or "realsense" in first
+
+
+def test_export_lone_db3_error_leads_with_sdk_not_ros(tmp_path: Path, monkeypatch):
+    """Station B: Intel .db3 that looks like ROS sqlite must still lead with SDK error."""
+    from poc1.deliverable2 import export as export_mod
+    from poc1.deliverable2.export import ExportResult
+
+    db3 = tmp_path / "r_take.db3"
+    db3.write_bytes(b"fake-intel-db3")
+    _write_tiny_mp4(tmp_path / "r_take.mp4", frames=4)
+
+    monkeypatch.setattr(export_mod, "_looks_like_ros2_db3", lambda _p: True)
+    monkeypatch.setattr(
+        export_mod,
+        "_export_realsense_bag",
+        lambda *_a, **_k: ExportResult(
+            False, None, "H.264", message="SDK cannot open this file"
+        ),
+    )
+    monkeypatch.setattr(
+        export_mod,
+        "_export_rosbag2_to_mp4",
+        lambda *_a, **_k: ExportResult(
+            False, None, "H.264", message="No image topics in r_take.db3"
+        ),
+    )
+    monkeypatch.setattr(
+        export_mod,
+        "_export_via_opencv",
+        lambda *_a, **_k: ExportResult(False, None, "H.264", message="OpenCV fail"),
+    )
+    monkeypatch.setattr(
+        export_mod,
+        "_export_via_ffmpeg",
+        lambda *_a, **_k: ExportResult(
+            False, None, "H.264", message="ffmpeg not found on PATH"
+        ),
+    )
+
+    result = export_to_mp4(db3, tmp_path / "r_take_h264.mp4", codec="h264")
+    assert not result.ok
+    first = result.message.split("\n")[0].lower()
+    assert "realsense" in first
+    assert not first.startswith("could not decode ros 2")
+    assert "sdk cannot open" in result.message.lower()
+    assert "no image topics" in result.message.lower()  # may appear later, not lead
+    assert result.message.lower().index("realsense") < result.message.lower().index(
+        "no image topics"
+    )
 
 
 def test_export_elgato_color_folder_does_not_copy_sibling(tmp_path: Path):

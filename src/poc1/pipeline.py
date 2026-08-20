@@ -268,9 +268,15 @@ class Pipeline:
                 self.processor.stop()
             except Exception:  # noqa: BLE001
                 logger.exception("processor.stop failed")
+        bag_dropped = 0
+        bag_frames = 0
         if self._uvc_bag is not None:
             try:
+                bag_dropped = int(getattr(self._uvc_bag, "dropped", 0) or 0)
+                bag_frames = int(getattr(self._uvc_bag, "frames_written", 0) or 0)
                 self._bag_written = self._uvc_bag.stop() or self._bag_path
+                bag_dropped = int(getattr(self._uvc_bag, "dropped", bag_dropped) or 0)
+                bag_frames = int(getattr(self._uvc_bag, "frames_written", bag_frames) or 0)
             except Exception:  # noqa: BLE001
                 logger.exception("UVC ROS2 bag stop failed")
             self._uvc_bag = None
@@ -286,6 +292,14 @@ class Pipeline:
             except Exception:  # noqa: BLE001
                 logger.exception("monitor.stop failed")
         report = self.report()
+        report["bag_dropped"] = bag_dropped
+        report["bag_frames_written"] = bag_frames
+        if bag_dropped > 0:
+            report["bag_queue_overflow"] = True
+            logger.warning(
+                "Elgato ROS2 bag dropped %d frame(s) (queue overflow) — MP4 path separate",
+                bag_dropped,
+            )
         if hasattr(self, "_requested_fps"):
             report["requested_fps"] = int(self._requested_fps)
         self._last_report = report
@@ -407,6 +421,8 @@ class Pipeline:
             "compression_stage": "processor",
             "bag_path": str(self._bag_written) if self._bag_written else "",
             "bag_recorded": bool(self._bag_written),
+            "bag_dropped": 0,
+            "bag_frames_written": 0,
             "no_frame_drops": no_drops,
             "no_capture": no_capture,
             "r7_120_ok": r7_120_ok,

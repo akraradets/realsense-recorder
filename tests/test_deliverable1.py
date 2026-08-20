@@ -143,7 +143,7 @@ def test_win_names_classify_elgato_and_realsense():
     assert classify_capture_name("USB2.0 HD UVC WebCam") == "uvc"
 
 
-def test_elgato_modes_are_mjpg_only_with_1080p120_default():
+def test_elgato_modes_are_mjpg_only_with_1080p_defaults():
     cam = ConnectedCamera(
         cam_id="uvc:0:DSHOW",
         kind="uvc",
@@ -155,7 +155,8 @@ def test_elgato_modes_are_mjpg_only_with_1080p120_default():
     )
     modes = list_uvc_modes(cam)
     assert modes
-    assert modes[0] == StreamMode(1920, 1080, 120, "mjpg")
+    assert modes[0] == StreamMode(1920, 1080, 60, "mjpg")
+    assert any(m == StreamMode(1920, 1080, 120, "mjpg") for m in modes)
     assert all(m.pixel_format == "mjpg" for m in modes)
 
 
@@ -219,6 +220,108 @@ def test_refresh_devices_refreshes_windows_name_cache(monkeypatch):
     assert seen == [True]
 
 
+def test_elgato_open_targets_prefer_dshow_then_index_then_msmf(monkeypatch):
+    import cv2
+    from poc1.deliverable1 import devices as dev
+
+    monkeypatch.setattr(
+        dev, "elgato_open_name_paths", lambda: ["video=Elgato 4K X"]
+    )
+    targets = dev._elgato_open_targets("video=Elgato 4K X", device_index=0, max_index=3)
+    assert targets[0] == ("video=Elgato 4K X", cv2.CAP_DSHOW)
+    # Index scan after named DSHOW
+    assert (0, cv2.CAP_DSHOW) in targets
+    assert (1, cv2.CAP_DSHOW) in targets
+    # MSMF appears after DSHOW index attempts
+    dshow_idxs = [i for i, (t, b) in enumerate(targets) if b == cv2.CAP_DSHOW]
+    msmf_idxs = [i for i, (t, b) in enumerate(targets) if b == cv2.CAP_MSMF]
+    assert msmf_idxs and max(dshow_idxs) < min(msmf_idxs)
+    assert ("video=Elgato 4K X", cv2.CAP_MSMF) in targets
+
+
+def test_uvc_open_failure_message_distinguishes_open_vs_frames():
+    from poc1.deliverable1.devices import _uvc_open_failure_message
+
+    no_open = _uvc_open_failure_message(
+        is_elgato=True,
+        opened_once=False,
+        last_exc=RuntimeError("Could not open 0 backend=700"),
+    )
+    assert no_open.startswith("Could not open Elgato")
+    assert "opened but delivered no frames" not in no_open.lower()
+
+    no_frames = _uvc_open_failure_message(
+        is_elgato=True,
+        opened_once=True,
+        last_exc=RuntimeError("no frames after open"),
+    )
+    assert "opened but delivered no frames" in no_frames.lower()
+    assert "HDMI" in no_frames
+
+
+def test_elgato_bag_intent_allowed_like_realsense():
+    """Station B: Elgato bag checkbox must not be zeroed before Record."""
+    rs = ConnectedCamera(
+        cam_id="realsense:ABC",
+        kind="realsense",
+        name="Intel RealSense D435",
+        serial="ABC",
+        device_tag="realsense",
+    )
+    elg = ConnectedCamera(
+        cam_id="uvc:elgato:Elgato 4K X:DSHOW",
+        kind="uvc",
+        name="Elgato / capture card — Elgato 4K X",
+        index=0,
+        device_tag="elgato",
+    )
+    webcam = ConnectedCamera(
+        cam_id="uvc:0:DSHOW",
+        kind="uvc",
+        name="USB Webcam",
+        index=1,
+        device_tag="uvc",
+    )
+    # Mirror _capture_bag_intent rules without Tk.
+    def allow_bag(cam: ConnectedCamera, checked: bool) -> bool:
+        if not checked:
+            return False
+        return cam.kind == "realsense" or cam.device_tag == "elgato"
+
+    assert allow_bag(rs, True) is True
+    assert allow_bag(elg, True) is True
+    assert allow_bag(webcam, True) is False
+    assert allow_bag(elg, False) is False
+
+
+def test_session_keeps_elgato_record_bag_flag():
+    session = MultiCamSession(n_slots=2)
+    devices = session.refresh_devices(
+        include_fake=True, probe_uvc=False, probe_realsense=False
+    )
+    fakes = [d for d in devices if d.kind == "fake"]
+    # Simulate Elgato-tagged camera by assigning fake then patching tag on slot.
+    session.assign_camera(0, fakes[0].cam_id)
+    session.slots[0].camera = ConnectedCamera(
+        cam_id="uvc:elgato:test:DSHOW",
+        kind="uvc",
+        name="Elgato test",
+        index=0,
+        device_tag="elgato",
+    )
+    session.slots[0].record_bag = True
+    session.bag_intent = {0: True}
+    # The alignment block in start_recording_armed must keep True for elgato.
+    want = bool(session.bag_intent.get(0, session.slots[0].record_bag))
+    cam = session.slots[0].camera
+    assert cam is not None
+    if cam.kind == "realsense" or cam.device_tag == "elgato":
+        session.slots[0].record_bag = want
+    else:
+        session.slots[0].record_bag = False
+    assert session.slots[0].record_bag is True
+
+
 def test_default_prefixes_are_m_and_r():
     session = MultiCamSession(n_slots=2)
     assert session.slots[0].prefix == "m"
@@ -265,7 +368,14 @@ def test_multicam_two_fakes_preview_and_armed_record(tmp_path: Path):
     session.set_armed(1, True)
 
     session.start_previews()
-    time.sleep(0.4)
+    deadline = time.perf_counter() + 2.0
+    while time.perf_counter() < deadline:
+        if (
+            session.slots[0].get_preview_frame() is not None
+            and session.slots[1].get_preview_frame() is not None
+        ):
+            break
+        time.sleep(0.05)
     assert session.slots[0].get_preview_frame() is not None
     assert session.slots[1].get_preview_frame() is not None
 

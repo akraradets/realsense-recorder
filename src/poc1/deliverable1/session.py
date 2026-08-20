@@ -281,16 +281,28 @@ class MultiCamSession:
         slot.status = "idle"
 
     def start_previews(self) -> None:
-        """R3 — start preview on every assigned slot."""
+        """R3 — start preview on every assigned slot (RealSense first, then Elgato)."""
         errors: list[str] = []
-        for slot in self.slots:
-            if slot.camera is None:
-                continue
+        ordered = sorted(
+            [s for s in self.slots if s.camera is not None],
+            key=lambda s: (
+                0
+                if s.camera and s.camera.kind == "realsense"
+                else (1 if s.camera and s.camera.device_tag == "elgato" else 2),
+                s.slot_id,
+            ),
+        )
+        for slot in ordered:
             try:
                 self.start_slot_preview(slot.slot_id)
+                # Brief pause after RealSense so USB / exclusive access settles
+                # before Elgato open (Station A race).
+                if slot.camera and slot.camera.kind == "realsense":
+                    time.sleep(0.35)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"slot{slot.slot_id}: {exc}")
                 slot.status = f"error: {exc}"
+                logger.exception("start_slot_preview failed for slot %d", slot.slot_id)
         if errors:
             raise RuntimeError("; ".join(errors))
 
@@ -329,7 +341,7 @@ class MultiCamSession:
                     )
                 # Keep slot.record_bag aligned with authoritative intent for UI restore.
                 want_bag = bool(intent.get(s.slot_id, s.record_bag))
-                if s.camera.kind == "realsense":
+                if s.camera.kind == "realsense" or s.camera.device_tag == "elgato":
                     s.record_bag = want_bag
                 else:
                     s.record_bag = False

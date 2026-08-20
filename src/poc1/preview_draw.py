@@ -91,7 +91,9 @@ def hud_lines_for_source(slot, src) -> list[str]:
     if preview_fps > 1:
         lines.append(f"preview redraw ~{preview_fps:.0f} fps (display only)")
     if requested >= 90 and camera_fps < requested * 0.85 and tag == "elgato":
-        lines.append("HDMI source is not 120Hz")
+        lines.append(
+            f"HDMI is ~{camera_fps:.0f}; set camera HDMI to 1080p120 for true 120"
+        )
     elif kind == "realsense" and requested >= 90:
         lines.append("D400 color is not 120fps")
     return lines

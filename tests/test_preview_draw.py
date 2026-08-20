@@ -65,3 +65,19 @@ def test_hud_separates_camera_and_preview_fps() -> None:
     assert any("camera ~118" in line for line in lines)
     assert any("preview redraw" in line for line in lines)
     assert not any("delivering" in line for line in lines)
+
+
+def test_hud_hdmi_not_120_message() -> None:
+    slot = CameraSlot(slot_id=0, prefix="m")
+
+    class Src:
+        device_tag = "elgato"
+        actual_width = 1920
+        actual_height = 1080
+        target_fps = 60
+        requested_fps = 120
+        actual_fps = 58.0
+
+    lines = hud_lines_for_source(slot, Src())
+    assert any("1080p120" in line for line in lines)
+    assert any("HDMI is ~58" in line for line in lines)

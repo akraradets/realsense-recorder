@@ -828,7 +828,12 @@ class Deliverable1App:
         for card in self.cards:
             slot = self.session.slots[card.slot_id]
             want = bool(card.bag_var.get())
-            if slot.camera is None or slot.camera.kind != "realsense":
+            cam = slot.camera
+            if cam is None:
+                want = False
+            elif cam.kind == "realsense" or cam.device_tag == "elgato":
+                pass
+            else:
                 want = False
             intent[card.slot_id] = want
             slot.record_bag = want
