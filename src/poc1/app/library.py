@@ -239,6 +239,32 @@ class LibraryPage(tk.Frame):
                 return
             self.selected = self.files[int(idxs[0])]
         path = self.selected
+
+        # Elgato ROS2 bag folder (*_color) — not a playable video.
+        if path.is_dir() and (
+            path.name.endswith("_color") or (path / "metadata.yaml").is_file()
+        ):
+            sibling = self._sibling_record_mp4_for_bag(path)
+            if sibling is not None:
+                if messagebox.askyesno(
+                    "Playback",
+                    f"{path.name} is an Elgato ROS2 color bag folder "
+                    "(not a video file).\n\n"
+                    f"A matching Record MP4 exists:\n{sibling.name}\n\n"
+                    "Play that original MP4 now?\n\n"
+                    "(Cancel = stay here. Use Export selected to decode the bag "
+                    "to a NEW mp4; Record MP4 is kept.)",
+                ):
+                    self._start_playback(sibling)
+                return
+            if messagebox.askyesno(
+                "Playback",
+                f"{path.name} is a ROS2 bag folder and cannot play directly.\n\n"
+                "Export it to a NEW MP4 (decoded from the bag), then play?",
+            ):
+                self._run_export(path)
+            return
+
         if path.suffix.lower() in {".bag", ".bd3", ".db3"}:
             sibling = path.with_suffix(".mp4")
             if sibling.is_file() and sibling.stat().st_size > 32:
@@ -260,6 +286,26 @@ class LibraryPage(tk.Frame):
                 self._run_export(path)
             return
         self._start_playback(path)
+
+    @staticmethod
+    def _sibling_record_mp4_for_bag(path: Path) -> Optional[Path]:
+        """Record MP4 beside a RealSense .db3 or Elgato *_color folder."""
+        path = Path(path)
+        candidates: list[Path] = []
+        if path.is_dir():
+            name = path.name
+            if name.endswith("_color"):
+                candidates.append(path.parent / f"{name[:-6]}.mp4")
+            candidates.append(path.parent / f"{path.name}.mp4")
+        else:
+            candidates.append(path.with_suffix(".mp4"))
+            stem = path.stem
+            if stem.endswith("_color"):
+                candidates.append(path.parent / f"{stem[:-6]}.mp4")
+        for candidate in candidates:
+            if candidate.is_file() and candidate.stat().st_size > 32:
+                return candidate
+        return None
 
     def open_system_player(self) -> None:
         if self.selected is None:

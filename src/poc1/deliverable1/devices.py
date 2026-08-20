@@ -763,6 +763,30 @@ def list_stream_modes(camera: ConnectedCamera) -> list[StreamMode]:
     return list_uvc_modes(camera)
 
 
+def elgato_open_profiles(
+    wanted_w: int, wanted_h: int, wanted_fps: int, wanted_fmt: str = "mjpg"
+) -> list[tuple[int, int, int, str]]:
+    """Ordered Elgato open attempts: user selection first, then HDMI fallbacks."""
+    fmt = "mjpg" if (wanted_fmt or "mjpg").lower() != "mjpg" else "mjpg"
+    profiles = [
+        (wanted_w, wanted_h, wanted_fps, fmt),
+        (wanted_w, wanted_h, wanted_fps, "mjpg"),
+        (1920, 1080, 60, "mjpg"),
+        (1920, 1080, 120, "mjpg"),
+        (1920, 1080, 50, "mjpg"),
+        (1280, 720, 60, "mjpg"),
+        (1280, 720, 120, "mjpg"),
+        (1280, 720, 30, "mjpg"),
+    ]
+    seen: set[tuple[int, int, int, str]] = set()
+    out: list[tuple[int, int, int, str]] = []
+    for prof in profiles:
+        if prof not in seen:
+            seen.add(prof)
+            out.append(prof)
+    return out
+
+
 def _looks_like_packed_yuyv(bgr: np.ndarray) -> bool:
     """True when YUY2 was likely decoded as BGR (fine zebra / chroma stripes)."""
     if bgr is None or bgr.ndim != 3 or bgr.shape[2] != 3:
@@ -1052,15 +1076,10 @@ class FormattedUvcSource(CvCaptureSource):
                         "ffmpeg not available — Elgato open may fail with PnP-only names. "
                         "Install ffmpeg on PATH, then Refresh."
                     )
-                # Try 60 first (common HDMI), then 120 when the source can do it.
-                profiles = [
-                    (1920, 1080, 60, "mjpg"),
-                    (1920, 1080, 120, "mjpg"),
-                    (wanted_w, wanted_h, wanted_fps, "mjpg"),
-                    (1920, 1080, 50, "mjpg"),
-                    (1280, 720, 60, "mjpg"),
-                    (1280, 720, 30, "mjpg"),
-                ]
+                # Prefer the Setup dropdown mode first, then common HDMI fallbacks.
+                profiles = elgato_open_profiles(
+                    wanted_w, wanted_h, wanted_fps, wanted_fmt
+                )
             else:
                 # Laptop UVC almost never delivers real bgr8. MJPG first avoids
                 # YUY2-as-BGR zebra stripes. Keep the list tiny so start() cannot

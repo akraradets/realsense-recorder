@@ -930,7 +930,7 @@ def _export_bd3_or_db3(
         "Tips:\n"
         "  • Record MP4 is unchanged — play that file in Library.\n"
         f"  • Export writes a NEW {source.stem}_h264.mp4 decoded from the bag.\n"
-        "  • uv sync --extra realsense && uv run poc1 (title sdk-record-v18+)\n"
+        "  • uv sync --extra realsense && uv run poc1 (title sdk-record-v19+)\n"
         "  • Elgato ROS2 bags are folders named *_color with metadata.yaml"
         + ff_extra
     )

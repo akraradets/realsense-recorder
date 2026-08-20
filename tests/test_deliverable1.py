@@ -143,6 +143,29 @@ def test_win_names_classify_elgato_and_realsense():
     assert classify_capture_name("USB2.0 HD UVC WebCam") == "uvc"
 
 
+def test_elgato_open_profiles_prefer_user_selection():
+    from poc1.deliverable1.devices import elgato_open_profiles
+
+    profiles = elgato_open_profiles(1280, 720, 120, "mjpg")
+    assert profiles[0] == (1280, 720, 120, "mjpg")
+    assert (1920, 1080, 60, "mjpg") in profiles
+    assert profiles.index((1280, 720, 120, "mjpg")) < profiles.index(
+        (1920, 1080, 60, "mjpg")
+    )
+
+
+def test_sibling_mp4_for_elgato_color_folder(tmp_path: Path):
+    from poc1.app.library import LibraryPage
+
+    bag = tmp_path / "m_take_color"
+    bag.mkdir()
+    (bag / "metadata.yaml").write_text("x", encoding="utf-8")
+    mp4 = tmp_path / "m_take.mp4"
+    mp4.write_bytes(b"\x00" * 64)
+    found = LibraryPage._sibling_record_mp4_for_bag(bag)
+    assert found == mp4
+
+
 def test_elgato_modes_are_mjpg_only_with_1080p_defaults():
     cam = ConnectedCamera(
         cam_id="uvc:0:DSHOW",
