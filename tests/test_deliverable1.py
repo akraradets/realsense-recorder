@@ -154,6 +154,18 @@ def test_elgato_open_profiles_prefer_user_selection():
     )
 
 
+def test_library_display_name_marks_color_bag(tmp_path: Path):
+    from poc1.app.library import LibraryPage
+
+    bag = tmp_path / "m_take_color"
+    bag.mkdir()
+    (bag / "metadata.yaml").write_text("x", encoding="utf-8")
+    label = LibraryPage._display_name(bag)
+    assert "ROS2 bag" in label
+    assert "Export" in label
+    assert LibraryPage._display_name(tmp_path / "m_take.mp4") == "m_take.mp4"
+
+
 def test_sibling_mp4_for_elgato_color_folder(tmp_path: Path):
     from poc1.app.library import LibraryPage
 

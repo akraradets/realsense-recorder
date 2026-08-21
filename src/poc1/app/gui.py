@@ -529,6 +529,11 @@ class UnifiedApp:
     def _previews_started(self, error: Optional[str]) -> None:
         self._set_busy(False)
         self._clear_opening_placeholders()
+        for card in self.cards:
+            try:
+                card.sync_opened_mode_from_source()
+            except Exception:  # noqa: BLE001
+                pass
         live = self._live_preview_count()
         opened = len([s for s in self.session.slots if s.pipeline])
         waiting = opened - live
@@ -560,6 +565,10 @@ class UnifiedApp:
                 f"{error}\n\nClose other camera apps, then try again.",
             )
         else:
+            try:
+                self.cards[slot_id].sync_opened_mode_from_source()
+            except Exception:  # noqa: BLE001
+                pass
             self.set_status(f"Camera {slot_id + 1} is live.")
             self.root.after(3500, lambda: self._warn_slot_if_no_frames(slot_id))
         self.refresh_record_gate()

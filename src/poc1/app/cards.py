@@ -221,6 +221,30 @@ class CameraCard(tk.Frame):
         if slot.mode:
             self.mode_var.set(slot.mode.label())
 
+    def sync_opened_mode_from_source(self) -> None:
+        """After Elgato preview opens, align Setup dropdown with actual size/stamp FPS."""
+        slot = self.session.slots[self.slot_id]
+        if slot.pipeline is None:
+            return
+        src = slot.pipeline.source
+        if getattr(src, "device_tag", "") != "elgato":
+            return
+        w = int(getattr(src, "width", 0) or 0)
+        h = int(getattr(src, "height", 0) or 0)
+        fps = int(getattr(src, "target_fps", 0) or 0)
+        fmt = str(getattr(src, "pixel_format", "mjpg") or "mjpg")
+        if w < 1 or h < 1 or fps < 1:
+            return
+        opened = StreamMode(w, h, fps, fmt)
+        if slot.mode == opened:
+            return
+        modes = list(slot.available_modes)
+        if opened not in modes:
+            modes.insert(0, opened)
+            slot.available_modes = modes
+        slot.mode = opened
+        self._load_modes(slot)
+
     def _on_device(self, *_args) -> None:
         if self.app.busy:
             return
@@ -354,8 +378,9 @@ class CameraCard(tk.Frame):
                 status = f"{status} | camera ~{measured:.0f}fps"
                 if wanted >= 90 and measured < wanted * 0.85:
                     status += (
-                        f" (HDMI ~{measured:.0f}; set camera to 1080p120 for true 120"
-                        " — not a software drop)"
+                        f" (Station HDMI ~{measured:.0f} — set mirrorless HDMI to "
+                        f"1080p120 for true 120; file stamped ~{measured:.0f}, "
+                        "not a software drop)"
                     )
         self.status_label.configure(text=status)
         try:

@@ -63,8 +63,9 @@ def test_hud_separates_camera_and_preview_fps() -> None:
 
     lines = hud_lines_for_source(slot, Src())
     assert any("camera ~118" in line for line in lines)
-    assert any("preview redraw" in line for line in lines)
+    assert any("UI paint" in line and "not file FPS" in line for line in lines)
     assert not any("delivering" in line for line in lines)
+    assert not any("preview redraw" in line for line in lines)
 
 
 def test_hud_hdmi_not_120_message() -> None:
@@ -80,4 +81,5 @@ def test_hud_hdmi_not_120_message() -> None:
 
     lines = hud_lines_for_source(slot, Src())
     assert any("1080p120" in line for line in lines)
-    assert any("HDMI is ~58" in line for line in lines)
+    assert any("Station HDMI is ~58" in line for line in lines)
+    assert any("file stamped" in line for line in lines)

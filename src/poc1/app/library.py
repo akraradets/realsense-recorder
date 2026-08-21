@@ -202,8 +202,20 @@ class LibraryPage(tk.Frame):
         self.files = list_media_files(folder)
         self.listbox.delete(0, tk.END)
         for path in self.files:
-            self.listbox.insert(tk.END, path.name)
+            self.listbox.insert(tk.END, self._display_name(path))
         self.app.set_status(f"Library: {len(self.files)} file(s) in {folder}")
+
+    @staticmethod
+    def _display_name(path: Path) -> str:
+        """Clear Library labels so *_color is not mistaken for a playable video."""
+        path = Path(path)
+        if path.is_dir() and (
+            path.name.endswith("_color") or (path / "metadata.yaml").is_file()
+        ):
+            return f"{path.name}  [ROS2 bag — Export / Play sibling MP4]"
+        if path.suffix.lower() in {".db3", ".bag", ".bd3"}:
+            return f"{path.name}  [bag — Export / Play sibling MP4]"
+        return path.name
 
     def select_path(self, path: Path) -> None:
         path = Path(path)
@@ -249,18 +261,17 @@ class LibraryPage(tk.Frame):
                 if messagebox.askyesno(
                     "Playback",
                     f"{path.name} is an Elgato ROS2 color bag folder "
-                    "(not a video file).\n\n"
-                    f"A matching Record MP4 exists:\n{sibling.name}\n\n"
-                    "Play that original MP4 now?\n\n"
-                    "(Cancel = stay here. Use Export selected to decode the bag "
-                    "to a NEW mp4; Record MP4 is kept.)",
+                    "(m_*_color with .db3 + metadata.yaml — not a video).\n\n"
+                    f"Play the Record MP4 instead?\n{sibling.name}\n\n"
+                    "Yes = play MP4.  No = stay here.\n"
+                    "To decode the bag: select this folder → Export selected.",
                 ):
                     self._start_playback(sibling)
                 return
             if messagebox.askyesno(
                 "Playback",
-                f"{path.name} is a ROS2 bag folder and cannot play directly.\n\n"
-                "Export it to a NEW MP4 (decoded from the bag), then play?",
+                f"{path.name} is a ROS2 bag folder (not playable video).\n\n"
+                "Export it to a NEW MP4 now?",
             ):
                 self._run_export(path)
             return

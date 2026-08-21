@@ -21,7 +21,7 @@ logger = logging.getLogger("poc1.bag")
 _RECORD_SUFFIX: Optional[str] = ".db3"
 
 # Build stamp so operators can confirm they are not on a stale Phue copy.
-BUILD_ID = "sdk-record-v19-2026-08-20"
+BUILD_ID = "sdk-record-v20-2026-08-20"
 
 
 def can_record_bag(source: Any) -> bool:
