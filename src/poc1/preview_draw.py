@@ -51,9 +51,6 @@ def overlay_hud(rgb: np.ndarray, lines: list[str]) -> np.ndarray:
     for line in lines:
         text = str(line)[:80]
         cv2.putText(
-            img, text, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 3, cv2.LINE_AA
-        )
-        cv2.putText(
             img, text, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (40, 255, 90), 1, cv2.LINE_AA
         )
         y += 18
