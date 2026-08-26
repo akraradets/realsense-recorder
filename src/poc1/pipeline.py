@@ -206,17 +206,32 @@ class Pipeline:
         tag = str(getattr(self.source, "device_tag", "") or "")
         if tag not in {"elgato", "uvc"}:
             return
-        # Preview already owns VideoCapture. Reading it here while the capture
-        # thread is paused left Elgato at 0/0 after a working live preview.
+        # Prefer live camera-handler delivery rate over open-time sample / UI paint.
         rate = float(getattr(self.source, "actual_fps", 0) or 0)
+        try:
+            live = float(self.camera_handler.live_delivery_fps() or 0)
+            if live >= 5:
+                rate = max(rate, live)
+        except Exception:  # noqa: BLE001
+            pass
         hint = float(getattr(self, "_preview_fps_hint", 0) or 0)
-        if hint >= 5:
-            rate = max(rate, hint)
+        # Preview paint is capped (~15Hz) — only use it if we have no better signal.
+        if rate < 5 and hint >= 5:
+            rate = hint
         if rate < 5:
             return
         self.source.actual_fps = rate
         requested = int(getattr(self, "_requested_fps", self.source.target_fps) or 30)
-        if requested >= 90 and rate < requested * 0.85:
+        if requested >= 90 and rate >= requested * 0.85:
+            # Live path is truly high-rate — stamp the requested container FPS.
+            self.source.target_fps = requested
+            logger.info(
+                "%s Record stamp %dfps (live ~%.1f matches request)",
+                tag,
+                requested,
+                rate,
+            )
+        elif requested >= 90 and rate < requested * 0.85:
             stamped = int(round(rate / 5.0) * 5) or 60
             stamped = max(15, min(stamped, requested))
             logger.warning(

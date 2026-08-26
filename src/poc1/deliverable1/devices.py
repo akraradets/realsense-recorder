@@ -766,18 +766,31 @@ def list_stream_modes(camera: ConnectedCamera) -> list[StreamMode]:
 def elgato_open_profiles(
     wanted_w: int, wanted_h: int, wanted_fps: int, wanted_fmt: str = "mjpg"
 ) -> list[tuple[int, int, int, str]]:
-    """Ordered Elgato open attempts: user selection first, then HDMI fallbacks."""
+    """Ordered Elgato open attempts: user selection first, then HDMI fallbacks.
+
+    When the user asks for >=90fps, try every 120 profile before any 60 fallback
+    so a soft reject cannot silently lock the card at 1080p60 (OBS-style path).
+    """
     fmt = "mjpg" if (wanted_fmt or "mjpg").lower() != "mjpg" else "mjpg"
-    profiles = [
+    primary = [
         (wanted_w, wanted_h, wanted_fps, fmt),
         (wanted_w, wanted_h, wanted_fps, "mjpg"),
-        (1920, 1080, 60, "mjpg"),
+    ]
+    rate_120 = [
         (1920, 1080, 120, "mjpg"),
+        (1280, 720, 120, "mjpg"),
+    ]
+    rate_60 = [
+        (1920, 1080, 60, "mjpg"),
         (1920, 1080, 50, "mjpg"),
         (1280, 720, 60, "mjpg"),
-        (1280, 720, 120, "mjpg"),
         (1280, 720, 30, "mjpg"),
+        (1920, 1080, 30, "mjpg"),
     ]
+    if wanted_fps >= 90:
+        profiles = primary + rate_120 + rate_60
+    else:
+        profiles = primary + rate_60 + rate_120
     seen: set[tuple[int, int, int, str]] = set()
     out: list[tuple[int, int, int, str]] = []
     for prof in profiles:
@@ -805,30 +818,39 @@ def _looks_like_packed_yuyv(bgr: np.ndarray) -> bool:
 
 
 def _looks_like_solid_green(bgr: np.ndarray) -> bool:
-    """True when the buffer is almost only green (wrong FOURCC / 10-bit HDMI)."""
+    """True only for near-uniform green (wrong FOURCC / empty buffer).
+
+    Textured chroma-key / green-screen studios must NOT match — rejecting those
+    made OpenCV fall through from @120 to @60 while OBS (no green reject) held 120.
+    """
     if bgr is None or bgr.ndim != 3 or bgr.shape[2] != 3:
         return False
     sample = bgr[:: max(1, bgr.shape[0] // 24), :: max(1, bgr.shape[1] // 24)]
+    # Spatial variance per channel (not all-BGR std — flat [0,180,0] has high
+    # cross-channel std even when every pixel is identical).
+    spatial = float(
+        max(float(np.std(sample[:, :, c])) for c in range(3))
+    )
+    if spatial >= 12.0:
+        return False
     b = sample[:, :, 0].astype(np.float32)
     g = sample[:, :, 1].astype(np.float32)
     r = sample[:, :, 2].astype(np.float32)
-    # Slightly looser thresholds — Station B Elgato often showed full green
-    # with mean-G ~150–180 while R/B stayed low.
     return float(g.mean()) > 140.0 and float(b.mean()) < 70.0 and float(r.mean()) < 70.0
 
 
 def _frame_is_unusable_elgato(bgr: np.ndarray) -> bool:
-    """Reject solid green / near-empty buffers before accepting an Elgato profile."""
+    """Reject empty / flat wrong-format buffers — not real green-screen scenes."""
     if bgr is None or bgr.size == 0:
-        return True
-    if _looks_like_solid_green(bgr):
         return True
     mean = float(np.mean(bgr))
     if mean < 1.5:
         return True
-    # Nearly uniform green-dominant frame (low variance).
-    std = float(np.std(bgr))
-    if std < 8.0 and float(np.mean(bgr[:, :, 1])) > 120.0:
+    # Flat near-uniform green only (wrong FOURCC). Textured studio green is OK.
+    spatial = float(max(float(np.std(bgr[:, :, c])) for c in range(3)))
+    if spatial < 8.0 and float(np.mean(bgr[:, :, 1])) > 120.0:
+        return True
+    if _looks_like_solid_green(bgr):
         return True
     return False
 
@@ -1027,18 +1049,23 @@ class FormattedUvcSource(CvCaptureSource):
         pixel_format: str,
     ) -> Optional[np.ndarray]:
         # Order matters for Elgato/DirectShow: FOURCC first, then size, then FPS
-        # (repeated), then small buffer so we measure the real delivery rate.
+        # (repeated). High-rate needs a deeper driver buffer so dual-cam Record
+        # does not starve (OBS keeps a deeper capture queue; BUFFERSIZE=1 drops).
         _apply_uvc_fourcc(cap, pixel_format)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
         for _ in range(3):
             cap.set(cv2.CAP_PROP_FPS, float(fps))
+        buf = 8 if (getattr(self, "device_tag", "") == "elgato" and fps >= 90) else (
+            4 if fps >= 60 else 1
+        )
         try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, float(buf))
         except Exception:  # noqa: BLE001
             pass
         # Warm up: capture cards often emit a few empty/black frames first.
-        warm = 20 if getattr(self, "device_tag", "") == "elgato" else 4
+        is_elgato = getattr(self, "device_tag", "") == "elgato"
+        warm = 40 if (is_elgato and fps >= 90) else (20 if is_elgato else 4)
         frame = None
         for _ in range(warm):
             ok, candidate = cap.read()
@@ -1061,6 +1088,33 @@ class FormattedUvcSource(CvCaptureSource):
         if elapsed <= 0.05 or n < 2:
             return 0.0
         return (n - 1) / elapsed
+
+    def _elgato_measure_high_rate(
+        self, cap: cv2.VideoCapture, fps: int
+    ) -> float:
+        """Longer settle + optional second sample so DirectShow can reach 120."""
+        self._cap = cap
+        # Drain a short settle window after mode switch (OBS also warms up).
+        for _ in range(25):
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                self._pending_frame = np.ascontiguousarray(frame)
+        measured = self._measure_delivery_fps(1.0)
+        if measured >= fps * 0.85:
+            return measured
+        # Second poke: re-assert FPS and sample again (HDMI/driver may lag).
+        for _ in range(3):
+            try:
+                cap.set(cv2.CAP_PROP_FPS, float(fps))
+            except Exception:  # noqa: BLE001
+                break
+        time.sleep(0.2)
+        for _ in range(20):
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                self._pending_frame = np.ascontiguousarray(frame)
+        measured2 = self._measure_delivery_fps(1.0)
+        return max(measured, measured2)
 
     def start(self) -> None:
         with quiet_opencv():
@@ -1179,7 +1233,7 @@ class FormattedUvcSource(CvCaptureSource):
                     owned = np.ascontiguousarray(frame)
                     self._pending_frame = owned
                     if is_elgato and fps >= 90:
-                        measured = self._measure_delivery_fps(0.45)
+                        measured = self._elgato_measure_high_rate(cap, fps)
                     else:
                         measured = 0.0
                     reported = float(cap.get(cv2.CAP_PROP_FPS) or 0)
@@ -1188,15 +1242,19 @@ class FormattedUvcSource(CvCaptureSource):
                     )
                     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
                     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
+                    # Keep user-requested high-rate mode even when HDMI is still
+                    # settling low — do NOT fall through to @60 open (that made
+                    # green-screen studios look "stuck at 60" vs OBS @120).
                     chosen = (rate, w, h, fps, fmt, cap, owned)
                     logger.info(
-                        "UVC opened via target=%r backend=%s %dx%d@%d %s",
+                        "UVC opened via target=%r backend=%s %dx%d@%d %s (measured ~%.1f)",
                         target,
                         backend,
                         w,
                         h,
                         fps,
                         fmt,
+                        rate,
                     )
                     break
 

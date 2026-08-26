@@ -1005,16 +1005,24 @@ class UnifiedApp:
             if "error" in report:
                 continue
             if int(report.get("frames_read_by_camera") or 0) == 0:
-                no_capture.append(slot.prefix)
+                cam = slot.camera
+                label = getattr(cam, "name", None) or "unassigned"
+                no_capture.append(
+                    f"Camera {slot.slot_id + 1} · prefix={slot.prefix!r} · {label}"
+                )
         if no_capture:
+            from poc1.bag_recorder import BUILD_ID
+
             messagebox.showerror(
                 "No frames captured",
                 "Preview was live but Record counted 0 frames on:\n"
-                + ", ".join(no_capture)
-                + "\n\nThis is not a slow-PC / skipped-encode problem.\n"
-                "Close Intel RealSense Viewer and Elgato 4K Capture Utility, "
-                "confirm HDMI is on, then Start preview again and Record.\n"
-                "Title bar must show sdk-record-v10 (not v4).",
+                + "\n".join(f"• {line}" for line in no_capture)
+                + f"\n\nSave folder: {self.session.out_dir}\n\n"
+                "This is not a slow-PC / skipped-encode problem.\n"
+                "Fully quit OBS, Intel RealSense Viewer, and Elgato 4K Capture Utility "
+                "(they lock the device). Confirm HDMI is on, Start preview again, "
+                "then Record.\n"
+                f"Title bar must show {BUILD_ID}.",
             )
 
         mismatched = [

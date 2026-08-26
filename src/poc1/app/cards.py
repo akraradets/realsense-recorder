@@ -222,7 +222,12 @@ class CameraCard(tk.Frame):
             self.mode_var.set(slot.mode.label())
 
     def sync_opened_mode_from_source(self) -> None:
-        """After Elgato preview opens, align Setup dropdown with actual size/stamp FPS."""
+        """Sync Setup dropdown only if open fell back to a different resolution.
+
+        Keep the user-selected FPS in the combobox (HUD shows stamped/delivery).
+        Overwriting @120 → @60 after a short sample made operators think 120 was
+        unavailable even when OBS held 120 on the same card.
+        """
         slot = self.session.slots[self.slot_id]
         if slot.pipeline is None:
             return
@@ -231,9 +236,17 @@ class CameraCard(tk.Frame):
             return
         w = int(getattr(src, "width", 0) or 0)
         h = int(getattr(src, "height", 0) or 0)
-        fps = int(getattr(src, "target_fps", 0) or 0)
         fmt = str(getattr(src, "pixel_format", "mjpg") or "mjpg")
-        if w < 1 or h < 1 or fps < 1:
+        if w < 1 or h < 1:
+            return
+        req = int(getattr(src, "requested_fps", 0) or 0)
+        stamp = int(getattr(src, "target_fps", 0) or 0)
+        # Prefer showing what the operator selected for FPS.
+        fps = req if req > 0 else stamp
+        if fps < 1:
+            return
+        if slot.mode is not None and slot.mode.width == w and slot.mode.height == h:
+            # Same size — leave dropdown FPS as the user-selected mode.
             return
         opened = StreamMode(w, h, fps, fmt)
         if slot.mode == opened:

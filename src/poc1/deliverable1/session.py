@@ -382,9 +382,15 @@ class MultiCamSession:
             started: list[CameraSlot] = []
             try:
                 for s in armed:
-                    hint = s.estimate_preview_fps()
-                    if hint and s.pipeline is not None:
-                        s.pipeline._preview_fps_hint = float(hint)
+                    if s.pipeline is not None:
+                        try:
+                            live = float(
+                                s.pipeline.camera_handler.live_delivery_fps() or 0
+                            )
+                        except Exception:  # noqa: BLE001
+                            live = 0.0
+                        if live >= 5:
+                            s.pipeline._preview_fps_hint = live
                     mp4 = self.out_dir / f"{s.prefix}_{stamp}.mp4"
                     csv = meta_dir / f"{s.prefix}_{stamp}_sysmon.csv"
                     bag = None

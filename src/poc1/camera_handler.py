@@ -192,6 +192,9 @@ class CameraHandler:
         # Do not block capture on encode — that made live Record look slow-mo.
         # No-drop is a deep queue + drain on Stop (processor.stop).
         self._block_processor_puts = False
+        # Rolling capture timestamps so Elgato actual_fps tracks live HDMI rate
+        # (open-time sample alone can under-count while DirectShow settles).
+        self._delivery_ts: list[float] = []
 
     def start(self) -> None:
         self.source.start()
@@ -233,6 +236,16 @@ class CameraHandler:
     def is_recording(self) -> bool:
         return self._recording.is_set()
 
+    def live_delivery_fps(self) -> float:
+        """Recent source.read() rate (true capture, not UI paint)."""
+        stamps = list(self._delivery_ts)
+        if len(stamps) < 15:
+            return 0.0
+        elapsed = stamps[-1] - stamps[0]
+        if elapsed <= 0.1:
+            return 0.0
+        return (len(stamps) - 1) / elapsed
+
     def stop(self) -> None:
         with self._record_lock:
             self._recording.clear()
@@ -241,6 +254,19 @@ class CameraHandler:
         if self._thread:
             self._thread.join(timeout=5.0)
         self.source.stop()
+
+    def _note_delivery(self) -> None:
+        now = time.time()
+        self._delivery_ts.append(now)
+        if len(self._delivery_ts) > 180:
+            self._delivery_ts = self._delivery_ts[-180:]
+        live = self.live_delivery_fps()
+        if live < 5:
+            return
+        try:
+            self.source.actual_fps = live
+        except Exception:  # noqa: BLE001
+            pass
 
     def _loop(self) -> None:
         while self._running.is_set():
@@ -263,6 +289,8 @@ class CameraHandler:
                     break
                 time.sleep(0.001)
                 continue
+
+            self._note_delivery()
 
             # Own the buffer when the source reuses memory (OpenCV/RealSense).
             # FakeFrameSource already returns a unique copy — don't copy twice

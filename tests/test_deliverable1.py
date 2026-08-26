@@ -152,6 +152,35 @@ def test_elgato_open_profiles_prefer_user_selection():
     assert profiles.index((1280, 720, 120, "mjpg")) < profiles.index(
         (1920, 1080, 60, "mjpg")
     )
+    # High-rate request: every 120 profile before any 60 fallback.
+    assert profiles.index((1920, 1080, 120, "mjpg")) < profiles.index(
+        (1920, 1080, 60, "mjpg")
+    )
+
+
+def test_textured_green_screen_is_usable_elgato():
+    """Studio chroma-key must not be rejected (that forced @120 → @60 fallback)."""
+    import numpy as np
+
+    from poc1.deliverable1.devices import (
+        _frame_is_unusable_elgato,
+        _looks_like_solid_green,
+    )
+
+    # Textured green screen (folds / shadows) — high variance.
+    rng = np.random.default_rng(0)
+    textured = np.zeros((180, 320, 3), dtype=np.uint8)
+    textured[:, :, 1] = rng.integers(100, 220, size=(180, 320), dtype=np.uint8)
+    textured[:, :, 0] = rng.integers(0, 40, size=(180, 320), dtype=np.uint8)
+    textured[:, :, 2] = rng.integers(0, 40, size=(180, 320), dtype=np.uint8)
+    assert not _looks_like_solid_green(textured)
+    assert not _frame_is_unusable_elgato(textured)
+
+    # Flat wrong-format green — still rejected.
+    flat = np.zeros((180, 320, 3), dtype=np.uint8)
+    flat[:, :, 1] = 180
+    assert _looks_like_solid_green(flat)
+    assert _frame_is_unusable_elgato(flat)
 
 
 def test_library_display_name_marks_color_bag(tmp_path: Path):
