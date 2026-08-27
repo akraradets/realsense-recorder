@@ -122,10 +122,30 @@ def test_capture_releases_record_lock_before_processor_put() -> None:
         handler.stop()
 
 
-def test_build_id_v28() -> None:
+def test_build_id_v29() -> None:
     from poc1.bag_recorder import BUILD_ID
 
-    assert BUILD_ID.startswith("sdk-record-v28-")
+    assert BUILD_ID.startswith("sdk-record-v29-")
+
+
+def test_ffmpeg_dshow_cmd_obs_parity_pin() -> None:
+    from poc1.ffmpeg_dshow_source import build_ffmpeg_dshow_cmd, dshow_device_name
+
+    assert dshow_device_name("video=Elgato 4K X") == "Elgato 4K X"
+    cmd = build_ffmpeg_dshow_cmd(
+        "ffmpeg", "Elgato 4K X", 1920, 1080, 120, pixel_format="mjpeg"
+    )
+    assert cmd[0] == "ffmpeg"
+    assert "-f" in cmd and "dshow" in cmd
+    assert "-framerate" in cmd and "120" in cmd
+    assert "-video_size" in cmd and "1920x1080" in cmd
+    # Pin options must precede -i (OBS-like negotiation).
+    i_at = cmd.index("-i")
+    assert cmd.index("-framerate") < i_at
+    assert cmd.index("-video_size") < i_at
+    assert cmd[i_at + 1] == "video=Elgato 4K X"
+    assert cmd[-1] == "-"
+    assert "rawvideo" in cmd and "bgr24" in cmd
 
 
 def test_wait_recorded_frames_true_when_armed() -> None:
