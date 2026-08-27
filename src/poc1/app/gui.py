@@ -1000,29 +1000,36 @@ class UnifiedApp:
             )
 
         no_capture = []
-        for slot in self.session.slots:
-            report = reports.get(slot.prefix) or {}
+        # Only cameras that actually participated in THIS stop (reports keys).
+        # Empty `{}` for unarmed slots used to false-trigger "0 frames" on RealSense
+        # when only Elgato was armed.
+        for prefix, report in reports.items():
             if "error" in report:
                 continue
-            if int(report.get("frames_read_by_camera") or 0) == 0:
-                cam = slot.camera
-                label = getattr(cam, "name", None) or "unassigned"
-                no_capture.append(
-                    f"Camera {slot.slot_id + 1} · prefix={slot.prefix!r} · {label}"
-                )
+            if int(report.get("frames_read_by_camera") or 0) != 0:
+                continue
+            slot = next((s for s in self.session.slots if s.prefix == prefix), None)
+            if slot is None:
+                no_capture.append(f"prefix={prefix!r}")
+                continue
+            cam = slot.camera
+            label = getattr(cam, "name", None) or "unassigned"
+            no_capture.append(
+                f"Camera {slot.slot_id + 1} · prefix={slot.prefix!r} · {label}"
+            )
         if no_capture:
             from poc1.bag_recorder import BUILD_ID
 
             messagebox.showerror(
                 "No frames captured",
-                "Preview was live but the Record path counted 0 frames on:\n"
+                "Preview looked live but Record counted 0 frames on cameras that "
+                "were actually recording:\n"
                 + "\n".join(f"• {line}" for line in no_capture)
                 + f"\n\nSave folder: {self.session.out_dir}\n\n"
-                "This is a Record-path miss (not encode skipping frames).\n"
-                "1) Press Stop all previews, then Start preview again on that camera.\n"
-                "2) Wait until the HUD shows live video, then Record.\n"
-                "3) If it still fails: fully Exit OBS / Viewer / Elgato Utility "
-                "(only if they are running), Refresh cameras, retry.\n"
+                "This is a Record-path miss (capture stalled or queue lock).\n"
+                "1) Stop all previews → Start preview on that camera alone.\n"
+                "2) Wait for moving live video in the HUD, then Record.\n"
+                "3) Try with bag unchecked first. Exit OBS only if it is running.\n"
                 f"Build: {BUILD_ID}.",
             )
 

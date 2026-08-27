@@ -223,6 +223,7 @@ class CameraHandler:
             self.frames_to_recorder = 0
             self._seq = 0
             self.frames_read = 0
+            self._delivery_ts = []
             reset = getattr(self.source, "reset_sequence", None)
             if callable(reset):
                 reset()
@@ -295,23 +296,26 @@ class CameraHandler:
             else:
                 owned = np.array(frame, copy=True, order="C")
 
+            # Snapshot arming under the lock, then release BEFORE any queue put.
+            # Holding _record_lock across put_live (up to 2s) stalled Elgato reads
+            # → FPS collapse (~11) and "0 frames on Record" even with live preview.
             with self._record_lock:
-                # Arm check AFTER read. Requiring was_recording AND recording_now
-                # dropped every in-flight frame when Record clicked during a slow
-                # 1080p Elgato read → "Preview live but Record counted 0 frames".
                 recording_now = self._recording.is_set()
                 if recording_now:
                     seq = self._seq
                     self._seq += 1
                     self.frames_read += 1
                     self.frames_to_recorder += 1
-                    # Stamp camera seq so verifier matches drop accounting even if
-                    # the source's own overlay raced with reset_sequence().
                     embed_seq_barcode(owned, seq)
                     env = FrameEnvelope(seq=seq, capture_ts=time.time(), frame=owned)
-                    # Live preview is drop-oldest and must not wait on encode.
-                    self.viewer_queue.put(env)
-                    self.processor_queue.put_live(env)
                 else:
                     env = FrameEnvelope(seq=-1, capture_ts=time.time(), frame=owned)
-                    self.viewer_queue.put(env)
+
+            # Preview always; never block the capture thread on encode backlog.
+            self.viewer_queue.put(env)
+            if recording_now:
+                if self._block_processor_puts:
+                    self.processor_queue.put_live(env)
+                else:
+                    # Non-blocking: drop+count if full (better than stalling USB/DSHOW).
+                    self.processor_queue.put(env)

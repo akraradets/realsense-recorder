@@ -87,6 +87,47 @@ def test_put_live_blocks_near_full_instead_of_drop() -> None:
     assert q.dropped_count == 0
 
 
+def test_capture_releases_record_lock_before_processor_put() -> None:
+    """Regression: holding _record_lock across put stalled Elgato → 0 Record frames."""
+    import time
+
+    from poc1.camera_handler import CameraHandler
+    from poc1.frame_source import FakeFrameSource
+
+    source = FakeFrameSource(width=64, height=48, target_fps=60)
+    handler = CameraHandler(source)
+
+    lock_free_during_put: list[bool] = []
+    orig_put = handler.processor_queue.put
+
+    def checking_put(item):
+        acquired = handler._record_lock.acquire(blocking=False)
+        lock_free_during_put.append(bool(acquired))
+        if acquired:
+            handler._record_lock.release()
+        return orig_put(item)
+
+    handler.processor_queue.put = checking_put  # type: ignore[method-assign]
+    handler.start()
+    try:
+        handler.enable_recording()
+        deadline = time.time() + 2.0
+        while time.time() < deadline and handler.frames_read < 5:
+            time.sleep(0.02)
+        assert handler.frames_read >= 5, handler.frames_read
+        assert lock_free_during_put, "processor.put never called"
+        assert all(lock_free_during_put), lock_free_during_put
+    finally:
+        handler.disable_recording()
+        handler.stop()
+
+
+def test_build_id_v26() -> None:
+    from poc1.bag_recorder import BUILD_ID
+
+    assert BUILD_ID.startswith("sdk-record-v26-")
+
+
 def test_uvc_ros2_bag_writes_jpeg_frames(tmp_path) -> None:
     import time
 

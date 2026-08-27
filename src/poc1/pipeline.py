@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -188,19 +189,37 @@ class Pipeline:
         )
         self.monitor = SystemMonitor(output_csv=monitor_csv)
 
-        # Arm capture BEFORE starting encode workers so Elgato frames during
-        # worker startup are counted (fixes 0-frame Record with live preview).
-        self.camera_handler.enable_recording()
+        # Start encode workers FIRST so the processor queue is drained, then arm
+        # capture. Arming before workers filled the queue and put_live blocked
+        # the Elgato read loop (0 frames / FPS collapse).
         self.processor.start()
         self.recorder.start()
         self.monitor.start()
+        self.camera_handler.enable_recording()
+
+        # Confirm the capture thread is feeding Record (Elgato-only still failed
+        # when preview was stale and reads stalled).
+        deadline = time.time() + 2.5
+        while time.time() < deadline:
+            if int(self.camera_handler.frames_read) > 0:
+                break
+            time.sleep(0.05)
+        if int(self.camera_handler.frames_read) <= 0:
+            logger.warning(
+                "Record armed but frames_read still 0 after %.1fs (tag=%s) — "
+                "capture may be stalled; continuing so Stop can report honestly",
+                2.5,
+                getattr(self.source, "device_tag", ""),
+            )
+
         logger.info(
-            "Recording started -> %s (compression=%s bag=%s fps=%s requested=%s)",
+            "Recording started -> %s (compression=%s bag=%s fps=%s requested=%s read=%d)",
             output_path,
             self.processor.codec_label,
             bool(self._bag_path),
             self.source.target_fps,
             getattr(self, "_requested_fps", self.source.target_fps),
+            int(self.camera_handler.frames_read),
         )
 
     def _align_capture_fps(self) -> None:
