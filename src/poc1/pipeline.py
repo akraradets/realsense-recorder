@@ -203,6 +203,8 @@ class Pipeline:
 
     def _align_capture_fps(self) -> None:
         """Stamp MP4 at the real delivery rate. Never steal the live UVC handle."""
+        from poc1.deliverable1.devices import honest_container_fps
+
         tag = str(getattr(self.source, "device_tag", "") or "")
         if tag not in {"elgato", "uvc"}:
             return
@@ -222,31 +224,24 @@ class Pipeline:
             return
         self.source.actual_fps = rate
         requested = int(getattr(self, "_requested_fps", self.source.target_fps) or 30)
-        if requested >= 90 and rate >= requested * 0.85:
-            # Live path is truly high-rate — stamp the requested container FPS.
-            self.source.target_fps = requested
-            logger.info(
-                "%s Record stamp %dfps (live ~%.1f matches request)",
-                tag,
-                requested,
-                rate,
-            )
-        elif requested >= 90 and rate < requested * 0.85:
-            stamped = int(round(rate / 5.0) * 5) or 60
-            stamped = max(15, min(stamped, requested))
+        stamped = honest_container_fps(rate, requested)
+        if stamped != int(self.source.target_fps):
             logger.warning(
                 "%s Record stamp %dfps → %dfps (measured ~%.1f). "
-                "Set HDMI source to 1080p120 for true 120.",
+                "Quit OBS; set HDMI to 1080p120 for true 120.",
                 tag,
                 requested,
                 stamped,
                 rate,
             )
-            self.source.target_fps = stamped
-        elif abs(rate - float(self.source.target_fps)) / max(self.source.target_fps, 1) > 0.12:
-            stamped = max(15, int(round(rate)))
-            self.source.target_fps = stamped
-            logger.info("%s stamp adjusted to measured ~%dfps", tag, stamped)
+        else:
+            logger.info(
+                "%s Record stamp %dfps (live ~%.1f)",
+                tag,
+                stamped,
+                rate,
+            )
+        self.source.target_fps = stamped
 
     def _align_elgato_fps(self) -> None:
         self._align_capture_fps()

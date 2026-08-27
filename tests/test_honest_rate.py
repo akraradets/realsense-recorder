@@ -38,6 +38,35 @@ def test_one_elgato_120_plus_30_companions_allowed() -> None:
     )
 
 
+def test_honest_container_fps_never_55_from_near_60() -> None:
+    from poc1.deliverable1.devices import honest_container_fps
+
+    # Station A/B regression: short window ~55–57 with request 120 must stamp 60.
+    assert honest_container_fps(55.0, 120) == 60
+    assert honest_container_fps(56.5, 120) == 60
+    assert honest_container_fps(59.995, 120) == 60
+    assert honest_container_fps(62.0, 120) == 60
+    # Never invent 120 from ~60 HDMI.
+    assert honest_container_fps(60.0, 120) == 60
+    assert honest_container_fps(70.0, 120) != 120
+    # Real OBS-like 120 lock.
+    assert honest_container_fps(118.0, 120) == 120
+    assert honest_container_fps(120.0, 120) == 120
+    assert honest_container_fps(30.1, 30) == 30
+
+
+def test_elgato_open_targets_dshow_only_skips_msmf() -> None:
+    import cv2
+
+    from poc1.deliverable1.devices import _elgato_open_targets
+
+    targets = _elgato_open_targets(None, 0, dshow_only=True)
+    assert targets
+    assert all(backend == cv2.CAP_DSHOW for _, backend in targets)
+    full = _elgato_open_targets(None, 0, dshow_only=False)
+    assert any(backend == cv2.CAP_MSMF for _, backend in full)
+
+
 def test_prefix_elgato_m_realsense_r() -> None:
     rs = ConnectedCamera("rs", "realsense", "D435", serial="1")
     elgato = ConnectedCamera("e", "uvc", "Elgato", device_tag="elgato")

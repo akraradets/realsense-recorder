@@ -128,10 +128,19 @@ class Recorder:
         # Always detect mismatch (webcam, Elgato, RealSense). Whether we auto-remux
         # is decided by the GUI / allow_fps_remux — but players will play too fast
         # if we never flag it.
-        if abs(measured - self.fps) / max(self.fps, 1) < 0.10:
+        # Absolute floor catches 55-vs-60 (relative was ~9% and previously skipped).
+        rel = abs(measured - self.fps) / max(self.fps, 1)
+        if rel < 0.08 and abs(measured - self.fps) < 3.5:
             return
 
         suggested = max(1.0, round(measured, 3))
+        # Snap suggested to honest bands for remux (same rules as stamp).
+        try:
+            from poc1.deliverable1.devices import honest_container_fps
+
+            suggested = float(honest_container_fps(measured, int(round(self.fps))))
+        except Exception:  # noqa: BLE001
+            pass
         self.fps_mismatch = True
         self.suggested_fps = suggested
         logger.info(

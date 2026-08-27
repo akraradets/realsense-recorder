@@ -219,8 +219,9 @@ def test_elgato_modes_are_mjpg_only_with_1080p_defaults():
     )
     modes = list_uvc_modes(cam)
     assert modes
-    assert modes[0] == StreamMode(1920, 1080, 60, "mjpg")
-    assert any(m == StreamMode(1920, 1080, 120, "mjpg") for m in modes)
+    # Prefer OBS-equivalent 1080p120 first so stations default to real high-rate.
+    assert modes[0] == StreamMode(1920, 1080, 120, "mjpg")
+    assert any(m == StreamMode(1920, 1080, 60, "mjpg") for m in modes)
     assert all(m.pixel_format == "mjpg" for m in modes)
 
 

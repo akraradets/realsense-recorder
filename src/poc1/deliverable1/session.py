@@ -281,23 +281,48 @@ class MultiCamSession:
         slot.status = "idle"
 
     def start_previews(self) -> None:
-        """R3 — start preview on every assigned slot (RealSense first, then Elgato)."""
+        """R3 — start preview on every assigned slot.
+
+        When any Elgato is @≥90, open Elgato first (exclusive DirectShow pin like
+        OBS) then RealSense. Otherwise RealSense-first (USB settle for Station A).
+        """
         errors: list[str] = []
+        want_elgato_first = any(
+            s.camera is not None
+            and s.camera.device_tag == "elgato"
+            and s.mode is not None
+            and int(s.mode.fps) >= 90
+            for s in self.slots
+        )
+
+        def _order(slot: CameraSlot) -> tuple:
+            cam = slot.camera
+            if cam is None:
+                return (9, slot.slot_id)
+            if want_elgato_first:
+                if cam.device_tag == "elgato":
+                    return (0, slot.slot_id)
+                if cam.kind == "realsense":
+                    return (1, slot.slot_id)
+                return (2, slot.slot_id)
+            if cam.kind == "realsense":
+                return (0, slot.slot_id)
+            if cam.device_tag == "elgato":
+                return (1, slot.slot_id)
+            return (2, slot.slot_id)
+
         ordered = sorted(
             [s for s in self.slots if s.camera is not None],
-            key=lambda s: (
-                0
-                if s.camera and s.camera.kind == "realsense"
-                else (1 if s.camera and s.camera.device_tag == "elgato" else 2),
-                s.slot_id,
-            ),
+            key=_order,
         )
         for slot in ordered:
             try:
                 self.start_slot_preview(slot.slot_id)
-                # Brief pause after RealSense so USB / exclusive access settles
-                # before Elgato open (Station A race).
-                if slot.camera and slot.camera.kind == "realsense":
+                # Brief pause so USB / exclusive access settles before the next open.
+                if slot.camera and (
+                    slot.camera.kind == "realsense"
+                    or (want_elgato_first and slot.camera.device_tag == "elgato")
+                ):
                     time.sleep(0.35)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"slot{slot.slot_id}: {exc}")

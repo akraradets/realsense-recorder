@@ -124,6 +124,40 @@ def too_many_1080p120(modes: list[Optional[StreamMode]]) -> bool:
     return sum(1 for m in modes if is_fhd_high_rate(m)) >= 2
 
 
+def honest_container_fps(rate: float, requested: int) -> int:
+    """Map measured delivery rate to an honest MP4 container FPS.
+
+    Never invent 120 from ~60 HDMI. Snap common bands so a short under-count
+    (e.g. 55–57 when the take averages ~60) does not stamp the file as 55.
+    """
+    req = int(requested) if int(requested or 0) > 0 else 30
+    r = float(rate or 0.0)
+    if r < 5.0:
+        return 30 if req >= 90 else max(15, min(req, 60))
+
+    # True high-rate match (OBS-like 120 locked).
+    if req >= 90 and r >= req * 0.85:
+        return req
+    if 100.0 <= r <= 130.0:
+        return 120 if req >= 90 else min(req, 120)
+
+    # HDMI / NTSC ~60 — includes short-window undercounts that used to become 55.
+    if 48.0 <= r <= 63.0:
+        return 60
+
+    if 28.0 <= r < 48.0:
+        return 30
+
+    if 20.0 <= r < 28.0:
+        return 24
+
+    stamped = int(round(r / 5.0) * 5) or 30
+    stamped = max(15, stamped)
+    if req >= 90:
+        return min(stamped, req)
+    return stamped
+
+
 def prefix_for_camera(camera: ConnectedCamera) -> str:
     """SL naming: Elgato/mirrorless = m, RealSense = r."""
     if camera.kind == "realsense":
@@ -694,14 +728,15 @@ def list_uvc_modes(camera: ConnectedCamera) -> list[StreamMode]:
     """R2 — preset + lightly probed modes for a UVC device."""
     # Capture cards (Elgato) usually need MJPG for high-res; webcams vary.
     if camera.device_tag == "elgato":
-        # Common HDMI first (60), then 120 when the mirrorless HDMI is 1080p120.
+        # Prefer OBS-equivalent 1080p120 MJPG first so stations default to the
+        # mode that hardware already proves in OBS (not silent 1080p60).
         preferred = [
-            StreamMode(1920, 1080, 60, "mjpg"),
             StreamMode(1920, 1080, 120, "mjpg"),
+            StreamMode(1920, 1080, 60, "mjpg"),
+            StreamMode(1280, 720, 120, "mjpg"),
             StreamMode(1920, 1080, 50, "mjpg"),
             StreamMode(1920, 1080, 30, "mjpg"),
             StreamMode(1280, 720, 60, "mjpg"),
-            StreamMode(1280, 720, 120, "mjpg"),
             StreamMode(1280, 720, 30, "mjpg"),
             StreamMode(1920, 1080, 25, "mjpg"),
             StreamMode(640, 480, 30, "mjpg"),
@@ -884,12 +919,13 @@ def _elgato_open_targets(
     device_index: int,
     *,
     max_index: int = 8,
+    dshow_only: bool = False,
 ) -> list[tuple[Any, int]]:
     """
     Ordered OpenCV open attempts for Elgato 4K X / HD60.
 
-    Prefer ffmpeg DirectShow names, then scan indices (PnP index is unreliable),
-    then MSMF by name/index, then CAP_ANY.
+    Prefer ffmpeg DirectShow names, then scan indices (PnP index is unreliable).
+    For high-rate lock passes, use dshow_only=True (MSMF often caps Elgato at 60).
     """
     targets: list[tuple[Any, int]] = []
     name_paths = list(elgato_open_name_paths())
@@ -906,6 +942,9 @@ def _elgato_open_targets(
         indices.insert(0, device_index)
     for idx in indices:
         targets.append((idx, cv2.CAP_DSHOW))
+
+    if dshow_only:
+        return targets
 
     # 3) MSMF last-resort for Elgato 4K X when DSHOW fails on Station A.
     for path in name_paths:
@@ -938,14 +977,14 @@ def _uvc_open_failure_message(
         if opened_once:
             return (
                 f"Elgato opened but delivered no frames{detail}."
-                " HDMI source ON (1080p60/120), close Elgato 4K Capture Utility / OBS,"
-                " then Start preview again."
+                " Fully quit OBS (not minimize), Elgato 4K Capture Utility, and"
+                " RealSense Viewer. HDMI ON at 1080p120 for true 120, then Start preview."
                 + ff_hint
             )
         return (
             f"Could not open Elgato capture card{detail}."
-            " Close Elgato 4K Capture Utility, OBS, Zoom, Teams, and Windows Camera."
-            " Confirm HDMI is on, click Refresh, then Start preview on Camera 2 alone."
+            " Fully quit OBS, Elgato 4K Capture Utility, Zoom, Teams, and Windows Camera."
+            " Confirm HDMI is on, click Refresh, then Start preview on the Elgato card alone."
             + ff_hint
         )
     if opened_once:
@@ -1048,30 +1087,116 @@ class FormattedUvcSource(CvCaptureSource):
         fps: int,
         pixel_format: str,
     ) -> Optional[np.ndarray]:
-        # Order matters for Elgato/DirectShow: FOURCC first, then size, then FPS
-        # (repeated). High-rate needs a deeper driver buffer so dual-cam Record
-        # does not starve (OBS keeps a deeper capture queue; BUFFERSIZE=1 drops).
-        _apply_uvc_fourcc(cap, pixel_format)
+        # OBS-like DirectShow order for Elgato: MJPG → size → FPS (repeated).
+        # High-rate needs a deeper driver buffer so dual-cam Record does not starve.
+        is_elgato = getattr(self, "device_tag", "") == "elgato"
+        if is_elgato and fps >= 90:
+            return self._elgato_configure_obs_pin(cap, width, height, fps)
+        fmt = pixel_format
+        _apply_uvc_fourcc(cap, fmt)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+        _apply_uvc_fourcc(cap, fmt)
         for _ in range(3):
             cap.set(cv2.CAP_PROP_FPS, float(fps))
-        buf = 8 if (getattr(self, "device_tag", "") == "elgato" and fps >= 90) else (
-            4 if fps >= 60 else 1
-        )
+        buf = 4 if fps >= 60 else 1
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, float(buf))
         except Exception:  # noqa: BLE001
             pass
-        # Warm up: capture cards often emit a few empty/black frames first.
-        is_elgato = getattr(self, "device_tag", "") == "elgato"
-        warm = 40 if (is_elgato and fps >= 90) else (20 if is_elgato else 4)
+        warm = 20 if is_elgato else 4
         frame = None
         for _ in range(warm):
             ok, candidate = cap.read()
             if ok and candidate is not None:
                 frame = candidate
         return frame
+
+    def _elgato_configure_obs_pin(
+        self,
+        cap: cv2.VideoCapture,
+        width: int,
+        height: int,
+        fps: int,
+    ) -> Optional[np.ndarray]:
+        """Force OBS-equivalent Custom WxH @ fps MJPEG pin (multiple property orders)."""
+        mjpg = cv2.VideoWriter_fourcc(*"MJPG")
+        sequences: list[list[tuple[str, float | int]]] = [
+            # Closest to OBS: format → size → fps, then re-assert.
+            [
+                ("fourcc", mjpg),
+                ("w", width),
+                ("h", height),
+                ("fps", fps),
+                ("fourcc", mjpg),
+                ("fps", fps),
+                ("fps", fps),
+            ],
+            [
+                ("w", width),
+                ("h", height),
+                ("fourcc", mjpg),
+                ("fps", fps),
+                ("fps", fps),
+            ],
+            [
+                ("fps", fps),
+                ("w", width),
+                ("h", height),
+                ("fourcc", mjpg),
+                ("fps", fps),
+            ],
+        ]
+        best: Optional[np.ndarray] = None
+        for seq_i, seq in enumerate(sequences):
+            for key, val in seq:
+                try:
+                    if key == "fourcc":
+                        cap.set(cv2.CAP_PROP_FOURCC, float(int(val)))
+                    elif key == "w":
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(val))
+                    elif key == "h":
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(val))
+                    elif key == "fps":
+                        cap.set(cv2.CAP_PROP_FPS, float(val))
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 8.0)
+            except Exception:  # noqa: BLE001
+                pass
+            frame = None
+            for _ in range(50):
+                ok, candidate = cap.read()
+                if ok and candidate is not None:
+                    frame = candidate
+            if frame is None:
+                continue
+            best = frame
+            got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            got_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+            logger.info(
+                "Elgato OBS-pin try#%d asked %dx%d@%d → driver %dx%d@%.1f",
+                seq_i + 1,
+                width,
+                height,
+                fps,
+                got_w,
+                got_h,
+                got_fps,
+            )
+            # Driver advertises high-rate (or 0/unknown) at the right size → use it.
+            size_ok = got_w >= int(width * 0.9) and got_h >= int(height * 0.9)
+            fps_ok = got_fps <= 0.5 or got_fps >= fps * 0.85
+            if size_ok and fps_ok:
+                return frame
+            # Driver still stuck at ~60 — try next property order before measuring.
+            if got_fps > 0 and got_fps < fps * 0.85:
+                continue
+            if size_ok:
+                return frame
+        return best
 
     def _measure_delivery_fps(self, seconds: float = 0.7) -> float:
         """Count frames for a short window to learn the real HDMI/driver rate."""
@@ -1092,28 +1217,25 @@ class FormattedUvcSource(CvCaptureSource):
     def _elgato_measure_high_rate(
         self, cap: cv2.VideoCapture, fps: int
     ) -> float:
-        """Longer settle + optional second sample so DirectShow can reach 120."""
+        """Longer settle + retries so DirectShow can lock 120 like OBS."""
         self._cap = cap
-        # Drain a short settle window after mode switch (OBS also warms up).
-        for _ in range(25):
+        for _ in range(40):
             ok, frame = cap.read()
             if ok and frame is not None:
                 self._pending_frame = np.ascontiguousarray(frame)
-        measured = self._measure_delivery_fps(1.0)
+        measured = self._measure_delivery_fps(1.5)
         if measured >= fps * 0.85:
             return measured
-        # Second poke: re-assert FPS and sample again (HDMI/driver may lag).
-        for _ in range(3):
-            try:
-                cap.set(cv2.CAP_PROP_FPS, float(fps))
-            except Exception:  # noqa: BLE001
-                break
-        time.sleep(0.2)
-        for _ in range(20):
+        # Re-apply OBS pin and sample again.
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or self.width or 1920)
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or self.height or 1080)
+        self._elgato_configure_obs_pin(cap, w, h, fps)
+        time.sleep(0.3)
+        for _ in range(40):
             ok, frame = cap.read()
             if ok and frame is not None:
                 self._pending_frame = np.ascontiguousarray(frame)
-        measured2 = self._measure_delivery_fps(1.0)
+        measured2 = self._measure_delivery_fps(1.5)
         return max(measured, measured2)
 
     def start(self) -> None:
@@ -1159,11 +1281,30 @@ class FormattedUvcSource(CvCaptureSource):
             chosen: Optional[
                 tuple[float, int, int, int, str, cv2.VideoCapture, np.ndarray]
             ] = None
+            best_effort: Optional[
+                tuple[float, int, int, int, str, cv2.VideoCapture, np.ndarray]
+            ] = None
+            want_high = is_elgato and wanted_fps >= 90
+            high_only = (
+                [p for p in unique_profiles if p[2] >= 90] if want_high else unique_profiles
+            )
+            if want_high and not high_only:
+                high_only = [(1920, 1080, 120, "mjpg"), (1280, 720, 120, "mjpg")]
 
             if is_elgato:
-                open_targets = _elgato_open_targets(
-                    self.open_path, int(self.device_index or 0)
-                )
+                # High-rate: DSHOW-only first (MSMF often caps Elgato at 60). Two
+                # passes so we reopen after OBS-style pin retries fail.
+                if want_high:
+                    open_targets = _elgato_open_targets(
+                        self.open_path,
+                        int(self.device_index or 0),
+                        dshow_only=True,
+                    )
+                    open_targets = open_targets + open_targets  # second exclusive pass
+                else:
+                    open_targets = _elgato_open_targets(
+                        self.open_path, int(self.device_index or 0)
+                    )
                 open_timeout = 6.0
             else:
                 open_targets = []
@@ -1177,12 +1318,18 @@ class FormattedUvcSource(CvCaptureSource):
                     open_targets.append((self.device_index, cv2.CAP_MSMF))
                 open_timeout = 3.0
 
+            profile_list = high_only if want_high else unique_profiles
             seen_open: set[tuple[str, int]] = set()
             for target, backend in open_targets:
                 ok_key = (str(target), int(backend))
-                if ok_key in seen_open:
+                # Allow a second DSHOW pass for high-rate by tagging pass index.
+                pass_key = ok_key
+                if want_high and pass_key in seen_open:
+                    # Second identical target: reopen for exclusive pin after OBS.
+                    pass
+                elif pass_key in seen_open:
                     continue
-                seen_open.add(ok_key)
+                seen_open.add(pass_key)
                 try:
                     cap = _open_uvc_timeout(target, backend, timeout_s=open_timeout)
                 except Exception as exc:  # noqa: BLE001
@@ -1192,7 +1339,8 @@ class FormattedUvcSource(CvCaptureSource):
 
                 opened_once = True
                 got_any = False
-                for width, height, fps, fmt in unique_profiles:
+                accepted_here = False
+                for width, height, fps, fmt in profile_list:
                     try:
                         frame = self._configure_and_grab(cap, width, height, fps, fmt)
                     except Exception as exc:  # noqa: BLE001
@@ -1242,10 +1390,7 @@ class FormattedUvcSource(CvCaptureSource):
                     )
                     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
                     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
-                    # Keep user-requested high-rate mode even when HDMI is still
-                    # settling low — do NOT fall through to @60 open (that made
-                    # green-screen studios look "stuck at 60" vs OBS @120).
-                    chosen = (rate, w, h, fps, fmt, cap, owned)
+                    candidate = (rate, w, h, fps, fmt, cap, owned)
                     logger.info(
                         "UVC opened via target=%r backend=%s %dx%d@%d %s (measured ~%.1f)",
                         target,
@@ -1256,16 +1401,120 @@ class FormattedUvcSource(CvCaptureSource):
                         fmt,
                         rate,
                     )
+                    # Real 120 lock (OBS-equivalent): accept immediately.
+                    if fps >= 90 and rate >= fps * 0.85:
+                        chosen = candidate
+                        accepted_here = True
+                        logger.info(
+                            "Elgato 120 LOCKED like OBS (~%.1ffps) via %r",
+                            rate,
+                            target,
+                        )
+                        break
+                    # Soft ~60 while asking 120: keep searching; remember best effort.
+                    if want_high and fps >= 90 and rate < fps * 0.85:
+                        if best_effort is None or rate > best_effort[0]:
+                            if (
+                                best_effort is not None
+                                and best_effort[5] is not cap
+                            ):
+                                try:
+                                    best_effort[5].release()
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            best_effort = candidate
+                        logger.warning(
+                            "Elgato asked @%d but delivery ~%.1f — not accepting yet; "
+                            "retrying OBS-style pin / next target (quit OBS if open)",
+                            fps,
+                            rate,
+                        )
+                        continue
+                    chosen = candidate
+                    accepted_here = True
                     break
 
                 if chosen is not None:
                     break
-                try:
-                    cap.release()
-                except Exception:  # noqa: BLE001
-                    pass
+                keep_best = best_effort is not None and best_effort[5] is cap
+                if not accepted_here and not keep_best:
+                    try:
+                        cap.release()
+                    except Exception:  # noqa: BLE001
+                        pass
                 if not got_any:
                     last_exc = last_exc or RuntimeError("no frames after open")
+
+            # Fallbacks when 120 never locked: try remaining profiles, then best effort.
+            if chosen is None and want_high:
+                logger.warning(
+                    "Elgato could not lock ~%dfps after OBS-style DSHOW retries. "
+                    "Fully quit OBS, then Start preview again. Using best effort.",
+                    wanted_fps,
+                )
+                if best_effort is not None:
+                    chosen = best_effort
+                else:
+                    # Last resort: full target list including MSMF + 60 profiles.
+                    open_targets = _elgato_open_targets(
+                        self.open_path, int(self.device_index or 0)
+                    )
+                    seen_open = set()
+                    for target, backend in open_targets:
+                        ok_key = (str(target), int(backend))
+                        if ok_key in seen_open:
+                            continue
+                        seen_open.add(ok_key)
+                        try:
+                            cap = _open_uvc_timeout(
+                                target, backend, timeout_s=open_timeout
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            last_exc = (
+                                exc
+                                if isinstance(exc, Exception)
+                                else Exception(str(exc))
+                            )
+                            continue
+                        opened_once = True
+                        for width, height, fps, fmt in unique_profiles:
+                            try:
+                                frame = self._configure_and_grab(
+                                    cap, width, height, fps, fmt
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                last_exc = exc
+                                continue
+                            if frame is None:
+                                continue
+                            if is_elgato and _frame_is_unusable_elgato(frame):
+                                continue
+                            owned = np.ascontiguousarray(frame)
+                            self._cap = cap
+                            self._backend = backend
+                            if isinstance(target, str) and target.startswith("video="):
+                                self.open_path = target
+                            measured = (
+                                self._elgato_measure_high_rate(cap, fps)
+                                if fps >= 90
+                                else 0.0
+                            )
+                            reported = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+                            rate = (
+                                measured
+                                if measured > 1
+                                else (reported if reported > 0 else float(fps))
+                            )
+                            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
+                            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
+                            chosen = (rate, w, h, fps, fmt, cap, owned)
+                            break
+                        if chosen is not None:
+                            break
+                        try:
+                            cap.release()
+                        except Exception:  # noqa: BLE001
+                            pass
 
             if chosen is None:
                 raise RuntimeError(
@@ -1286,20 +1535,33 @@ class FormattedUvcSource(CvCaptureSource):
             self.actual_height = h
             self._pending_frame = frame
 
-            if is_elgato and req_fps >= 90 and rate < req_fps * 0.85:
-                stamped = int(round(rate / 5.0) * 5) or 60
-                stamped = max(15, min(stamped, req_fps))
-                logger.warning(
-                    "Elgato requested %dfps but measured ~%.1ffps — stamping @%dfps. "
-                    "The capture card only outputs what the HDMI source sends; set "
-                    "the console/PC to 1080p120 for true 120.",
-                    req_fps,
-                    rate,
-                    stamped,
-                )
+            if is_elgato and (req_fps >= 90 or want_high):
+                stamp_req = wanted_fps if want_high else req_fps
+                stamped = honest_container_fps(rate, stamp_req)
+                if stamped < stamp_req * 0.85:
+                    logger.warning(
+                        "Elgato requested %dfps but measured ~%.1ffps — stamping @%dfps. "
+                        "Fully quit OBS (Exit), pick 1920x1080@120 mjpg, HDMI 1080p120. "
+                        "Hardware can do 120 in OBS; this process must own the pin alone.",
+                        stamp_req,
+                        rate,
+                        stamped,
+                    )
+                else:
+                    logger.info(
+                        "Elgato high-rate locked: requested %d measured ~%.1f → stamp %d",
+                        stamp_req,
+                        rate,
+                        stamped,
+                    )
                 self.target_fps = stamped
+                self.requested_fps = stamp_req
             else:
-                self.target_fps = req_fps if req_fps > 0 else 30
+                self.target_fps = (
+                    honest_container_fps(rate, req_fps)
+                    if is_elgato and rate > 5
+                    else (req_fps if req_fps > 0 else 30)
+                )
 
         mean = float(np.mean(self._pending_frame)) if self._pending_frame is not None else 0.0
         if mean < 2.0:
