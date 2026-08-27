@@ -140,15 +140,14 @@ class Pipeline:
         self.camera_handler.processor_queue.clear()
         self.processor.out_queue.clear()
 
+        tag = str(getattr(self.source, "device_tag", "") or "")
+        # Defer Elgato ROS2 bag until Record frames are flowing. Starting the
+        # bag writer before arm raced DirectShow and left frames_read==0 while
+        # the HUD still showed a stale ~59 from preview.
+        pending_uvc_bag: Optional[Path] = None
         if bag_path is not None:
-            tag = str(getattr(self.source, "device_tag", "") or "")
             if tag == "elgato":
-                from poc1.uvc_rosbag import UvcRos2Bag
-
-                self._uvc_bag = UvcRos2Bag(Path(bag_path))
-                self._uvc_bag.start()
-                self._bag_path = Path(bag_path)
-                self.processor.sidecar_bag = self._uvc_bag
+                pending_uvc_bag = Path(bag_path)
             else:
                 self.camera_handler.pause_reads()
                 try:
@@ -175,7 +174,7 @@ class Pipeline:
         )
         # Remux safety net for devices that still drift after stamping.
         allow_remux = bool(getattr(self.source, "allow_fps_remux", True))
-        if getattr(self.source, "device_tag", "") == "elgato":
+        if tag == "elgato":
             allow_remux = True
         self.recorder = Recorder(
             out_queue=self.processor.out_queue,
@@ -189,28 +188,87 @@ class Pipeline:
         )
         self.monitor = SystemMonitor(output_csv=monitor_csv)
 
-        # Start encode workers FIRST so the processor queue is drained, then arm
-        # capture. Arming before workers filled the queue and put_live blocked
-        # the Elgato read loop (0 frames / FPS collapse).
+        # Workers first (queue must drain), then arm. Puts are non-blocking so
+        # arming cannot stall the Elgato read loop.
         self.processor.start()
         self.recorder.start()
         self.monitor.start()
         self.camera_handler.enable_recording()
 
-        # Confirm the capture thread is feeding Record (Elgato-only still failed
-        # when preview was stale and reads stalled).
-        deadline = time.time() + 2.5
-        while time.time() < deadline:
-            if int(self.camera_handler.frames_read) > 0:
-                break
-            time.sleep(0.05)
-        if int(self.camera_handler.frames_read) <= 0:
+        if not self.camera_handler.wait_recorded_frames(2.0):
             logger.warning(
-                "Record armed but frames_read still 0 after %.1fs (tag=%s) — "
-                "capture may be stalled; continuing so Stop can report honestly",
-                2.5,
-                getattr(self.source, "device_tag", ""),
+                "Record armed but frames_read=0 (tag=%s) — recovering capture",
+                tag,
             )
+            try:
+                self.processor.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self.recorder.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self.monitor.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self.camera_handler.recover_capture()
+            # Rebuild writers against the recovered stream.
+            self.processor.configure_output(
+                output_path=output_path,
+                width=self.source.width,
+                height=self.source.height,
+                fps=self.source.target_fps,
+            )
+            self.recorder = Recorder(
+                out_queue=self.processor.out_queue,
+                output_path=output_path,
+                width=self.source.width,
+                height=self.source.height,
+                fps=self.source.target_fps,
+                fourcc=self.processor.chosen_fourcc,
+                codec_label=self.processor.codec_label,
+                correct_container_fps=allow_remux,
+            )
+            self.monitor = SystemMonitor(output_csv=monitor_csv)
+            self.camera_handler.processor_queue.clear()
+            self.processor.out_queue.clear()
+            self.processor.start()
+            self.recorder.start()
+            self.monitor.start()
+            self.camera_handler.enable_recording()
+            if not self.camera_handler.wait_recorded_frames(2.5):
+                try:
+                    self.camera_handler.disable_recording()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    self.processor.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    self.recorder.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    self.monitor.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                if output_path.exists() and output_path.stat().st_size == 0:
+                    output_path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"Record got 0 frames from {tag or 'camera'} after capture recovery. "
+                    "Stop all previews → Start preview on this camera alone → wait for "
+                    "moving live video → Record with bag unchecked first."
+                )
+
+        if pending_uvc_bag is not None:
+            from poc1.uvc_rosbag import UvcRos2Bag
+
+            self._uvc_bag = UvcRos2Bag(pending_uvc_bag)
+            self._uvc_bag.start()
+            self._bag_path = pending_uvc_bag
+            self.processor.sidecar_bag = self._uvc_bag
 
         logger.info(
             "Recording started -> %s (compression=%s bag=%s fps=%s requested=%s read=%d)",

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -1635,7 +1636,40 @@ class FormattedUvcSource(CvCaptureSource):
             frame = self._pending_frame
             self._pending_frame = None
             return frame
+        if getattr(self, "device_tag", "") == "elgato":
+            return self._read_elgato_timed(timeout_s=1.5)
         return super().read()
+
+    def _read_elgato_timed(self, timeout_s: float = 1.5) -> Optional[np.ndarray]:
+        """
+        DirectShow ``read()`` can block forever under USB load. Run it on a
+        short-lived worker so the camera-handler loop can recover instead of
+        freezing Record at frames_read=0 with a stale preview frame.
+        """
+        if self._cap is None:
+            return None
+        box: list[tuple[bool, Optional[np.ndarray]]] = []
+
+        def _worker() -> None:
+            try:
+                ok, frame = self._cap.read()
+                box.append((bool(ok), frame))
+            except Exception:  # noqa: BLE001
+                box.append((False, None))
+
+        t = threading.Thread(target=_worker, name="elgato-read", daemon=True)
+        t.start()
+        t.join(timeout=max(0.2, float(timeout_s)))
+        if t.is_alive():
+            logger.warning(
+                "Elgato VideoCapture.read() hung >%.1fs — returning None so Record can recover",
+                timeout_s,
+            )
+            return None
+        if not box:
+            return None
+        ok, frame = box[0]
+        return frame if ok and frame is not None else None
 
 
 class ConfiguredRealSenseSource:

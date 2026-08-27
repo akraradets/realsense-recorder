@@ -122,10 +122,27 @@ def test_capture_releases_record_lock_before_processor_put() -> None:
         handler.stop()
 
 
-def test_build_id_v26() -> None:
+def test_build_id_v27() -> None:
     from poc1.bag_recorder import BUILD_ID
 
-    assert BUILD_ID.startswith("sdk-record-v26-")
+    assert BUILD_ID.startswith("sdk-record-v27-")
+
+
+def test_wait_recorded_frames_true_when_armed() -> None:
+    import time
+
+    from poc1.camera_handler import CameraHandler
+    from poc1.frame_source import FakeFrameSource
+
+    handler = CameraHandler(FakeFrameSource(width=64, height=48, target_fps=60))
+    handler.start()
+    try:
+        handler.enable_recording()
+        assert handler.wait_recorded_frames(2.0)
+        assert handler.frames_read > 0
+    finally:
+        handler.disable_recording()
+        handler.stop()
 
 
 def test_uvc_ros2_bag_writes_jpeg_frames(tmp_path) -> None:

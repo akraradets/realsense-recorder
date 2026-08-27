@@ -224,6 +224,12 @@ class CameraHandler:
             self._seq = 0
             self.frames_read = 0
             self._delivery_ts = []
+            # Clear stale open-time / preview FPS so HUD cannot look "live" at
+            # ~59 while Record is actually starved (v26 false confidence).
+            try:
+                self.source.actual_fps = 0.0
+            except Exception:  # noqa: BLE001
+                pass
             reset = getattr(self.source, "reset_sequence", None)
             if callable(reset):
                 reset()
@@ -232,6 +238,55 @@ class CameraHandler:
     def disable_recording(self) -> None:
         with self._record_lock:
             self._recording.clear()
+
+    def wait_recorded_frames(self, timeout_s: float = 2.5) -> bool:
+        """True if at least one Record-path frame arrived within timeout."""
+        deadline = time.time() + max(0.05, float(timeout_s))
+        while time.time() < deadline:
+            if int(self.frames_read) > 0:
+                return True
+            time.sleep(0.02)
+        return int(self.frames_read) > 0
+
+    def recover_capture(self) -> None:
+        """
+        Unstick a dead DirectShow/OpenCV read loop (common on Elgato Record).
+
+        If the capture thread is wedged inside ``source.read()``, abandon it and
+        reopen the device on a fresh thread. Prefer this over a silent 0-frame take.
+        """
+        with self._record_lock:
+            self._recording.clear()
+        self._paused.clear()
+        self._running.clear()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+            if self._thread.is_alive():
+                logger.warning(
+                    "capture thread stuck in source.read() — abandoning thread and reopening"
+                )
+            self._thread = None
+        try:
+            self.source.stop()
+        except Exception:  # noqa: BLE001
+            logger.exception("recover_capture: source.stop failed")
+        try:
+            self.source.start()
+        except Exception:  # noqa: BLE001
+            logger.exception("recover_capture: source.start failed")
+            return
+        self._delivery_ts = []
+        self._running.set()
+        self._thread = threading.Thread(
+            target=self._loop, name="camera-handler", daemon=True
+        )
+        self._thread.start()
+        # Prove the new thread can deliver before Record arms again.
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if self._delivery_ts:
+                return
+            time.sleep(0.02)
 
     @property
     def is_recording(self) -> bool:

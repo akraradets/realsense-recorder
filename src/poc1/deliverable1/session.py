@@ -358,6 +358,18 @@ class MultiCamSession:
             if not armed:
                 raise RuntimeError("No cameras armed — enable Armed on at least one slot")
 
+            # Elgato/UVC first so DirectShow is recording before RealSense bag
+            # loads the USB bus (dual-cam left Elgato at frames_read=0 on v26).
+            def _record_start_priority(slot: CameraSlot) -> int:
+                cam = slot.camera
+                if cam is not None and cam.device_tag == "elgato":
+                    return 0
+                if cam is not None and cam.kind == "uvc":
+                    return 1
+                return 2
+
+            armed = sorted(armed, key=_record_start_priority)
+
             for s in armed:
                 if s.camera is None or s.mode is None:
                     raise RuntimeError(
