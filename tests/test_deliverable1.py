@@ -148,14 +148,20 @@ def test_elgato_open_profiles_prefer_user_selection():
 
     profiles = elgato_open_profiles(1280, 720, 120, "mjpg")
     assert profiles[0] == (1280, 720, 120, "mjpg")
-    assert (1920, 1080, 60, "mjpg") in profiles
-    assert profiles.index((1280, 720, 120, "mjpg")) < profiles.index(
-        (1920, 1080, 60, "mjpg")
-    )
-    # High-rate request: every 120 profile before any 60 fallback.
-    assert profiles.index((1920, 1080, 120, "mjpg")) < profiles.index(
-        (1920, 1080, 60, "mjpg")
-    )
+    # Same resolution only — no silent 720↔1080 fallback.
+    assert all(p[0] == 1280 and p[1] == 720 for p in profiles)
+    assert (1920, 1080, 60, "mjpg") not in profiles
+    assert (1920, 1080, 120, "mjpg") not in profiles
+
+
+def test_elgato_open_profiles_1080_never_falls_to_720():
+    from poc1.deliverable1.devices import elgato_open_profiles
+
+    profiles = elgato_open_profiles(1920, 1080, 120, "mjpg")
+    assert profiles[0] == (1920, 1080, 120, "mjpg")
+    assert all(p[0] == 1920 and p[1] == 1080 for p in profiles)
+    assert (1280, 720, 120, "mjpg") not in profiles
+    assert (1280, 720, 60, "mjpg") not in profiles
 
 
 def test_textured_green_screen_is_usable_elgato():

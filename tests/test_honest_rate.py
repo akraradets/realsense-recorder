@@ -49,6 +49,9 @@ def test_honest_container_fps_never_55_from_near_60() -> None:
     # Never invent 120 from ~60 HDMI.
     assert honest_container_fps(60.0, 120) == 60
     assert honest_container_fps(70.0, 120) != 120
+    # Settling high-rate (~95) must stamp 120 — not nearest-5 → 95.
+    assert honest_container_fps(95.0, 120) == 120
+    assert honest_container_fps(90.0, 120) == 120
     # Real OBS-like 120 lock.
     assert honest_container_fps(118.0, 120) == 120
     assert honest_container_fps(120.0, 120) == 120

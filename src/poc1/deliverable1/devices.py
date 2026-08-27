@@ -128,15 +128,17 @@ def honest_container_fps(rate: float, requested: int) -> int:
     """Map measured delivery rate to an honest MP4 container FPS.
 
     Never invent 120 from ~60 HDMI. Snap common bands so a short under-count
-    (e.g. 55–57 when the take averages ~60) does not stamp the file as 55.
+    (e.g. 55–57 → 60, or 90–99 while settling toward 120 → 120) does not
+    stamp a bogus mid value like 55 or 95.
     """
     req = int(requested) if int(requested or 0) > 0 else 30
     r = float(rate or 0.0)
     if r < 5.0:
         return 30 if req >= 90 else max(15, min(req, 60))
 
-    # True high-rate match (OBS-like 120 locked).
-    if req >= 90 and r >= req * 0.85:
+    # True / settling high-rate (OBS-like 120). Open-time samples often land
+    # ~95 briefly while live delivery is already climbing to ~120 — stamp req.
+    if req >= 90 and r >= 90.0:
         return req
     if 100.0 <= r <= 130.0:
         return 120 if req >= 90 else min(req, 120)
@@ -156,6 +158,41 @@ def honest_container_fps(rate: float, requested: int) -> int:
     if req >= 90:
         return min(stamped, req)
     return stamped
+
+
+def elgato_open_profiles(
+    wanted_w: int, wanted_h: int, wanted_fps: int, wanted_fmt: str = "mjpg"
+) -> list[tuple[int, int, int, str]]:
+    """Ordered Elgato open attempts — **same resolution only**.
+
+    Never silently fall back 1920x1080 → 1280x720 (Station A/B regression).
+    When the operator picks 1080p120, we only retry that size (FPS variants).
+    """
+    fmt = "mjpg" if (wanted_fmt or "mjpg").lower() != "mjpg" else "mjpg"
+    w, h = int(wanted_w), int(wanted_h)
+    fps = int(wanted_fps) if int(wanted_fps) > 0 else 30
+    primary = [
+        (w, h, fps, fmt),
+        (w, h, fps, "mjpg"),
+    ]
+    # Same WxH only — no cross-resolution fallback.
+    same_res_high = [(w, h, 120, "mjpg")] if fps != 120 else []
+    same_res_mid = [
+        (w, h, 60, "mjpg"),
+        (w, h, 50, "mjpg"),
+        (w, h, 30, "mjpg"),
+    ]
+    if fps >= 90:
+        profiles = primary + same_res_high + same_res_mid
+    else:
+        profiles = primary + same_res_mid + same_res_high
+    seen: set[tuple[int, int, int, str]] = set()
+    out: list[tuple[int, int, int, str]] = []
+    for prof in profiles:
+        if prof not in seen:
+            seen.add(prof)
+            out.append(prof)
+    return out
 
 
 def prefix_for_camera(camera: ConnectedCamera) -> str:
@@ -798,43 +835,6 @@ def list_stream_modes(camera: ConnectedCamera) -> list[StreamMode]:
     return list_uvc_modes(camera)
 
 
-def elgato_open_profiles(
-    wanted_w: int, wanted_h: int, wanted_fps: int, wanted_fmt: str = "mjpg"
-) -> list[tuple[int, int, int, str]]:
-    """Ordered Elgato open attempts: user selection first, then HDMI fallbacks.
-
-    When the user asks for >=90fps, try every 120 profile before any 60 fallback
-    so a soft reject cannot silently lock the card at 1080p60 (OBS-style path).
-    """
-    fmt = "mjpg" if (wanted_fmt or "mjpg").lower() != "mjpg" else "mjpg"
-    primary = [
-        (wanted_w, wanted_h, wanted_fps, fmt),
-        (wanted_w, wanted_h, wanted_fps, "mjpg"),
-    ]
-    rate_120 = [
-        (1920, 1080, 120, "mjpg"),
-        (1280, 720, 120, "mjpg"),
-    ]
-    rate_60 = [
-        (1920, 1080, 60, "mjpg"),
-        (1920, 1080, 50, "mjpg"),
-        (1280, 720, 60, "mjpg"),
-        (1280, 720, 30, "mjpg"),
-        (1920, 1080, 30, "mjpg"),
-    ]
-    if wanted_fps >= 90:
-        profiles = primary + rate_120 + rate_60
-    else:
-        profiles = primary + rate_60 + rate_120
-    seen: set[tuple[int, int, int, str]] = set()
-    out: list[tuple[int, int, int, str]] = []
-    for prof in profiles:
-        if prof not in seen:
-            seen.add(prof)
-            out.append(prof)
-    return out
-
-
 def _looks_like_packed_yuyv(bgr: np.ndarray) -> bool:
     """True when YUY2 was likely decoded as BGR (fine zebra / chroma stripes)."""
     if bgr is None or bgr.ndim != 3 or bgr.shape[2] != 3:
@@ -1285,11 +1285,22 @@ class FormattedUvcSource(CvCaptureSource):
                 tuple[float, int, int, int, str, cv2.VideoCapture, np.ndarray]
             ] = None
             want_high = is_elgato and wanted_fps >= 90
+            # Same resolution only — never silently accept 720 when operator picked 1080.
             high_only = (
-                [p for p in unique_profiles if p[2] >= 90] if want_high else unique_profiles
+                [
+                    p
+                    for p in unique_profiles
+                    if p[2] >= 90 and p[0] == wanted_w and p[1] == wanted_h
+                ]
+                if want_high
+                else unique_profiles
             )
             if want_high and not high_only:
-                high_only = [(1920, 1080, 120, "mjpg"), (1280, 720, 120, "mjpg")]
+                high_only = [(wanted_w, wanted_h, wanted_fps, "mjpg")]
+            # Best-effort same-res list (may include @60 at the same WxH only).
+            same_res_profiles = [
+                p for p in unique_profiles if p[0] == wanted_w and p[1] == wanted_h
+            ] or [(wanted_w, wanted_h, wanted_fps, "mjpg")]
 
             if is_elgato:
                 # High-rate: DSHOW-only first (MSMF often caps Elgato at 60). Two
@@ -1390,6 +1401,19 @@ class FormattedUvcSource(CvCaptureSource):
                     )
                     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
                     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
+                    # Reject silent resolution fallback (1080 request → 720 open).
+                    if want_high and (
+                        w < int(wanted_w * 0.9) or h < int(wanted_h * 0.9)
+                    ):
+                        logger.warning(
+                            "Rejecting size fallback %dx%d (operator selected %dx%d@%d)",
+                            w,
+                            h,
+                            wanted_w,
+                            wanted_h,
+                            wanted_fps,
+                        )
+                        continue
                     candidate = (rate, w, h, fps, fmt, cap, owned)
                     logger.info(
                         "UVC opened via target=%r backend=%s %dx%d@%d %s (measured ~%.1f)",
@@ -1401,18 +1425,21 @@ class FormattedUvcSource(CvCaptureSource):
                         fmt,
                         rate,
                     )
-                    # Real 120 lock (OBS-equivalent): accept immediately.
-                    if fps >= 90 and rate >= fps * 0.85:
+                    # Real / settling 120 lock: accept when delivery is already high-rate
+                    # (>=90). Do not require a perfect 102 sample (that caused 95 stamps).
+                    if fps >= 90 and rate >= 90.0:
                         chosen = candidate
                         accepted_here = True
                         logger.info(
-                            "Elgato 120 LOCKED like OBS (~%.1ffps) via %r",
+                            "Elgato 120 LOCKED like OBS (~%.1ffps) at %dx%d via %r",
                             rate,
+                            w,
+                            h,
                             target,
                         )
                         break
                     # Soft ~60 while asking 120: keep searching; remember best effort.
-                    if want_high and fps >= 90 and rate < fps * 0.85:
+                    if want_high and fps >= 90 and rate < 90.0:
                         if best_effort is None or rate > best_effort[0]:
                             if (
                                 best_effort is not None
@@ -1445,17 +1472,21 @@ class FormattedUvcSource(CvCaptureSource):
                 if not got_any:
                     last_exc = last_exc or RuntimeError("no frames after open")
 
-            # Fallbacks when 120 never locked: try remaining profiles, then best effort.
+            # Fallbacks when 120 never locked: same resolution only (no 1080→720).
             if chosen is None and want_high:
                 logger.warning(
-                    "Elgato could not lock ~%dfps after OBS-style DSHOW retries. "
-                    "Fully quit OBS, then Start preview again. Using best effort.",
+                    "Elgato could not lock ~%dfps at %dx%d after OBS-style DSHOW retries. "
+                    "Fully quit OBS, then Start preview again. "
+                    "Best effort stays at %dx%d (no resolution fallback).",
                     wanted_fps,
+                    wanted_w,
+                    wanted_h,
+                    wanted_w,
+                    wanted_h,
                 )
                 if best_effort is not None:
                     chosen = best_effort
                 else:
-                    # Last resort: full target list including MSMF + 60 profiles.
                     open_targets = _elgato_open_targets(
                         self.open_path, int(self.device_index or 0)
                     )
@@ -1477,7 +1508,7 @@ class FormattedUvcSource(CvCaptureSource):
                             )
                             continue
                         opened_once = True
-                        for width, height, fps, fmt in unique_profiles:
+                        for width, height, fps, fmt in same_res_profiles:
                             try:
                                 frame = self._configure_and_grab(
                                     cap, width, height, fps, fmt
@@ -1507,6 +1538,15 @@ class FormattedUvcSource(CvCaptureSource):
                             )
                             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
                             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
+                            if w < int(wanted_w * 0.9) or h < int(wanted_h * 0.9):
+                                logger.warning(
+                                    "Last-resort rejecting size %dx%d (want %dx%d)",
+                                    w,
+                                    h,
+                                    wanted_w,
+                                    wanted_h,
+                                )
+                                continue
                             chosen = (rate, w, h, fps, fmt, cap, owned)
                             break
                         if chosen is not None:
@@ -1517,6 +1557,14 @@ class FormattedUvcSource(CvCaptureSource):
                             pass
 
             if chosen is None:
+                if want_high:
+                    raise RuntimeError(
+                        f"Could not open Elgato at {wanted_w}x{wanted_h}@{wanted_fps} "
+                        f"(no silent fallback to 720p). Fully quit OBS / Elgato Utility / "
+                        f"Viewer, confirm HDMI is {wanted_w}x{wanted_h}@120, install ffmpeg, "
+                        f"Refresh, then Start preview on the Elgato alone."
+                        + (f" Last error: {last_exc}" if last_exc else "")
+                    )
                 raise RuntimeError(
                     _uvc_open_failure_message(
                         is_elgato=is_elgato,
