@@ -122,10 +122,10 @@ def test_capture_releases_record_lock_before_processor_put() -> None:
         handler.stop()
 
 
-def test_build_id_v27() -> None:
+def test_build_id_v28() -> None:
     from poc1.bag_recorder import BUILD_ID
 
-    assert BUILD_ID.startswith("sdk-record-v27-")
+    assert BUILD_ID.startswith("sdk-record-v28-")
 
 
 def test_wait_recorded_frames_true_when_armed() -> None:
