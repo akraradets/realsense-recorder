@@ -1015,14 +1015,15 @@ class UnifiedApp:
 
             messagebox.showerror(
                 "No frames captured",
-                "Preview was live but Record counted 0 frames on:\n"
+                "Preview was live but the Record path counted 0 frames on:\n"
                 + "\n".join(f"• {line}" for line in no_capture)
                 + f"\n\nSave folder: {self.session.out_dir}\n\n"
-                "This is not a slow-PC / skipped-encode problem.\n"
-                "Fully quit OBS, Intel RealSense Viewer, and Elgato 4K Capture Utility "
-                "(they lock the device). Confirm HDMI is on, Start preview again, "
-                "then Record.\n"
-                f"Title bar must show {BUILD_ID}.",
+                "This is a Record-path miss (not encode skipping frames).\n"
+                "1) Press Stop all previews, then Start preview again on that camera.\n"
+                "2) Wait until the HUD shows live video, then Record.\n"
+                "3) If it still fails: fully Exit OBS / Viewer / Elgato Utility "
+                "(only if they are running), Refresh cameras, retry.\n"
+                f"Build: {BUILD_ID}.",
             )
 
         mismatched = [

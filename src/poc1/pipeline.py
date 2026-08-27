@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -189,10 +188,12 @@ class Pipeline:
         )
         self.monitor = SystemMonitor(output_csv=monitor_csv)
 
+        # Arm capture BEFORE starting encode workers so Elgato frames during
+        # worker startup are counted (fixes 0-frame Record with live preview).
+        self.camera_handler.enable_recording()
         self.processor.start()
         self.recorder.start()
         self.monitor.start()
-        self.camera_handler.enable_recording()
         logger.info(
             "Recording started -> %s (compression=%s bag=%s fps=%s requested=%s)",
             output_path,
@@ -210,22 +211,14 @@ class Pipeline:
         if tag not in {"elgato", "uvc"}:
             return
         # Prefer live camera-handler delivery rate over open-time sample / UI paint.
+        # Do NOT sleep here — blocking Record start raced Elgato reads and
+        # contributed to "0 frames captured" on both stations.
         rate = float(getattr(self.source, "actual_fps", 0) or 0)
         requested = int(getattr(self, "_requested_fps", self.source.target_fps) or 30)
         try:
             live = float(self.camera_handler.live_delivery_fps() or 0)
             if live >= 5:
                 rate = max(rate, live)
-            # High-rate: wait briefly for the rolling FPS to climb off a mid
-            # sample (~95) before freezing the MP4 container FPS.
-            if requested >= 90 and rate < requested * 0.85:
-                for _ in range(6):
-                    time.sleep(0.12)
-                    live = float(self.camera_handler.live_delivery_fps() or 0)
-                    if live >= 5:
-                        rate = max(rate, live)
-                    if rate >= 90.0:
-                        break
         except Exception:  # noqa: BLE001
             pass
         hint = float(getattr(self, "_preview_fps_hint", 0) or 0)

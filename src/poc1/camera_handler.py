@@ -274,11 +274,6 @@ class CameraHandler:
                 time.sleep(0.005)
                 continue
 
-            # Snapshot arming state before read so a mid-read enable_recording()
-            # cannot attach a pre-reset synthetic barcode to seq 0.
-            with self._record_lock:
-                was_recording = self._recording.is_set()
-
             self._in_read.set()
             try:
                 frame = self.source.read()
@@ -301,8 +296,11 @@ class CameraHandler:
                 owned = np.array(frame, copy=True, order="C")
 
             with self._record_lock:
+                # Arm check AFTER read. Requiring was_recording AND recording_now
+                # dropped every in-flight frame when Record clicked during a slow
+                # 1080p Elgato read → "Preview live but Record counted 0 frames".
                 recording_now = self._recording.is_set()
-                if recording_now and was_recording:
+                if recording_now:
                     seq = self._seq
                     self._seq += 1
                     self.frames_read += 1
