@@ -209,6 +209,52 @@ def test_ensure_bgr_nv12_and_bgr() -> None:
     assert out.shape == (48, 64, 3)
 
 
+def test_ffmpeg_dshow_low_latency_settings() -> None:
+    from poc1.ffmpeg_dshow_source import DSHOW_RTBUFSIZE, FfmpegDshowCaptureSource
+
+    ff = FfmpegDshowCaptureSource(1920, 1080, 120, device_names=["Elgato 4K X"])
+    cmd = ff._build_cmd("Elgato 4K X", "vcodec_mjpeg")
+    assert cmd[cmd.index("-rtbufsize") + 1] == DSHOW_RTBUFSIZE
+    assert DSHOW_RTBUFSIZE != "150M"
+    assert "-fflags" in cmd and "nobuffer" in cmd
+
+
+def test_ffmpeg_dshow_read_prefers_newest_queued() -> None:
+    import numpy as np
+
+    from poc1.ffmpeg_dshow_source import FfmpegDshowCaptureSource
+
+    ff = FfmpegDshowCaptureSource(4, 4, 120, device_names=["x"])
+    ff._running = True
+    old = np.zeros((6, 4), dtype=np.uint8)
+    old[0, 0] = 1
+    new = np.zeros((6, 4), dtype=np.uint8)
+    new[0, 0] = 9
+    ff._queue.put_nowait(old)
+    ff._queue.put_nowait(new)
+    got = ff.read()
+    assert got is not None
+    assert got[0, 0] == 9
+
+
+def test_ffmpeg_dshow_seek_live_edge() -> None:
+    import numpy as np
+
+    from poc1.ffmpeg_dshow_source import FfmpegDshowCaptureSource
+
+    ff = FfmpegDshowCaptureSource(4, 4, 120, device_names=["x"])
+    stale = np.zeros((6, 4), dtype=np.uint8)
+    stale[0, 0] = 1
+    fresh = np.zeros((6, 4), dtype=np.uint8)
+    fresh[0, 0] = 7
+    ff._queue.put_nowait(stale)
+    ff._queue.put_nowait(fresh)
+    ff._seek_live_edge()
+    got = ff.read()
+    assert got is not None
+    assert got[0, 0] == 7
+
+
 def test_wait_recorded_frames_true_when_armed() -> None:
     import time
 

@@ -27,6 +27,9 @@ from poc1.frame_layout import (
 
 logger = logging.getLogger("poc1.ffmpeg_dshow")
 
+# DirectShow input buffer — 150M caused ~1–3s preview lag vs RealSense.
+DSHOW_RTBUFSIZE = "20M"
+
 # Elgato MJPEG is an input *codec* on dshow (-vcodec mjpeg), not -pixel_format mjpeg.
 InputMode = str  # "vcodec_mjpeg" | "pixel_yuyv422" | "none"
 
@@ -186,6 +189,7 @@ class FfmpegDshowCaptureSource:
                             self.pipe_pix_fmt,
                             rate,
                         )
+                        self._seek_live_edge()
                         return
                     self.stop()
                     last_err = f"{device} mode={mode} measured ~{rate:.1f}fps"
@@ -219,10 +223,12 @@ class FfmpegDshowCaptureSource:
             "-loglevel",
             "warning",
             "-nostdin",
+            "-fflags",
+            "nobuffer",
             "-f",
             "dshow",
             "-rtbufsize",
-            "150M",
+            DSHOW_RTBUFSIZE,
         ]
         size_args = ["-video_size", f"{self.width}x{self.height}"]
         fps_args = ["-framerate", str(self.target_fps)]
@@ -256,7 +262,7 @@ class FfmpegDshowCaptureSource:
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            bufsize=self._frame_bytes * 4,
+            bufsize=self._frame_bytes * 2,
             creationflags=creationflags,
         )
 
@@ -297,11 +303,9 @@ class FfmpegDshowCaptureSource:
                 continue
             if frame is None:
                 break
-            self._pending = frame
 
         n = 0
         t0 = time.perf_counter()
-        first: Optional[np.ndarray] = None
         while time.perf_counter() - t0 < measure_s:
             try:
                 frame = self._queue.get(timeout=0.25)
@@ -312,13 +316,8 @@ class FfmpegDshowCaptureSource:
             if frame is None:
                 break
             n += 1
-            if first is None:
-                first = frame
-                self._pending = frame
         elapsed = max(time.perf_counter() - t0, 0.05)
         rate = (n - 1) / elapsed if n >= 2 else (n / elapsed if n >= 1 and elapsed > 0.2 else 0.0)
-        if first is not None:
-            self._pending = first
         if proc.poll() is not None and n == 0:
             err = ""
             try:
@@ -371,18 +370,53 @@ class FfmpegDshowCaptureSource:
             except queue.Full:
                 pass
 
+    def _seek_live_edge(self) -> None:
+        """Discard buffered frames from lock/measure; keep only the newest."""
+        self._pending = None
+        latest: Optional[np.ndarray] = None
+        while True:
+            try:
+                frame = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if frame is None:
+                continue
+            latest = frame
+        self._pending = latest
+
+    def _dequeue_newest(self, *, block: bool, timeout: float = 2.0) -> Optional[np.ndarray]:
+        """Return the freshest queued frame (drop older buffered copies)."""
+        if block:
+            try:
+                frame = self._queue.get(timeout=timeout)
+            except queue.Empty:
+                return None
+        else:
+            try:
+                frame = self._queue.get_nowait()
+            except queue.Empty:
+                return None
+        if frame is None:
+            return None
+        while True:
+            try:
+                nxt = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if nxt is None:
+                return None
+            frame = nxt
+        return frame
+
     def read(self) -> Optional[np.ndarray]:
+        if not self._running:
+            return None
         if self._pending is not None:
             frame = self._pending
             self._pending = None
-            return frame
-        if not self._running:
-            return None
-        try:
-            frame = self._queue.get(timeout=2.0)
-        except queue.Empty:
-            return None
-        return frame
+            newer = self._dequeue_newest(block=False)
+            return newer if newer is not None else frame
+        return self._dequeue_newest(block=True)
 
     def stop(self) -> None:
         self._running = False
