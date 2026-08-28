@@ -1693,12 +1693,27 @@ class FormattedUvcSource(CvCaptureSource):
                     ):
                         self._log_d1_uvc_start()
                         return
-                    chosen = best_effort
-                    logger.warning(
-                        "Elgato soft-open at ~%.1ffps (HDMI likely not 1080p120; "
-                        "file will stamp honest 60 — not fake 120)",
-                        best_effort[0],
-                    )
+                    from poc1.ffmpeg_dshow_source import find_ffmpeg
+
+                    be_rate = float(best_effort[0])
+                    if be_rate >= 90.0 or not find_ffmpeg():
+                        chosen = best_effort
+                        if be_rate < 90.0:
+                            logger.warning(
+                                "Elgato soft-open at ~%.1ffps (ffmpeg missing; "
+                                "install ffmpeg for 1080p120)",
+                                be_rate,
+                            )
+                    else:
+                        logger.warning(
+                            "Refusing OpenCV ~%.1ffps for 1080p120 — ffmpeg installed "
+                            "but could not lock vcodec=mjpeg",
+                            be_rate,
+                        )
+                        try:
+                            best_effort[5].release()
+                        except Exception:  # noqa: BLE001
+                            pass
 
             if chosen is None:
                 if want_high and self._activate_ffmpeg_dshow(
@@ -1735,6 +1750,16 @@ class FormattedUvcSource(CvCaptureSource):
                 ):
                     self._log_d1_uvc_start()
                     return
+                from poc1.ffmpeg_dshow_source import find_ffmpeg
+
+                if find_ffmpeg():
+                    raise RuntimeError(
+                        f"Elgato opened at ~{rate:.0f}fps but mode is "
+                        f"{wanted_w}x{wanted_h}@{wanted_fps}. "
+                        "ffmpeg is installed but could not lock -vcodec mjpeg at 120. "
+                        "Fully quit OBS, confirm HDMI 1080p120, Start preview on "
+                        "Elgato alone, then check logs for 'ffmpeg dshow LOCKED'."
+                    )
 
             self._cap = cap
             self.width = w

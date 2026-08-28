@@ -164,11 +164,23 @@ def test_dshow_input_names_strips_video_prefix() -> None:
     assert not names[0].startswith("video=")
 
 
+def test_input_modes_mjpg_uses_vcodec() -> None:
+    from poc1.ffmpeg_dshow_source import (
+        _input_modes_to_try,
+        _pin_args_for_mode,
+    )
+
+    order = _input_modes_to_try("mjpg")
+    assert order[0] == "vcodec_mjpeg"
+    assert _pin_args_for_mode("vcodec_mjpeg") == ["-vcodec", "mjpeg"]
+    assert "-pixel_format" not in _pin_args_for_mode("vcodec_mjpeg")
+
+
 def test_pixel_formats_to_try_mjpg_first() -> None:
     from poc1.ffmpeg_dshow_source import _pixel_formats_to_try
 
     order = _pixel_formats_to_try("mjpg")
-    assert order[0] == "mjpeg"
+    assert order[0] == "vcodec_mjpeg"
 
 
 def test_wait_recorded_frames_true_when_armed() -> None:

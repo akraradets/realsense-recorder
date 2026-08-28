@@ -20,14 +20,31 @@ import numpy as np
 
 logger = logging.getLogger("poc1.ffmpeg_dshow")
 
-_DSHOW_PIX: dict[str, Optional[str]] = {
-    "mjpg": "mjpeg",
-    "mjpeg": "mjpeg",
-    "yuyv": "yuyv422",
-    "yuy2": "yuyv422",
-    "bgr8": None,
-    "rgb8": None,
-}
+# Elgato MJPEG is an input *codec* on dshow (-vcodec mjpeg), not -pixel_format mjpeg.
+InputMode = str  # "vcodec_mjpeg" | "pixel_yuyv422" | "none"
+
+
+def _input_modes_to_try(requested_fmt: str) -> list[InputMode]:
+    fmt = (requested_fmt or "mjpg").lower()
+    modes: list[InputMode] = []
+    if fmt in {"mjpg", "mjpeg"}:
+        modes.append("vcodec_mjpeg")
+    elif fmt in {"yuyv", "yuy2"}:
+        modes.append("pixel_yuyv422")
+    else:
+        modes.append("none")
+    for extra in ("pixel_yuyv422", "none"):
+        if extra not in modes:
+            modes.append(extra)
+    return modes
+
+
+def _pin_args_for_mode(mode: InputMode) -> list[str]:
+    if mode == "vcodec_mjpeg":
+        return ["-vcodec", "mjpeg"]
+    if mode == "pixel_yuyv422":
+        return ["-pixel_format", "yuyv422"]
+    return []
 
 
 def find_ffmpeg() -> Optional[str]:
@@ -67,16 +84,9 @@ def dshow_input_names(open_path: Optional[str]) -> list[str]:
     return names
 
 
-def _pixel_formats_to_try(requested_fmt: str) -> list[Optional[str]]:
-    fmt = (requested_fmt or "mjpg").lower()
-    primary = _DSHOW_PIX.get(fmt)
-    order: list[Optional[str]] = []
-    if primary is not None:
-        order.append(primary)
-    for extra in ("mjpeg", "yuyv422", None):
-        if extra not in order:
-            order.append(extra)
-    return order
+def _pixel_formats_to_try(requested_fmt: str) -> list[InputMode]:
+    """Backward-compatible alias for tests."""
+    return _input_modes_to_try(requested_fmt)
 
 
 def _lock_threshold(requested_fps: int) -> float:
@@ -120,6 +130,7 @@ class FfmpegDshowCaptureSource:
         self._queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=8)
         self._pending: Optional[np.ndarray] = None
         self._active_device = ""
+        self._active_input_mode = ""
 
     def start(self) -> None:
         if sys.platform != "win32":
@@ -136,44 +147,45 @@ class FfmpegDshowCaptureSource:
         threshold = _lock_threshold(want)
         last_err = "no attempt"
         for device in self._device_names:
-            for pix in _pixel_formats_to_try(self.pixel_format):
-                for measure_s in (3.5, 5.0):
+            for mode in _input_modes_to_try(self.pixel_format):
+                for measure_s in (3.5, 5.0, 7.0):
                     try:
-                        rate = self._try_open(device, pix, measure_s=measure_s)
+                        rate = self._try_open(device, mode, measure_s=measure_s)
                     except Exception as exc:  # noqa: BLE001
                         last_err = str(exc)
                         logger.warning(
-                            "ffmpeg dshow open failed %s %dx%d@%d pix=%s: %s",
+                            "ffmpeg dshow open failed %s %dx%d@%d mode=%s: %s",
                             device,
                             self.width,
                             self.height,
                             want,
-                            pix,
+                            mode,
                             exc,
                         )
                         continue
                     if rate >= threshold:
                         self.actual_fps = rate
                         self._active_device = device
+                        self._active_input_mode = mode
                         logger.info(
-                            "ffmpeg dshow LOCKED %s %dx%d@%d pix=%s measured ~%.1ffps",
+                            "ffmpeg dshow LOCKED %s %dx%d@%d mode=%s measured ~%.1ffps",
                             device,
                             self.width,
                             self.height,
                             want,
-                            pix,
+                            mode,
                             rate,
                         )
                         return
                     self.stop()
-                    last_err = f"{device} pix={pix} measured ~{rate:.1f}fps"
+                    last_err = f"{device} mode={mode} measured ~{rate:.1f}fps"
                     logger.warning(
-                        "ffmpeg dshow %s %dx%d@%d pix=%s only ~%.1ffps (need %.0f) — retrying",
+                        "ffmpeg dshow %s %dx%d@%d mode=%s only ~%.1ffps (need %.0f) — retrying",
                         device,
                         self.width,
                         self.height,
                         want,
-                        pix,
+                        mode,
                         rate,
                         threshold,
                     )
@@ -183,12 +195,12 @@ class FfmpegDshowCaptureSource:
             f"(last: {last_err}). Confirm HDMI is 1080p120 and OBS is fully exited."
         )
 
-    def _build_cmd(self, device: str, pix: Optional[str]) -> list[str]:
-        """OBS-style dshow pin — try framerate-before-size ordering."""
-        return self._build_cmd_variant(device, pix, fps_first=True)
+    def _build_cmd(self, device: str, input_mode: InputMode) -> list[str]:
+        """OBS-style dshow pin — framerate before size, vcodec mjpeg for Elgato."""
+        return self._build_cmd_variant(device, input_mode, fps_first=True)
 
     def _build_cmd_variant(
-        self, device: str, pix: Optional[str], *, fps_first: bool
+        self, device: str, input_mode: InputMode, *, fps_first: bool
     ) -> list[str]:
         assert self._ffmpeg
         head = [
@@ -204,14 +216,11 @@ class FfmpegDshowCaptureSource:
         ]
         size_args = ["-video_size", f"{self.width}x{self.height}"]
         fps_args = ["-framerate", str(self.target_fps)]
-        if pix:
-            pix_args = ["-pixel_format", pix]
-        else:
-            pix_args = []
+        fmt_args = _pin_args_for_mode(input_mode)
         if fps_first:
-            pin = fps_args + size_args + pix_args
+            pin = fps_args + size_args + fmt_args
         else:
-            pin = size_args + fps_args + pix_args
+            pin = size_args + fps_args + fmt_args
         return head + pin + [
             "-i",
             f"video={device}",
@@ -223,10 +232,10 @@ class FfmpegDshowCaptureSource:
             "pipe:1",
         ]
 
-    def _cmd_variants(self, device: str, pix: Optional[str]) -> list[list[str]]:
+    def _cmd_variants(self, device: str, input_mode: InputMode) -> list[list[str]]:
         return [
-            self._build_cmd_variant(device, pix, fps_first=True),
-            self._build_cmd_variant(device, pix, fps_first=False),
+            self._build_cmd_variant(device, input_mode, fps_first=True),
+            self._build_cmd_variant(device, input_mode, fps_first=False),
         ]
 
     def _spawn(self, cmd: list[str]) -> subprocess.Popen:
@@ -241,10 +250,10 @@ class FfmpegDshowCaptureSource:
             creationflags=creationflags,
         )
 
-    def _try_open(self, device: str, pix: Optional[str], measure_s: float) -> float:
+    def _try_open(self, device: str, input_mode: InputMode, measure_s: float) -> float:
         last_rate = 0.0
-        for cmd in self._cmd_variants(device, pix):
-            rate = self._try_open_cmd(cmd, device, pix, measure_s)
+        for cmd in self._cmd_variants(device, input_mode):
+            rate = self._try_open_cmd(cmd, input_mode, measure_s)
             if rate > last_rate:
                 last_rate = rate
             if rate >= _lock_threshold(self.target_fps):
@@ -253,9 +262,9 @@ class FfmpegDshowCaptureSource:
         return last_rate
 
     def _try_open_cmd(
-        self, cmd: list[str], device: str, pix: Optional[str], measure_s: float
+        self, cmd: list[str], input_mode: InputMode, measure_s: float
     ) -> float:
-        logger.info("ffmpeg dshow try: %s", " ".join(cmd[1:16]))
+        logger.info("ffmpeg dshow try: %s", " ".join(cmd[1:18]))
         proc = self._spawn(cmd)
         self._proc = proc
         self._running = True
