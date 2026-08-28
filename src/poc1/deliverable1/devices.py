@@ -1053,6 +1053,7 @@ class FormattedUvcSource(CvCaptureSource):
             return False
         from poc1.ffmpeg_dshow_source import (
             FfmpegDshowCaptureSource,
+            _lock_threshold,
             dshow_input_names,
             find_ffmpeg,
         )
@@ -1088,7 +1089,7 @@ class FormattedUvcSource(CvCaptureSource):
         except Exception as exc:  # noqa: BLE001
             logger.warning("ffmpeg dshow Elgato open failed: %s", exc)
             return False
-        if ff.actual_fps < wanted_fps * 0.85:
+        if ff.actual_fps < _lock_threshold(wanted_fps):
             ff.stop()
             return False
         self._ffmpeg = ff

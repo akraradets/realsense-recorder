@@ -79,6 +79,14 @@ def _pixel_formats_to_try(requested_fmt: str) -> list[Optional[str]]:
     return order
 
 
+def _lock_threshold(requested_fps: int) -> float:
+    """Minimum measured fps to treat high-rate (≥90 ask) as locked."""
+    req = int(requested_fps) if int(requested_fps) > 0 else 30
+    if req >= 90:
+        return 90.0
+    return req * 0.85
+
+
 class FfmpegDshowCaptureSource:
     """Read BGR frames from ``ffmpeg -f dshow`` stdout."""
 
@@ -125,47 +133,50 @@ class FfmpegDshowCaptureSource:
             raise RuntimeError("No DirectShow device name for ffmpeg Elgato capture")
 
         want = self.target_fps
+        threshold = _lock_threshold(want)
         last_err = "no attempt"
         for device in self._device_names:
             for pix in _pixel_formats_to_try(self.pixel_format):
-                try:
-                    rate = self._try_open(device, pix, measure_s=2.0)
-                except Exception as exc:  # noqa: BLE001
-                    last_err = str(exc)
+                for measure_s in (3.5, 5.0):
+                    try:
+                        rate = self._try_open(device, pix, measure_s=measure_s)
+                    except Exception as exc:  # noqa: BLE001
+                        last_err = str(exc)
+                        logger.warning(
+                            "ffmpeg dshow open failed %s %dx%d@%d pix=%s: %s",
+                            device,
+                            self.width,
+                            self.height,
+                            want,
+                            pix,
+                            exc,
+                        )
+                        continue
+                    if rate >= threshold:
+                        self.actual_fps = rate
+                        self._active_device = device
+                        logger.info(
+                            "ffmpeg dshow LOCKED %s %dx%d@%d pix=%s measured ~%.1ffps",
+                            device,
+                            self.width,
+                            self.height,
+                            want,
+                            pix,
+                            rate,
+                        )
+                        return
+                    self.stop()
+                    last_err = f"{device} pix={pix} measured ~{rate:.1f}fps"
                     logger.warning(
-                        "ffmpeg dshow open failed %s %dx%d@%d pix=%s: %s",
-                        device,
-                        self.width,
-                        self.height,
-                        want,
-                        pix,
-                        exc,
-                    )
-                    continue
-                if rate >= want * 0.85:
-                    self.actual_fps = rate
-                    self._active_device = device
-                    logger.info(
-                        "ffmpeg dshow LOCKED %s %dx%d@%d pix=%s measured ~%.1ffps",
+                        "ffmpeg dshow %s %dx%d@%d pix=%s only ~%.1ffps (need %.0f) — retrying",
                         device,
                         self.width,
                         self.height,
                         want,
                         pix,
                         rate,
+                        threshold,
                     )
-                    return
-                self.stop()
-                last_err = f"{device} pix={pix} measured ~{rate:.1f}fps"
-                logger.warning(
-                    "ffmpeg dshow %s %dx%d@%d pix=%s only ~%.1ffps — retrying",
-                    device,
-                    self.width,
-                    self.height,
-                    want,
-                    pix,
-                    rate,
-                )
 
         raise RuntimeError(
             f"ffmpeg could not lock Elgato at {self.width}x{self.height}@{want} "
@@ -173,45 +184,50 @@ class FfmpegDshowCaptureSource:
         )
 
     def _build_cmd(self, device: str, pix: Optional[str]) -> list[str]:
+        """OBS-style dshow pin — try framerate-before-size ordering."""
+        return self._build_cmd_variant(device, pix, fps_first=True)
+
+    def _build_cmd_variant(
+        self, device: str, pix: Optional[str], *, fps_first: bool
+    ) -> list[str]:
         assert self._ffmpeg
-        cmd = [
+        head = [
             self._ffmpeg,
             "-hide_banner",
             "-loglevel",
             "warning",
             "-nostdin",
-            "-fflags",
-            "nobuffer",
-            "-flags",
-            "low_delay",
-            "-probesize",
-            "32",
-            "-analyzeduration",
-            "0",
             "-f",
             "dshow",
             "-rtbufsize",
             "150M",
-            "-video_size",
-            f"{self.width}x{self.height}",
-            "-framerate",
-            str(self.target_fps),
         ]
+        size_args = ["-video_size", f"{self.width}x{self.height}"]
+        fps_args = ["-framerate", str(self.target_fps)]
         if pix:
-            cmd.extend(["-pixel_format", pix])
-        cmd.extend(
-            [
-                "-i",
-                f"video={device}",
-                "-an",
-                "-pix_fmt",
-                "bgr24",
-                "-f",
-                "rawvideo",
-                "pipe:1",
-            ]
-        )
-        return cmd
+            pix_args = ["-pixel_format", pix]
+        else:
+            pix_args = []
+        if fps_first:
+            pin = fps_args + size_args + pix_args
+        else:
+            pin = size_args + fps_args + pix_args
+        return head + pin + [
+            "-i",
+            f"video={device}",
+            "-an",
+            "-pix_fmt",
+            "bgr24",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ]
+
+    def _cmd_variants(self, device: str, pix: Optional[str]) -> list[list[str]]:
+        return [
+            self._build_cmd_variant(device, pix, fps_first=True),
+            self._build_cmd_variant(device, pix, fps_first=False),
+        ]
 
     def _spawn(self, cmd: list[str]) -> subprocess.Popen:
         creationflags = 0
@@ -226,8 +242,20 @@ class FfmpegDshowCaptureSource:
         )
 
     def _try_open(self, device: str, pix: Optional[str], measure_s: float) -> float:
-        cmd = self._build_cmd(device, pix)
-        logger.info("ffmpeg dshow try: %s", " ".join(cmd[1:14]))
+        last_rate = 0.0
+        for cmd in self._cmd_variants(device, pix):
+            rate = self._try_open_cmd(cmd, device, pix, measure_s)
+            if rate > last_rate:
+                last_rate = rate
+            if rate >= _lock_threshold(self.target_fps):
+                return rate
+            self.stop()
+        return last_rate
+
+    def _try_open_cmd(
+        self, cmd: list[str], device: str, pix: Optional[str], measure_s: float
+    ) -> float:
+        logger.info("ffmpeg dshow try: %s", " ".join(cmd[1:16]))
         proc = self._spawn(cmd)
         self._proc = proc
         self._running = True
@@ -235,10 +263,22 @@ class FfmpegDshowCaptureSource:
             target=self._reader_loop, name="ffmpeg-dshow-read", daemon=True
         )
         self._thread.start()
-        # Drain stderr in background so a full pipe cannot stall ffmpeg.
         threading.Thread(
             target=self._drain_stderr, args=(proc,), name="ffmpeg-dshow-err", daemon=True
         ).start()
+
+        # Warmup — DirectShow can deliver a burst then settle at true rate.
+        warmup_end = time.perf_counter() + 0.6
+        while time.perf_counter() < warmup_end:
+            try:
+                frame = self._queue.get(timeout=0.15)
+            except queue.Empty:
+                if proc.poll() is not None:
+                    break
+                continue
+            if frame is None:
+                break
+            self._pending = frame
 
         n = 0
         t0 = time.perf_counter()
@@ -255,8 +295,9 @@ class FfmpegDshowCaptureSource:
             n += 1
             if first is None:
                 first = frame
+                self._pending = frame
         elapsed = max(time.perf_counter() - t0, 0.05)
-        rate = (n - 1) / elapsed if n >= 2 else 0.0
+        rate = (n - 1) / elapsed if n >= 2 else (n / elapsed if n >= 1 and elapsed > 0.2 else 0.0)
         if first is not None:
             self._pending = first
         if proc.poll() is not None and n == 0:

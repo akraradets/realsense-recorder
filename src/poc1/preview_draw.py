@@ -98,6 +98,6 @@ def hud_lines_for_source(slot, src) -> list[str]:
         from poc1.app.user_messages import capture_not_120_hud_hint
 
         lines.append(capture_not_120_hud_hint(camera_fps, mode_fps, stamped))
-    elif kind == "realsense" and requested >= 90:
+    elif kind == "realsense" and mode_fps >= 90:
         lines.append("D400 color is not 120fps")
     return lines

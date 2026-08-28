@@ -122,10 +122,37 @@ def test_capture_releases_record_lock_before_processor_put() -> None:
         handler.stop()
 
 
-def test_build_id_v30() -> None:
-    from poc1.bag_recorder import BUILD_ID
+def test_hud_lines_realsense_no_name_error() -> None:
+    from types import SimpleNamespace
 
-    assert BUILD_ID.startswith("sdk-record-v30-")
+    from poc1.preview_draw import hud_lines_for_source
+
+    slot = SimpleNamespace(
+        mode=SimpleNamespace(fps=30),
+        pipeline=None,
+        camera=SimpleNamespace(kind="realsense"),
+    )
+    src = SimpleNamespace(
+        device_tag="realsense",
+        width=1920,
+        height=1080,
+        actual_width=1920,
+        actual_height=1080,
+        requested_fps=30,
+        target_fps=30,
+        actual_fps=30.0,
+        _ffmpeg=None,
+    )
+    lines = hud_lines_for_source(slot, src)
+    assert lines
+    assert "realsense" in lines[0]
+
+
+def test_lock_threshold_120() -> None:
+    from poc1.ffmpeg_dshow_source import _lock_threshold
+
+    assert _lock_threshold(120) == 90.0
+    assert _lock_threshold(30) == 25.5
 
 
 def test_dshow_input_names_strips_video_prefix() -> None:

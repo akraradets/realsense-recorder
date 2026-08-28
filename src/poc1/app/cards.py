@@ -1,11 +1,14 @@
 """Setup-page camera card for the unified app."""
 from __future__ import annotations
 
+import logging
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import TYPE_CHECKING, Optional
 
 from PIL import Image, ImageTk
+
+logger = logging.getLogger("poc1.app.cards")
 
 from poc1.app.theme import (
     ACCENT,
@@ -414,6 +417,9 @@ class CameraCard(tk.Frame):
         th = max(self.preview_shell.winfo_height() - 4, 160)
         rgb = bgr_to_rgb_fill(frame, tw, th)
         if src is not None:
-            rgb = overlay_hud(rgb, hud_lines_for_source(slot, src))
+            try:
+                rgb = overlay_hud(rgb, hud_lines_for_source(slot, src))
+            except Exception:  # noqa: BLE001
+                logger.exception("HUD overlay failed for slot %d", self.slot_id)
         self._photo = ImageTk.PhotoImage(Image.fromarray(rgb))
         self.preview.configure(image=self._photo, text="")
