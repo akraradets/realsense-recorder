@@ -116,8 +116,15 @@ class Pipeline:
     def start_preview(self) -> None:
         if self._preview_started:
             return
+        if getattr(self.source, "device_tag", "") == "elgato":
+            setattr(self.source, "_fast_preview_open", True)
         self.viewer.start()
         self.camera_handler.start()
+        if hasattr(self.source, "_fast_preview_open"):
+            try:
+                delattr(self.source, "_fast_preview_open")
+            except AttributeError:
+                pass
         self._preview_started = True
         logger.info("Preview started")
 
@@ -163,6 +170,24 @@ class Pipeline:
             or 30
         )
         self.source.requested_fps = self._requested_fps
+
+        # Elgato: try ffmpeg/dshow 120 lock at Record (preview stays fast).
+        if tag == "elgato" and self._requested_fps >= 90:
+            upgrade = getattr(self.source, "try_upgrade_high_rate", None)
+            if callable(upgrade):
+                try:
+                    self.camera_handler.pause_reads()
+                    try:
+                        if upgrade():
+                            logger.info(
+                                "Elgato upgraded to high-rate for Record (~%.1ffps)",
+                                float(getattr(self.source, "actual_fps", 0) or 0),
+                            )
+                    finally:
+                        self.camera_handler.resume_reads()
+                except Exception:  # noqa: BLE001
+                    logger.warning("Elgato high-rate upgrade failed — continuing at measured rate")
+
         self._align_capture_fps()
 
         # Compression lives in the processor; recorder only accounts encoded tokens.

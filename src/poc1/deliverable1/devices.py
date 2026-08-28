@@ -920,41 +920,42 @@ def _elgato_open_targets(
     *,
     max_index: int = 8,
     dshow_only: bool = False,
+    named_only: bool = False,
 ) -> list[tuple[Any, int]]:
     """
     Ordered OpenCV open attempts for Elgato 4K X / HD60.
 
-    Prefer ffmpeg DirectShow names, then scan indices (PnP index is unreliable).
-    For high-rate lock passes, use dshow_only=True (MSMF often caps Elgato at 60).
+    Prefer ffmpeg DirectShow names. **Never scan raw indices when a named
+    ``open_path`` is known** — index 0/1 is often RealSense UVC, not Elgato.
     """
     targets: list[tuple[Any, int]] = []
     name_paths = list(elgato_open_name_paths())
     if open_path and open_path not in name_paths:
         name_paths.insert(0, open_path)
 
-    # 1) DirectShow by friendly name (ffmpeg-aligned preferred).
     for path in name_paths:
         targets.append((path, cv2.CAP_DSHOW))
 
-    # 2) Scan OpenCV indices — do not trust PnP/synthetic index alone.
-    indices = list(range(max_index))
-    if device_index not in indices and 0 <= device_index < 100:
-        indices.insert(0, device_index)
-    for idx in indices:
-        targets.append((idx, cv2.CAP_DSHOW))
+    # Index scan only when no explicit ``video=`` path — avoids opening RealSense
+    # at index 0 when the operator picked a named Elgato device.
+    use_index = not named_only and not open_path
+    if use_index:
+        indices = list(range(max_index))
+        if device_index not in indices and 0 <= device_index < 100:
+            indices.insert(0, device_index)
+        for idx in indices:
+            targets.append((idx, cv2.CAP_DSHOW))
 
-    if dshow_only:
+    if dshow_only or not use_index:
         return targets
 
-    # 3) MSMF last-resort for Elgato 4K X when DSHOW fails on Station A.
     for path in name_paths:
         targets.append((path, cv2.CAP_MSMF))
-    for idx in indices[:4]:
-        targets.append((idx, cv2.CAP_MSMF))
-
-    # 4) CAP_ANY
-    for idx in indices[:4]:
-        targets.append((idx, cv2.CAP_ANY))
+    if use_index:
+        for idx in indices[:4]:
+            targets.append((idx, cv2.CAP_MSMF))
+        for idx in indices[:4]:
+            targets.append((idx, cv2.CAP_ANY))
 
     return targets
 
@@ -1217,23 +1218,30 @@ class FormattedUvcSource(CvCaptureSource):
         return (n - 1) / elapsed
 
     def _elgato_measure_high_rate(
-        self, cap: cv2.VideoCapture, fps: int
+        self, cap: cv2.VideoCapture, fps: int, *, fast: bool = False
     ) -> float:
-        """Longer settle + retries so DirectShow can lock 120 like OBS."""
+        """Sample delivery rate. ``fast=True`` for preview (sub-second, no retries)."""
         self._cap = cap
+        if fast:
+            for _ in range(12):
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    self._pending_frame = np.ascontiguousarray(frame)
+            measured = self._measure_delivery_fps(0.45)
+            return measured
+
         best = 0.0
-        for attempt in range(3):
+        for attempt in range(2):
             if attempt > 0:
                 w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or self.width or 1920)
                 h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or self.height or 1080)
                 self._elgato_configure_obs_pin(cap, w, h, fps)
-                time.sleep(0.45)
-            for _ in range(60 if attempt == 0 else 40):
+                time.sleep(0.25)
+            for _ in range(40):
                 ok, frame = cap.read()
                 if ok and frame is not None:
                     self._pending_frame = np.ascontiguousarray(frame)
-            # Longer window on later attempts — short samples under-count toward ~60.
-            window = 1.2 if attempt == 0 else 2.0
+            window = 1.0 if attempt == 0 else 1.5
             measured = self._measure_delivery_fps(window)
             best = max(best, measured)
             logger.info(
@@ -1246,6 +1254,27 @@ class FormattedUvcSource(CvCaptureSource):
                 return measured
         return best
 
+    def try_upgrade_high_rate(self) -> bool:
+        """
+        Record-time only: try ffmpeg/dshow when preview opened soft ~60.
+
+        Returns True if delivery is now ≥90 fps. Never blocks preview startup.
+        """
+        if self.device_tag != "elgato":
+            return False
+        requested = int(getattr(self, "requested_fps", 0) or self.target_fps or 0)
+        if requested < 90:
+            return False
+        if float(self.actual_fps or 0) >= 90.0:
+            return True
+        rate = self._adopt_ffmpeg_high_rate(
+            self.width,
+            self.height,
+            requested,
+            release_caps=None,
+        )
+        return rate is not None and rate >= 90.0
+
     def start(self) -> None:
         with quiet_opencv():
             wanted_w, wanted_h = self.width, self.height
@@ -1253,6 +1282,8 @@ class FormattedUvcSource(CvCaptureSource):
             self.requested_fps = wanted_fps
             wanted_fmt = (self.pixel_format or "bgr8").lower()
             is_elgato = self.device_tag == "elgato"
+            # Preview must return in seconds — full 120 lock + ffmpeg is Record-only.
+            fast_preview = bool(getattr(self, "_fast_preview_open", False))
 
             if is_elgato:
                 if not ffmpeg_available():
@@ -1260,7 +1291,6 @@ class FormattedUvcSource(CvCaptureSource):
                         "ffmpeg not available — Elgato open may fail with PnP-only names. "
                         "Install ffmpeg on PATH, then Refresh."
                     )
-                # Prefer the Setup dropdown mode first, then common HDMI fallbacks.
                 profiles = elgato_open_profiles(
                     wanted_w, wanted_h, wanted_fps, wanted_fmt
                 )
@@ -1311,22 +1341,24 @@ class FormattedUvcSource(CvCaptureSource):
             ] or [(wanted_w, wanted_h, wanted_fps, "mjpg")]
 
             if is_elgato:
-                # High-rate: DSHOW-only first (MSMF often caps Elgato at 60). Two
-                # passes so we reopen after OBS-style pin retries fail.
+                named_only = bool(self.open_path and str(self.open_path).startswith("video="))
                 if want_high:
                     open_targets = _elgato_open_targets(
                         self.open_path,
                         int(self.device_index or 0),
                         dshow_only=True,
+                        named_only=named_only or fast_preview,
                     )
-                    # Three exclusive DSHOW passes with a short settle between —
-                    # OBS often needs a reopen after another app released the pin.
-                    open_targets = open_targets + open_targets + open_targets
+                    # One DSHOW pass at preview; second pass only on full Record upgrade.
+                    if not fast_preview:
+                        open_targets = open_targets + open_targets
                 else:
                     open_targets = _elgato_open_targets(
-                        self.open_path, int(self.device_index or 0)
+                        self.open_path,
+                        int(self.device_index or 0),
+                        named_only=named_only,
                     )
-                open_timeout = 6.0
+                open_timeout = 4.0 if fast_preview else 6.0
             else:
                 open_targets = []
                 if self.open_path and sys.platform == "win32":
@@ -1341,14 +1373,11 @@ class FormattedUvcSource(CvCaptureSource):
 
             profile_list = high_only if want_high else unique_profiles
             seen_open: set[tuple[str, int]] = set()
-            pass_n = 0
             for target, backend in open_targets:
                 ok_key = (str(target), int(backend))
-                # Allow repeated DSHOW passes for high-rate (exclusive pin after OBS).
-                if want_high:
+                if want_high and not fast_preview:
                     if ok_key in seen_open:
-                        pass_n += 1
-                        time.sleep(0.55)
+                        time.sleep(0.35)
                     seen_open.add(ok_key)
                 else:
                     if ok_key in seen_open:
@@ -1405,7 +1434,9 @@ class FormattedUvcSource(CvCaptureSource):
                     owned = np.ascontiguousarray(frame)
                     self._pending_frame = owned
                     if is_elgato and fps >= 90:
-                        measured = self._elgato_measure_high_rate(cap, fps)
+                        measured = self._elgato_measure_high_rate(
+                            cap, fps, fast=fast_preview
+                        )
                     else:
                         measured = 0.0
                     reported = float(cap.get(cv2.CAP_PROP_FPS) or 0)
@@ -1572,16 +1603,25 @@ class FormattedUvcSource(CvCaptureSource):
                         except Exception:  # noqa: BLE001
                             pass
                 if chosen is None and best_effort is not None:
-                    pass  # soft path handled below via ffmpeg then reopen
+                    pass  # handled below
 
-            # OBS shows 120 while OpenCV soft-locks ~60: switch to ffmpeg dshow.
             soft = None
             if want_high and chosen is not None and float(chosen[0]) < 90.0:
                 soft = chosen
                 chosen = None
             elif want_high and chosen is None and best_effort is not None:
                 soft = best_effort
-            if want_high and chosen is None:
+
+            # Preview: accept soft ~60 quickly so RealSense can start; Record upgrades later.
+            if fast_preview and chosen is None and soft is not None:
+                chosen = soft
+                logger.info(
+                    "Elgato preview fast-open ~%.1ffps (120 lock deferred to Record)",
+                    soft[0],
+                )
+
+            # ffmpeg/dshow is Record-only — preview must not block ~10min here.
+            if want_high and chosen is None and not fast_preview:
                 if soft is not None:
                     logger.warning(
                         "Elgato OpenCV soft-open at ~%.1ffps — trying ffmpeg/dshow "
@@ -1713,7 +1753,10 @@ class FormattedUvcSource(CvCaptureSource):
     ) -> Optional[tuple]:
         """Re-open same-res OpenCV after a failed ffmpeg attempt freed the device."""
         open_targets = _elgato_open_targets(
-            self.open_path, int(self.device_index or 0), dshow_only=True
+            self.open_path,
+            int(self.device_index or 0),
+            dshow_only=True,
+            named_only=bool(self.open_path and str(self.open_path).startswith("video=")),
         )
         for target, backend in open_targets:
             try:
@@ -1800,10 +1843,12 @@ class FormattedUvcSource(CvCaptureSource):
         primary = dshow_device_name(self.open_path, fallback="")
         if primary:
             names.append(primary)
-        for path in elgato_open_name_paths():
-            n = dshow_device_name(path, fallback="")
-            if n and n not in names:
-                names.append(n)
+        # Only try other Elgato names if the assigned path failed — never all indices.
+        if not primary:
+            for path in elgato_open_name_paths():
+                n = dshow_device_name(path, fallback="")
+                if n and n not in names:
+                    names.append(n)
         if not names:
             names = ["Elgato"]
 

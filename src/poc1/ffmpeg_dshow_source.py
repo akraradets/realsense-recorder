@@ -157,13 +157,13 @@ class FfmpegDshowCapture:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     stdin=subprocess.DEVNULL,
-                    bufsize=self._frame_bytes * 8,
+                    bufsize=self._frame_bytes * 4,
                 )
             except OSError as exc:
                 last_err = str(exc)
                 self._proc = None
                 continue
-            measured = self._measure(seconds=2.0)
+            measured = self._measure(seconds=1.0)
             if measured >= 90.0:
                 self.actual_fps = measured
                 self._pixel_format_used = pix or "auto"

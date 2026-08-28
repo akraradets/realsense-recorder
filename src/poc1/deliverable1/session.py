@@ -252,45 +252,20 @@ class MultiCamSession:
             raise RuntimeError(f"Slot {slot_id}: assign camera + mode first")
         if slot.pipeline is not None:
             return
-        # Pause companions while locking Elgato @≥90 so DirectShow gets an
-        # exclusive pin (dual-cam USB contention otherwise settles ~60).
-        paused: list = []
-        want_high = (
-            slot.camera.device_tag == "elgato"
-            and slot.mode is not None
-            and int(slot.mode.fps) >= 90
+        # Never silently substitute a simulated RealSense for a hardware pick.
+        source = build_frame_source(
+            slot.camera, slot.mode, allow_simulate_realsense=False
         )
-        if want_high:
-            for other in self.slots:
-                if other.slot_id == slot_id or other.pipeline is None:
-                    continue
-                try:
-                    other.pipeline.camera_handler.pause_reads(timeout=1.5)
-                    paused.append(other)
-                except Exception:  # noqa: BLE001
-                    pass
-        try:
-            # Never silently substitute a simulated RealSense for a hardware pick.
-            source = build_frame_source(
-                slot.camera, slot.mode, allow_simulate_realsense=False
-            )
-            # Preview must never enable SDK record_to_file (some SDKs reject .bag
-            # and would fail Start preview when the checkbox is on).
-            clear_bag_on_source(source)
-            pipe = Pipeline(source=source, on_preview_frame=slot.on_preview)
-            pipe.start_preview()
-            slot.pipeline = pipe
-            slot.status = f"preview {slot.camera.kind} {slot.mode.label()}"
-            if slot.record_bag and slot.camera.kind == "realsense":
-                slot.status += " (.bag/.db3 on Record)"
-            logger.info("Slot %d preview started (%s)", slot_id, slot.status)
-        finally:
-            for other in paused:
-                try:
-                    assert other.pipeline is not None
-                    other.pipeline.camera_handler.resume_reads()
-                except Exception:  # noqa: BLE001
-                    pass
+        # Preview must never enable SDK record_to_file (some SDKs reject .bag
+        # and would fail Start preview when the checkbox is on).
+        clear_bag_on_source(source)
+        pipe = Pipeline(source=source, on_preview_frame=slot.on_preview)
+        pipe.start_preview()
+        slot.pipeline = pipe
+        slot.status = f"preview {slot.camera.kind} {slot.mode.label()}"
+        if slot.record_bag and slot.camera.kind == "realsense":
+            slot.status += " (.bag/.db3 on Record)"
+        logger.info("Slot %d preview started (%s)", slot_id, slot.status)
 
     def stop_slot_preview(self, slot_id: int) -> None:
         slot = self.slots[slot_id]
@@ -308,28 +283,15 @@ class MultiCamSession:
     def start_previews(self) -> None:
         """R3 — start preview on every assigned slot.
 
-        When any Elgato is @≥90, open Elgato first (exclusive DirectShow pin like
-        OBS) then RealSense. Otherwise RealSense-first (USB settle for Station A).
+        RealSense SDK first (USB settle), then Elgato. Elgato preview uses a
+        fast named-path open; 120 lock + ffmpeg run at Record only.
         """
         errors: list[str] = []
-        want_elgato_first = any(
-            s.camera is not None
-            and s.camera.device_tag == "elgato"
-            and s.mode is not None
-            and int(s.mode.fps) >= 90
-            for s in self.slots
-        )
 
         def _order(slot: CameraSlot) -> tuple:
             cam = slot.camera
             if cam is None:
                 return (9, slot.slot_id)
-            if want_elgato_first:
-                if cam.device_tag == "elgato":
-                    return (0, slot.slot_id)
-                if cam.kind == "realsense":
-                    return (1, slot.slot_id)
-                return (2, slot.slot_id)
             if cam.kind == "realsense":
                 return (0, slot.slot_id)
             if cam.device_tag == "elgato":
@@ -346,7 +308,7 @@ class MultiCamSession:
                 # Brief pause so USB / exclusive access settles before the next open.
                 if slot.camera and (
                     slot.camera.kind == "realsense"
-                    or (want_elgato_first and slot.camera.device_tag == "elgato")
+                    or slot.camera.device_tag == "elgato"
                 ):
                     time.sleep(0.35)
             except Exception as exc:  # noqa: BLE001

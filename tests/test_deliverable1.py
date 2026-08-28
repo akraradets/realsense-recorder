@@ -298,12 +298,17 @@ def test_elgato_open_targets_prefer_dshow_then_index_then_msmf(monkeypatch):
     monkeypatch.setattr(
         dev, "elgato_open_name_paths", lambda: ["video=Elgato 4K X"]
     )
-    targets = dev._elgato_open_targets("video=Elgato 4K X", device_index=0, max_index=3)
+    # Named path: DSHOW by name only (no index scan — index 0 is often RealSense).
+    named = dev._elgato_open_targets(
+        "video=Elgato 4K X", device_index=0, max_index=3, named_only=True
+    )
+    assert named == [("video=Elgato 4K X", cv2.CAP_DSHOW)]
+
+    # No name at all: fall back to index scan + MSMF.
+    targets = dev._elgato_open_targets(None, device_index=0, max_index=3)
     assert targets[0] == ("video=Elgato 4K X", cv2.CAP_DSHOW)
-    # Index scan after named DSHOW
     assert (0, cv2.CAP_DSHOW) in targets
     assert (1, cv2.CAP_DSHOW) in targets
-    # MSMF appears after DSHOW index attempts
     dshow_idxs = [i for i, (t, b) in enumerate(targets) if b == cv2.CAP_DSHOW]
     msmf_idxs = [i for i, (t, b) in enumerate(targets) if b == cv2.CAP_MSMF]
     assert msmf_idxs and max(dshow_idxs) < min(msmf_idxs)

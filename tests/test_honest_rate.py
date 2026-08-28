@@ -122,10 +122,25 @@ def test_capture_releases_record_lock_before_processor_put() -> None:
         handler.stop()
 
 
-def test_build_id_v29() -> None:
+def test_build_id_v30() -> None:
     from poc1.bag_recorder import BUILD_ID
 
-    assert BUILD_ID.startswith("sdk-record-v29-")
+    assert BUILD_ID.startswith("sdk-record-v30-")
+
+
+def test_elgato_open_targets_named_only_skips_index_scan() -> None:
+    from poc1.deliverable1.devices import _elgato_open_targets
+
+    targets = _elgato_open_targets(
+        "video=Elgato 4K S",
+        2,
+        dshow_only=True,
+        named_only=True,
+    )
+    assert targets
+    assert all(isinstance(t[0], str) for t in targets)
+    assert all(t[0].startswith("video=") for t in targets)
+    assert not any(isinstance(t[0], int) for t in targets)
 
 
 def test_ffmpeg_dshow_cmd_obs_parity_pin() -> None:
