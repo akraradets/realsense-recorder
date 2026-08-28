@@ -21,6 +21,8 @@ import cv2
 
 from poc1.camera_handler import DropCountingQueue, FrameEnvelope
 from poc1.codec import choose_best_fourcc
+from poc1.frame_layout import ensure_bgr
+from poc1.frame_source import embed_seq_barcode
 
 logger = logging.getLogger("poc1.processor")
 
@@ -160,10 +162,13 @@ class Processor:
         with self._encode_lock:
             if self._writer is None:
                 return
-            frame = env.frame
+            frame = ensure_bgr(env.frame, self.height, self.width)
             h, w = frame.shape[:2]
             if w != self.width or h != self.height:
                 frame = cv2.resize(frame, (self.width, self.height))
+
+            if env.seq >= 0:
+                embed_seq_barcode(frame, env.seq)
 
             t0 = time.perf_counter()
             self._writer.write(frame)

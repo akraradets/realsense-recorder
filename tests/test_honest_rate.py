@@ -183,6 +183,32 @@ def test_pixel_formats_to_try_mjpg_first() -> None:
     assert order[0] == "vcodec_mjpeg"
 
 
+def test_pipe_pix_fmt_nv12_for_high_rate() -> None:
+    from poc1.frame_layout import PIPE_BGR24, PIPE_NV12, frame_bytes, pipe_pix_fmt_for_fps
+    from poc1.ffmpeg_dshow_source import FfmpegDshowCaptureSource
+
+    assert pipe_pix_fmt_for_fps(120) == PIPE_NV12
+    assert pipe_pix_fmt_for_fps(30) == PIPE_BGR24
+    assert frame_bytes(1920, 1080, PIPE_NV12) == 1920 * 1080 * 3 // 2
+    ff = FfmpegDshowCaptureSource(1920, 1080, 120, device_names=["Elgato 4K X"])
+    assert ff.pipe_pix_fmt == PIPE_NV12
+    cmd = ff._build_cmd("Elgato 4K X", "vcodec_mjpeg")
+    assert cmd[cmd.index("-pix_fmt") + 1] == "nv12"
+    assert "-vcodec" in cmd and "mjpeg" in cmd
+
+
+def test_ensure_bgr_nv12_and_bgr() -> None:
+    import numpy as np
+
+    from poc1.frame_layout import ensure_bgr
+
+    bgr = np.zeros((48, 64, 3), dtype=np.uint8)
+    assert ensure_bgr(bgr, 48, 64) is bgr
+    nv12 = np.zeros((72, 64), dtype=np.uint8)
+    out = ensure_bgr(nv12, 48, 64)
+    assert out.shape == (48, 64, 3)
+
+
 def test_wait_recorded_frames_true_when_armed() -> None:
     import time
 

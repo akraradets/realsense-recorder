@@ -2,7 +2,8 @@
 ffmpeg DirectShow capture for Elgato @1080p120 (OBS-equivalent pin).
 
 OpenCV CAP_DSHOW often soft-opens ~60 while OBS/ffmpeg lock 120 on the same HDMI.
-This module spawns ``ffmpeg -f dshow`` and reads decoded BGR24 frames from stdout.
+This module spawns ``ffmpeg -f dshow`` and reads raw frames from stdout (NV12 at
+≥90fps to halve pipe bandwidth; BGR24 otherwise).
 """
 from __future__ import annotations
 
@@ -17,6 +18,12 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+from poc1.frame_layout import (
+    frame_bytes,
+    pipe_pix_fmt_for_fps,
+    reshape_raw_frame,
+)
 
 logger = logging.getLogger("poc1.ffmpeg_dshow")
 
@@ -98,7 +105,7 @@ def _lock_threshold(requested_fps: int) -> float:
 
 
 class FfmpegDshowCaptureSource:
-    """Read BGR frames from ``ffmpeg -f dshow`` stdout."""
+    """Read raw frames from ``ffmpeg -f dshow`` stdout (NV12 or BGR24)."""
 
     allow_fps_remux = True
 
@@ -111,6 +118,7 @@ class FfmpegDshowCaptureSource:
         device_names: list[str],
         pixel_format: str = "mjpg",
         device_tag: str = "elgato",
+        pipe_pix_fmt: Optional[str] = None,
     ) -> None:
         self.width = int(width)
         self.height = int(height)
@@ -126,7 +134,8 @@ class FfmpegDshowCaptureSource:
         self._proc: Optional[subprocess.Popen] = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
-        self._frame_bytes = self.width * self.height * 3
+        self.pipe_pix_fmt = pipe_pix_fmt or pipe_pix_fmt_for_fps(self.target_fps)
+        self._frame_bytes = frame_bytes(self.width, self.height, self.pipe_pix_fmt)
         self._queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=8)
         self._pending: Optional[np.ndarray] = None
         self._active_device = ""
@@ -168,12 +177,13 @@ class FfmpegDshowCaptureSource:
                         self._active_device = device
                         self._active_input_mode = mode
                         logger.info(
-                            "ffmpeg dshow LOCKED %s %dx%d@%d mode=%s measured ~%.1ffps",
+                            "ffmpeg dshow LOCKED %s %dx%d@%d mode=%s pipe=%s measured ~%.1ffps",
                             device,
                             self.width,
                             self.height,
                             want,
                             mode,
+                            self.pipe_pix_fmt,
                             rate,
                         )
                         return
@@ -226,7 +236,7 @@ class FfmpegDshowCaptureSource:
             f"video={device}",
             "-an",
             "-pix_fmt",
-            "bgr24",
+            self.pipe_pix_fmt,
             "-f",
             "rawvideo",
             "pipe:1",
@@ -340,8 +350,8 @@ class FfmpegDshowCaptureSource:
                 buf = stdout.read(nbytes)
                 if len(buf) != nbytes:
                     break
-                frame = np.frombuffer(buf, dtype=np.uint8).reshape(
-                    self.height, self.width, 3
+                frame = reshape_raw_frame(
+                    buf, self.width, self.height, self.pipe_pix_fmt
                 )
                 owned = np.ascontiguousarray(frame)
                 try:

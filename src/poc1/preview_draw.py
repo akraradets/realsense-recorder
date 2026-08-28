@@ -4,12 +4,15 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from poc1.frame_layout import PIPE_NV12, ensure_bgr
+
 # Preview copies stay small so Tk stays responsive at 1080p/120 capture.
 PREVIEW_MAX_WIDTH = 960
 PREVIEW_HZ = 15.0
 
 
-def downscale_for_preview(bgr: np.ndarray, max_width: int = PREVIEW_MAX_WIDTH) -> np.ndarray:
+def downscale_for_preview(frame: np.ndarray, max_width: int = PREVIEW_MAX_WIDTH) -> np.ndarray:
+    bgr = ensure_bgr(frame, 0, 0)
     h, w = bgr.shape[:2]
     if w <= max_width:
         return bgr.copy()
@@ -38,7 +41,8 @@ def fill_bgr(bgr: np.ndarray, dest_w: int, dest_h: int) -> np.ndarray:
     return crop
 
 
-def bgr_to_rgb_fill(bgr: np.ndarray, dest_w: int, dest_h: int) -> np.ndarray:
+def bgr_to_rgb_fill(frame: np.ndarray, dest_w: int, dest_h: int) -> np.ndarray:
+    bgr = ensure_bgr(frame, 0, 0)
     return cv2.cvtColor(fill_bgr(bgr, dest_w, dest_h), cv2.COLOR_BGR2RGB)
 
 
@@ -92,6 +96,9 @@ def hud_lines_for_source(slot, src) -> list[str]:
     lines = [line1, f"delivery ~{camera_fps:.0f} fps  (file stamp {stamped})"]
     if getattr(src, "_ffmpeg", None) is not None:
         lines.append("capture: ffmpeg DirectShow (OBS pin)")
+        ff = getattr(src, "_ffmpeg", None)
+        if ff is not None and getattr(ff, "pipe_pix_fmt", "") == PIPE_NV12:
+            lines.append("pipe: NV12 (BGR deferred)")
     if preview_fps > 1:
         lines.append(f"UI paint ~{preview_fps:.0f} fps (not file FPS)")
     if mode_fps >= 90 and camera_fps < mode_fps * 0.85 and tag == "elgato":

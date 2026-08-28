@@ -29,7 +29,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from poc1.frame_source import FrameSource, embed_seq_barcode
+from poc1.frame_source import FrameSource
 
 logger = logging.getLogger("poc1.camera_handler")
 
@@ -361,7 +361,6 @@ class CameraHandler:
                     self._seq += 1
                     self.frames_read += 1
                     self.frames_to_recorder += 1
-                    embed_seq_barcode(owned, seq)
                     env = FrameEnvelope(seq=seq, capture_ts=time.time(), frame=owned)
                 else:
                     env = FrameEnvelope(seq=-1, capture_ts=time.time(), frame=owned)
