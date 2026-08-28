@@ -1,18 +1,16 @@
 """
-ffmpeg DirectShow capture for Elgato — OBS-parity high-rate path.
+ffmpeg DirectShow capture for Elgato @1080p120 (OBS-equivalent pin).
 
-OpenCV CAP_DSHOW often soft-opens Elgato at ~60 while OBS locks 1080p120.
-ffmpeg's dshow demuxer negotiates the same pin OBS uses:
-
-    ffmpeg -f dshow -framerate 120 -video_size 1920x1080 -i video=<name> ...
-
-Frames are read as raw BGR24 from stdout on the camera-handler thread only.
+OpenCV CAP_DSHOW often soft-opens ~60 while OBS/ffmpeg lock 120 on the same HDMI.
+This module spawns ``ffmpeg -f dshow`` and reads decoded BGR24 frames from stdout.
 """
 from __future__ import annotations
 
 import logging
+import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -22,256 +20,331 @@ import numpy as np
 
 logger = logging.getLogger("poc1.ffmpeg_dshow")
 
+_DSHOW_PIX: dict[str, Optional[str]] = {
+    "mjpg": "mjpeg",
+    "mjpeg": "mjpeg",
+    "yuyv": "yuyv422",
+    "yuy2": "yuyv422",
+    "bgr8": None,
+    "rgb8": None,
+}
+
 
 def find_ffmpeg() -> Optional[str]:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg:
         return ffmpeg
-    candidates = [
+    if sys.platform != "win32":
+        return None
+    for path in (
         Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
         Path(r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"),
         Path.home() / "scoop" / "apps" / "ffmpeg" / "current" / "ffmpeg.exe",
         Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Links" / "ffmpeg.exe",
-    ]
-    for path in candidates:
+    ):
         if path.is_file():
             return str(path)
     return None
 
 
-def dshow_device_name(open_path: Optional[str], fallback: str = "Elgato") -> str:
-    """Strip ``video=`` prefix from OpenCV/ffmpeg open paths."""
-    raw = (open_path or "").strip()
-    if raw.lower().startswith("video="):
-        return raw[6:].strip().strip('"')
-    return raw.strip().strip('"') or fallback
+def dshow_input_names(open_path: Optional[str]) -> list[str]:
+    """Plain DirectShow device names for ffmpeg ``-i video=…``."""
+    from poc1.deliverable1.win_names import elgato_open_name_paths
+
+    names: list[str] = []
+
+    def _add(raw: str) -> None:
+        name = raw.strip()
+        if name.startswith("video="):
+            name = name[6:].strip()
+        if name and name not in names:
+            names.append(name)
+
+    if open_path:
+        _add(open_path)
+    for path in elgato_open_name_paths():
+        _add(path)
+    return names
 
 
-def build_ffmpeg_dshow_cmd(
-    ffmpeg: str,
-    device_name: str,
-    width: int,
-    height: int,
-    fps: int,
-    *,
-    pixel_format: Optional[str] = "mjpeg",
-) -> list[str]:
-    """Build an OBS-like dshow grab → raw BGR24 pipe command."""
-    # Options that select the capture pin must appear before ``-i``.
-    cmd = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-fflags",
-        "nobuffer",
-        "-flags",
-        "low_delay",
-        "-f",
-        "dshow",
-        "-rtbufsize",
-        "256M",
-        "-framerate",
-        str(int(fps)),
-        "-video_size",
-        f"{int(width)}x{int(height)}",
-    ]
-    if pixel_format:
-        cmd.extend(["-pixel_format", str(pixel_format)])
-    cmd.extend(
-        [
-            "-i",
-            f"video={device_name}",
-            "-an",
-            "-sn",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "bgr24",
-            "-",
-        ]
-    )
-    return cmd
+def _pixel_formats_to_try(requested_fmt: str) -> list[Optional[str]]:
+    fmt = (requested_fmt or "mjpg").lower()
+    primary = _DSHOW_PIX.get(fmt)
+    order: list[Optional[str]] = []
+    if primary is not None:
+        order.append(primary)
+    for extra in ("mjpeg", "yuyv422", None):
+        if extra not in order:
+            order.append(extra)
+    return order
 
 
-class FfmpegDshowCapture:
-    """
-    Owns one ffmpeg dshow process and yields BGR frames.
+class FfmpegDshowCaptureSource:
+    """Read BGR frames from ``ffmpeg -f dshow`` stdout."""
 
-    Used as a drop-in read() backend behind FormattedUvcSource when OpenCV
-    cannot lock ≥90 fps on Elgato.
-    """
+    allow_fps_remux = True
 
     def __init__(
         self,
-        device_name: str,
         width: int,
         height: int,
         fps: int,
         *,
-        ffmpeg_path: Optional[str] = None,
+        device_names: list[str],
+        pixel_format: str = "mjpg",
+        device_tag: str = "elgato",
     ) -> None:
-        self.device_name = device_name
         self.width = int(width)
         self.height = int(height)
-        self.target_fps = int(fps) if int(fps) > 0 else 120
-        self._ffmpeg = ffmpeg_path or find_ffmpeg()
+        self.target_fps = int(fps) if int(fps) > 0 else 30
+        self.requested_fps = self.target_fps
+        self.pixel_format = pixel_format
+        self.device_tag = device_tag
+        self.actual_fps = 0.0
+        self.actual_width = self.width
+        self.actual_height = self.height
+        self._device_names = [n for n in device_names if n]
+        self._ffmpeg: Optional[str] = find_ffmpeg()
         self._proc: Optional[subprocess.Popen] = None
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
         self._frame_bytes = self.width * self.height * 3
-        self.actual_fps: float = 0.0
-        self._pixel_format_used: str = "mjpeg"
-        self._read_lock = threading.Lock()
+        self._queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=8)
+        self._pending: Optional[np.ndarray] = None
+        self._active_device = ""
 
-    @property
-    def alive(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
-
-    def start(self) -> float:
-        """
-        Start ffmpeg and measure delivery FPS. Raises RuntimeError on failure.
-        Returns measured delivery rate.
-        """
+    def start(self) -> None:
+        if sys.platform != "win32":
+            raise RuntimeError("ffmpeg DirectShow capture is Windows-only")
         if not self._ffmpeg:
             raise RuntimeError(
-                "ffmpeg not found — install ffmpeg on PATH for Elgato 1080p120 "
-                "(OBS-parity DirectShow capture)."
+                "ffmpeg not found on PATH — install ffmpeg so Elgato can open at 1080p120 "
+                "(same pin OBS uses)."
             )
-        self.stop()
-        last_err = ""
-        best_soft = 0.0
-        # Try MJPEG first (matches OBS Custom MJPG pin), then yuyv, then default.
-        attempts: list[Optional[str]] = ["mjpeg", "yuyv422", None]
-        for pix in attempts:
-            cmd = build_ffmpeg_dshow_cmd(
-                self._ffmpeg,
-                self.device_name,
-                self.width,
-                self.height,
-                self.target_fps,
-                pixel_format=pix,
-            )
-            logger.info("Elgato ffmpeg/dshow try: %s", " ".join(cmd))
-            try:
-                self._proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    stdin=subprocess.DEVNULL,
-                    bufsize=self._frame_bytes * 4,
-                )
-            except OSError as exc:
-                last_err = str(exc)
-                self._proc = None
-                continue
-            measured = self._measure(seconds=1.0)
-            if measured >= 90.0:
-                self.actual_fps = measured
-                self._pixel_format_used = pix or "auto"
-                logger.info(
-                    "Elgato ffmpeg/dshow LOCKED ~%.1ffps at %dx%d (pix=%s) via %r",
-                    measured,
+        if not self._device_names:
+            raise RuntimeError("No DirectShow device name for ffmpeg Elgato capture")
+
+        want = self.target_fps
+        last_err = "no attempt"
+        for device in self._device_names:
+            for pix in _pixel_formats_to_try(self.pixel_format):
+                try:
+                    rate = self._try_open(device, pix, measure_s=2.0)
+                except Exception as exc:  # noqa: BLE001
+                    last_err = str(exc)
+                    logger.warning(
+                        "ffmpeg dshow open failed %s %dx%d@%d pix=%s: %s",
+                        device,
+                        self.width,
+                        self.height,
+                        want,
+                        pix,
+                        exc,
+                    )
+                    continue
+                if rate >= want * 0.85:
+                    self.actual_fps = rate
+                    self._active_device = device
+                    logger.info(
+                        "ffmpeg dshow LOCKED %s %dx%d@%d pix=%s measured ~%.1ffps",
+                        device,
+                        self.width,
+                        self.height,
+                        want,
+                        pix,
+                        rate,
+                    )
+                    return
+                self.stop()
+                last_err = f"{device} pix={pix} measured ~{rate:.1f}fps"
+                logger.warning(
+                    "ffmpeg dshow %s %dx%d@%d pix=%s only ~%.1ffps — retrying",
+                    device,
                     self.width,
                     self.height,
-                    self._pixel_format_used,
-                    self.device_name,
+                    want,
+                    pix,
+                    rate,
                 )
-                return measured
-            err = self._kill_and_stderr()
-            last_err = err or f"measured ~{measured:.1f}fps"
-            best_soft = max(best_soft, measured)
-            logger.warning(
-                "Elgato ffmpeg/dshow pin pix=%s delivered ~%.1f — trying next",
-                pix,
-                measured,
-            )
-        self.actual_fps = best_soft
+
         raise RuntimeError(
-            f"ffmpeg/dshow could not lock {self.width}x{self.height}@"
-            f"{self.target_fps} on {self.device_name!r} (best ~{best_soft:.1f}fps; "
-            f"{last_err}). Confirm HDMI is 1080p120 and OBS has fully Exit."
+            f"ffmpeg could not lock Elgato at {self.width}x{self.height}@{want} "
+            f"(last: {last_err}). Confirm HDMI is 1080p120 and OBS is fully exited."
         )
 
-    def _kill_and_stderr(self) -> str:
-        proc = self._proc
-        self._proc = None
-        if proc is None:
-            return ""
-        try:
-            proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            out = proc.communicate(timeout=2.0)
-            return (out[1] or b"").decode("utf-8", errors="replace")[:400]
-        except Exception:  # noqa: BLE001
-            return ""
+    def _build_cmd(self, device: str, pix: Optional[str]) -> list[str]:
+        assert self._ffmpeg
+        cmd = [
+            self._ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-nostdin",
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
+            "-f",
+            "dshow",
+            "-rtbufsize",
+            "150M",
+            "-video_size",
+            f"{self.width}x{self.height}",
+            "-framerate",
+            str(self.target_fps),
+        ]
+        if pix:
+            cmd.extend(["-pixel_format", pix])
+        cmd.extend(
+            [
+                "-i",
+                f"video={device}",
+                "-an",
+                "-pix_fmt",
+                "bgr24",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ]
+        )
+        return cmd
 
-    def _measure(self, seconds: float = 1.5) -> float:
-        if not self.alive:
-            return 0.0
+    def _spawn(self, cmd: list[str]) -> subprocess.Popen:
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=self._frame_bytes * 4,
+            creationflags=creationflags,
+        )
+
+    def _try_open(self, device: str, pix: Optional[str], measure_s: float) -> float:
+        cmd = self._build_cmd(device, pix)
+        logger.info("ffmpeg dshow try: %s", " ".join(cmd[1:14]))
+        proc = self._spawn(cmd)
+        self._proc = proc
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._reader_loop, name="ffmpeg-dshow-read", daemon=True
+        )
+        self._thread.start()
+        # Drain stderr in background so a full pipe cannot stall ffmpeg.
+        threading.Thread(
+            target=self._drain_stderr, args=(proc,), name="ffmpeg-dshow-err", daemon=True
+        ).start()
+
         n = 0
         t0 = time.perf_counter()
-        deadline = t0 + max(0.5, float(seconds))
-        while time.perf_counter() < deadline:
-            frame = self.read(timeout_s=1.2)
+        first: Optional[np.ndarray] = None
+        while time.perf_counter() - t0 < measure_s:
+            try:
+                frame = self._queue.get(timeout=0.25)
+            except queue.Empty:
+                if proc.poll() is not None:
+                    break
+                continue
             if frame is None:
-                if n == 0 and time.perf_counter() - t0 < 0.8:
-                    continue
                 break
             n += 1
-        elapsed = time.perf_counter() - t0
-        if n < 5 or elapsed < 0.2:
-            return 0.0
-        return (n - 1) / elapsed
-
-    def read(self, timeout_s: float = 2.0) -> Optional[np.ndarray]:
-        if self._proc is None or self._proc.stdout is None:
-            return None
-        if self._proc.poll() is not None:
-            return None
-        need = self._frame_bytes
-        stdout = self._proc.stdout
-        box: list[bytes] = []
-
-        def _worker() -> None:
+            if first is None:
+                first = frame
+        elapsed = max(time.perf_counter() - t0, 0.05)
+        rate = (n - 1) / elapsed if n >= 2 else 0.0
+        if first is not None:
+            self._pending = first
+        if proc.poll() is not None and n == 0:
+            err = ""
             try:
-                data = stdout.read(need)
-                if data:
-                    box.append(data)
+                err = (proc.stderr.read() or b"").decode("utf-8", errors="replace")[:400]
             except Exception:  # noqa: BLE001
                 pass
+            raise RuntimeError(err or "ffmpeg exited with no frames")
+        return rate
 
-        with self._read_lock:
-            t = threading.Thread(target=_worker, name="ffmpeg-dshow-read", daemon=True)
-            t.start()
-            t.join(timeout=max(0.3, float(timeout_s)))
-            if t.is_alive():
-                return None
-        if not box or len(box[0]) != need:
-            return None
-        return (
-            np.frombuffer(box[0], dtype=np.uint8)
-            .reshape((self.height, self.width, 3))
-            .copy()
-        )
-
-    def stop(self) -> None:
-        proc = self._proc
-        self._proc = None
-        if proc is None:
+    def _drain_stderr(self, proc: subprocess.Popen) -> None:
+        if proc.stderr is None:
             return
         try:
-            proc.terminate()
+            for line in proc.stderr:
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    logger.debug("ffmpeg: %s", text)
         except Exception:  # noqa: BLE001
             pass
+
+    def _reader_loop(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+        stdout = proc.stdout
+        nbytes = self._frame_bytes
         try:
-            proc.wait(timeout=2.0)
-        except Exception:  # noqa: BLE001
+            while self._running:
+                buf = stdout.read(nbytes)
+                if len(buf) != nbytes:
+                    break
+                frame = np.frombuffer(buf, dtype=np.uint8).reshape(
+                    self.height, self.width, 3
+                )
+                owned = np.ascontiguousarray(frame)
+                try:
+                    self._queue.put_nowait(owned)
+                except queue.Full:
+                    try:
+                        self._queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self._queue.put_nowait(owned)
+                    except queue.Full:
+                        pass
+        finally:
             try:
-                proc.kill()
+                self._queue.put_nowait(None)
+            except queue.Full:
+                pass
+
+    def read(self) -> Optional[np.ndarray]:
+        if self._pending is not None:
+            frame = self._pending
+            self._pending = None
+            return frame
+        if not self._running:
+            return None
+        try:
+            frame = self._queue.get(timeout=2.0)
+        except queue.Empty:
+            return None
+        return frame
+
+    def stop(self) -> None:
+        self._running = False
+        proc = self._proc
+        self._proc = None
+        if proc is not None:
+            try:
+                proc.terminate()
             except Exception:  # noqa: BLE001
                 pass
             try:
-                proc.wait(timeout=1.0)
+                proc.wait(timeout=2.0)
             except Exception:  # noqa: BLE001
-                pass
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break

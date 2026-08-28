@@ -128,39 +128,20 @@ def test_build_id_v30() -> None:
     assert BUILD_ID.startswith("sdk-record-v30-")
 
 
-def test_elgato_open_targets_named_only_skips_index_scan() -> None:
-    from poc1.deliverable1.devices import _elgato_open_targets
+def test_dshow_input_names_strips_video_prefix() -> None:
+    from poc1.ffmpeg_dshow_source import dshow_input_names
 
-    targets = _elgato_open_targets(
-        "video=Elgato 4K S",
-        2,
-        dshow_only=True,
-        named_only=True,
-    )
-    assert targets
-    assert all(isinstance(t[0], str) for t in targets)
-    assert all(t[0].startswith("video=") for t in targets)
-    assert not any(isinstance(t[0], int) for t in targets)
+    names = dshow_input_names("video=Elgato 4K S")
+    assert names
+    assert names[0] == "Elgato 4K S"
+    assert not names[0].startswith("video=")
 
 
-def test_ffmpeg_dshow_cmd_obs_parity_pin() -> None:
-    from poc1.ffmpeg_dshow_source import build_ffmpeg_dshow_cmd, dshow_device_name
+def test_pixel_formats_to_try_mjpg_first() -> None:
+    from poc1.ffmpeg_dshow_source import _pixel_formats_to_try
 
-    assert dshow_device_name("video=Elgato 4K X") == "Elgato 4K X"
-    cmd = build_ffmpeg_dshow_cmd(
-        "ffmpeg", "Elgato 4K X", 1920, 1080, 120, pixel_format="mjpeg"
-    )
-    assert cmd[0] == "ffmpeg"
-    assert "-f" in cmd and "dshow" in cmd
-    assert "-framerate" in cmd and "120" in cmd
-    assert "-video_size" in cmd and "1920x1080" in cmd
-    # Pin options must precede -i (OBS-like negotiation).
-    i_at = cmd.index("-i")
-    assert cmd.index("-framerate") < i_at
-    assert cmd.index("-video_size") < i_at
-    assert cmd[i_at + 1] == "video=Elgato 4K X"
-    assert cmd[-1] == "-"
-    assert "rawvideo" in cmd and "bgr24" in cmd
+    order = _pixel_formats_to_try("mjpg")
+    assert order[0] == "mjpeg"
 
 
 def test_wait_recorded_frames_true_when_armed() -> None:

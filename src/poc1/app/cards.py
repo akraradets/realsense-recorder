@@ -387,13 +387,14 @@ class CameraCard(tk.Frame):
             wanted = int(
                 getattr(src, "requested_fps", 0) or getattr(src, "target_fps", 0) or 0
             )
+            stamp = int(getattr(src, "target_fps", 0) or 0)
             if measured > 1:
-                status = f"{status} | camera ~{measured:.0f}fps"
+                status = f"{status} | delivery ~{measured:.0f}fps"
                 if wanted >= 90 and measured < wanted * 0.85:
+                    from poc1.app.user_messages import capture_not_120_status
+
                     status += (
-                        f" (Station HDMI ~{measured:.0f} — set mirrorless HDMI to "
-                        f"1080p120 for true 120; file stamped ~{measured:.0f}, "
-                        "not a software drop)"
+                        f" ({capture_not_120_status(wanted, measured, stamp)})"
                     )
         self.status_label.configure(text=status)
         try:

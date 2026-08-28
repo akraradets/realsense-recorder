@@ -23,6 +23,12 @@ from typing import Optional
 from PIL import Image, ImageTk
 
 from poc1.app.cards import CameraCard
+from poc1.app.user_messages import (
+    bag_file_missing,
+    capture_not_120_status,
+    no_frames_captured_message,
+    preview_failed_message,
+)
 from poc1.app.library import LibraryPage
 from poc1.preview_draw import bgr_to_rgb_fill, hud_lines_for_source, overlay_hud
 from poc1.app.theme import (
@@ -560,9 +566,11 @@ class UnifiedApp:
         self._clear_opening_placeholders()
         if error:
             self.set_status(f"Camera {slot_id + 1} preview failed.")
+            slot = self.session.slots[slot_id]
+            tag = getattr(slot.camera, "device_tag", "") if slot.camera else ""
             messagebox.showerror(
                 f"Camera {slot_id + 1}",
-                f"{error}\n\nClose other camera apps, then try again.",
+                preview_failed_message(slot_id, error, device_tag=tag),
             )
         else:
             try:
@@ -653,7 +661,9 @@ class UnifiedApp:
                 f"{slot.prefix}: requested {requested} fps, delivering ~{measured:.0f}"
             )
             if requested >= 90 and measured < requested * 0.85:
-                line += f" (HDMI source is not 120Hz; playback stamp ~{stamp})"
+                line += (
+                    f" ({capture_not_120_status(requested, measured, stamp)})"
+                )
             lines.append(line)
         return lines
 
@@ -945,16 +955,18 @@ class UnifiedApp:
             for prefix, r in reports.items()
             if r.get("bag_recorded")
         ]
-        bag_missing = [
-            prefix
-            for prefix, r in reports.items()
-            if "error" not in r
-            and self.session.bag_intent.get(
-                next((s.slot_id for s in self.session.slots if s.prefix == prefix), -1),
-                False,
+        bag_missing = []
+        for prefix, r in reports.items():
+            if "error" in r:
+                continue
+            slot_id = next(
+                (s.slot_id for s in self.session.slots if s.prefix == prefix), -1
             )
-            and not r.get("bag_recorded")
-        ]
+            if not self.session.bag_intent.get(slot_id, False):
+                continue
+            if not bag_file_missing(r):
+                continue
+            bag_missing.append(prefix)
         status = (
             "Saved cleanly — no frame drops."
             if ok
@@ -964,16 +976,11 @@ class UnifiedApp:
         if hdmi:
             bits = []
             for report in hdmi:
-                bits.append(
-                    f"requested {report.get('requested_fps')} → measured "
-                    f"~{float(report.get('measured_fps') or 0):.0f}, "
-                    f"file stamped {report.get('container_fps')}"
-                )
-            status += (
-                " HDMI source is not 120Hz ("
-                + "; ".join(bits)
-                + ") — playback stamp is measured rate, not a drop."
-            )
+                req = int(report.get("requested_fps") or 0)
+                meas = float(report.get("measured_fps") or 0)
+                stamp = report.get("container_fps")
+                bits.append(capture_not_120_status(req, meas, stamp))
+            status += " " + "; ".join(bits) + "."
         if any(r.get("r7_120_ok") for r in valid):
             status += " Elgato ~120 with no software drops."
         if bag_ok:
@@ -1022,21 +1029,16 @@ class UnifiedApp:
 
             messagebox.showerror(
                 "No frames captured",
-                "Preview looked live but Record counted 0 frames on cameras that "
-                "were actually recording:\n"
-                + "\n".join(f"• {line}" for line in no_capture)
-                + f"\n\nSave folder: {self.session.out_dir}\n\n"
-                "This is a Record-path miss (capture stalled or queue lock).\n"
-                "1) Stop all previews → Start preview on that camera alone.\n"
-                "2) Wait for moving live video in the HUD, then Record.\n"
-                "3) Try with bag unchecked first. Exit OBS only if it is running.\n"
-                f"Build: {BUILD_ID}.",
+                no_frames_captured_message(
+                    no_capture, str(self.session.out_dir), BUILD_ID
+                ),
             )
 
         mismatched = [
             (slot, reports.get(slot.prefix, {}))
             for slot in self.session.slots
             if reports.get(slot.prefix, {}).get("fps_mismatch")
+            and not reports.get(slot.prefix, {}).get("hdmi_not_120hz")
             and int(reports.get(slot.prefix, {}).get("frames_read_by_camera") or 0) > 0
         ]
         # Auto-fix remaining mismatches (Elgato already auto-fixed in pipeline).

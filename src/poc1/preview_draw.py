@@ -64,10 +64,15 @@ def hud_lines_for_source(slot, src) -> list[str]:
     tag = str(getattr(src, "device_tag", "") or kind or "cam")
     w = int(getattr(src, "actual_width", 0) or getattr(src, "width", 0) or 0)
     h = int(getattr(src, "actual_height", 0) or getattr(src, "height", 0) or 0)
-    opened_fps = int(getattr(src, "target_fps", 0) or 0)
-    requested = int(
-        getattr(src, "requested_fps", 0) or getattr(src, "target_fps", 0) or 0
+    # Line 1 = operator-selected mode; line 2 = measured delivery (not file stamp).
+    slot_mode = getattr(slot, "mode", None)
+    mode_fps = int(
+        getattr(src, "requested_fps", 0)
+        or (getattr(slot_mode, "fps", 0) if slot_mode is not None else 0)
+        or getattr(src, "target_fps", 0)
+        or 0
     )
+    stamped = int(getattr(src, "target_fps", 0) or 0)
     camera_fps = float(getattr(src, "actual_fps", 0) or 0)
     preview_fps = 0.0
     est = getattr(slot, "estimate_preview_fps", None)
@@ -81,17 +86,18 @@ def hud_lines_for_source(slot, src) -> list[str]:
             rec = "REC"
     except Exception:
         rec = ""
-    line1 = f"{tag}  {w}x{h}@{opened_fps}"
+    line1 = f"{tag}  {w}x{h}@{mode_fps}"
     if rec:
         line1 = f"{rec}  {line1}"
-    lines = [line1, f"requested {requested}  camera ~{camera_fps:.0f} fps"]
+    lines = [line1, f"delivery ~{camera_fps:.0f} fps  (file stamp {stamped})"]
+    if getattr(src, "_ffmpeg", None) is not None:
+        lines.append("capture: ffmpeg DirectShow (OBS pin)")
     if preview_fps > 1:
         lines.append(f"UI paint ~{preview_fps:.0f} fps (not file FPS)")
-    if requested >= 90 and camera_fps < requested * 0.85 and tag == "elgato":
-        lines.append(
-            f"Station HDMI is ~{camera_fps:.0f} — set mirrorless HDMI to 1080p120 "
-            f"for true 120 (file stamped ~{camera_fps:.0f} until then)"
-        )
+    if mode_fps >= 90 and camera_fps < mode_fps * 0.85 and tag == "elgato":
+        from poc1.app.user_messages import capture_not_120_hud_hint
+
+        lines.append(capture_not_120_hud_hint(camera_fps, mode_fps, stamped))
     elif kind == "realsense" and requested >= 90:
         lines.append("D400 color is not 120fps")
     return lines
