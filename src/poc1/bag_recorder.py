@@ -21,7 +21,7 @@ logger = logging.getLogger("poc1.bag")
 _RECORD_SUFFIX: Optional[str] = ".db3"
 
 # Build stamp so operators can confirm they are not on a stale Phue copy.
-BUILD_ID = "sdk-record-v34-2026-08-28"
+BUILD_ID = "sdk-record-v35-2026-08-28"
 
 
 def can_record_bag(source: Any) -> bool:
@@ -185,7 +185,7 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
                     source.stop()
                 except Exception:  # noqa: BLE001
                     pass
-                time.sleep(0.3 * attempt)
+                time.sleep(0.12 * attempt)
 
                 source.bag_path = candidate
                 source._bag_path = candidate
@@ -217,6 +217,12 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
                         raise RuntimeError("SDK created no record file after start")
 
                 set_recording_suffix(candidate.suffix)
+                flush = getattr(source, "flush_to_live", None)
+                if callable(flush):
+                    try:
+                        flush()
+                    except Exception:  # noqa: BLE001
+                        logger.debug("RealSense flush_to_live after bag arm failed", exc_info=True)
                 logger.info(
                     "RealSense record armed (try %d) -> %s (exists=%s size=%s)",
                     attempt,

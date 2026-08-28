@@ -121,6 +121,22 @@ class Pipeline:
         self._preview_started = True
         logger.info("Preview started")
 
+    def arm_sdk_bag(self, bag_path: Path) -> Path:
+        """Restart RealSense with enable_record_to_file before MP4 arming.
+
+        Preview stays unarmed. Elgato must not call this (ROS2 bag is deferred).
+        """
+        tag = str(getattr(self.source, "device_tag", "") or "")
+        if tag == "elgato":
+            raise RuntimeError("Elgato bag starts after Record frames are flowing")
+        self.camera_handler.pause_reads()
+        try:
+            active = start_bag_recording(self.source, bag_path)
+            self._bag_path = Path(active)
+        finally:
+            self.camera_handler.resume_reads()
+        return self._bag_path
+
     def start_recording(
         self,
         output_path: Path,
@@ -131,7 +147,7 @@ class Pipeline:
             self.start_preview()
         self.output_path = output_path
         self.monitor_csv = monitor_csv
-        self._bag_path = None
+        prearmed_bag = self._bag_path
         self._bag_written = None
         self._uvc_bag = None
         self.processor.sidecar_bag = None
@@ -148,6 +164,9 @@ class Pipeline:
         if bag_path is not None:
             if tag == "elgato":
                 pending_uvc_bag = Path(bag_path)
+                self._bag_path = None
+            elif prearmed_bag is not None:
+                self._bag_path = prearmed_bag
             else:
                 self.camera_handler.pause_reads()
                 try:
@@ -155,6 +174,8 @@ class Pipeline:
                     self._bag_path = Path(active)
                 finally:
                     self.camera_handler.resume_reads()
+        else:
+            self._bag_path = None
 
         # Capture cards / UVC often advertise 120 while HDMI only sends ~60.
         self._requested_fps = int(

@@ -214,6 +214,16 @@ class CameraHandler:
             time.sleep(0.005)
 
     def resume_reads(self) -> None:
+        flush = getattr(self.source, "flush_to_live", None)
+        if callable(flush):
+            try:
+                flush()
+            except Exception:  # noqa: BLE001
+                logger.debug("flush_to_live failed", exc_info=True)
+        try:
+            self.viewer_queue.clear()
+        except Exception:  # noqa: BLE001
+            pass
         self._paused.clear()
 
     def enable_recording(self) -> None:

@@ -442,6 +442,7 @@ class MultiCamSession:
             stamp = stamp or datetime.now().strftime("%Y%m%d_%H%M%S")
             paths: list[Path] = []
             started: list[CameraSlot] = []
+            jobs: list[tuple[CameraSlot, Path, Path, Optional[Path]]] = []
             try:
                 for s in armed:
                     if s.pipeline is not None:
@@ -490,6 +491,24 @@ class MultiCamSession:
                         want_bag,
                         bag,
                     )
+                    jobs.append((s, mp4, csv, bag))
+
+                # Restart RealSense with SDK bag *before* Elgato enable_recording
+                # so both MP4s share the same Record t=0.
+                for s, _mp4, _csv, bag in jobs:
+                    if bag is None or s.camera is None or s.camera.kind != "realsense":
+                        continue
+                    assert s.pipeline is not None
+                    try:
+                        s.pipeline.arm_sdk_bag(bag)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Camera {s.slot_id + 1} ({s.prefix}) could not arm "
+                            f"RealSense bag: {exc}"
+                        ) from exc
+
+                for s, mp4, csv, bag in jobs:
+                    assert s.pipeline is not None
                     try:
                         s.pipeline.start_recording(mp4, csv, bag_path=bag)
                     except Exception as exc:

@@ -2194,6 +2194,32 @@ class ConfiguredRealSenseSource:
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         return np.ascontiguousarray(frame)
 
+    def flush_to_live(self) -> None:
+        """Drop SDK-queued frames so preview/record starts at the live edge."""
+        self._pending_frame = None
+        if self._pipeline is None:
+            return
+        latest: Optional[np.ndarray] = None
+        deadline = time.perf_counter() + 0.25
+        while time.perf_counter() < deadline:
+            try:
+                poll = getattr(self._pipeline, "poll_for_frames", None)
+                frames = poll() if callable(poll) else None
+            except Exception:  # noqa: BLE001
+                break
+            if not frames:
+                break
+            bgr = self._frames_to_bgr(frames)
+            if bgr is not None:
+                latest = bgr
+        if latest is None:
+            try:
+                frames = self._pipeline.wait_for_frames(timeout_ms=200)
+                latest = self._frames_to_bgr(frames)
+            except Exception:  # noqa: BLE001
+                latest = None
+        self._pending_frame = latest
+
     def read(self) -> Optional[np.ndarray]:
         if self._pending_frame is not None:
             frame = self._pending_frame
