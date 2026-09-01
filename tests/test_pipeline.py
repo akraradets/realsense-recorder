@@ -50,6 +50,9 @@ def test_fake_pipeline_no_drops(tmp_path: Path):
     assert report["dropped_processor_queue"] == 0
     assert report["dropped_recorder_queue"] == 0
     assert report["no_frame_drops"] is True
+    assert report.get("requested_fps") == 60
+    assert report.get("r7_120_ok") is False
+    assert "container_fps" in report
     assert report.get("compression_stage") == "processor"
     assert mp4.exists() and mp4.stat().st_size > 0
     assert csv.exists()
@@ -78,6 +81,8 @@ def test_fake_120_short_burst(tmp_path: Path):
     report = pipe.stop()
 
     assert report["no_frame_drops"], report
+    assert report.get("r7_120_ok") is False
+    assert report.get("requested_fps") == 120
     assert report["frames_written"] >= 90, report
     assert report.get("compression_stage") == "processor"
     result = verify_mp4(
@@ -88,3 +93,36 @@ def test_fake_120_short_burst(tmp_path: Path):
         require_barcode=True,
     )
     assert result.ok, result.message
+
+
+def test_arm_sdk_bag_refuses_elgato(tmp_path: Path):
+    src = FakeFrameSource(width=64, height=48, target_fps=30)
+    src.device_tag = "elgato"
+    pipe = Pipeline(source=src, on_preview_frame=lambda _e: None)
+    try:
+        pipe.arm_sdk_bag(tmp_path / "x.bag")
+    except RuntimeError as exc:
+        assert "Elgato" in str(exc)
+    else:
+        raise AssertionError("Elgato arm_sdk_bag should be refused")
+
+
+def test_start_recording_keeps_prearmed_realsense_bag(tmp_path: Path, monkeypatch):
+    src = FakeFrameSource(width=64, height=48, target_fps=30)
+    src.device_tag = "realsense"
+    src.mode = "hardware"
+    pipe = Pipeline(source=src, on_preview_frame=lambda _e: None)
+    pre = tmp_path / "pre.db3"
+    pipe._bag_path = pre
+    calls = {"n": 0}
+
+    def boom(*_a, **_k):
+        calls["n"] += 1
+        raise AssertionError("start_bag_recording should not run when prearmed")
+
+    monkeypatch.setattr("poc1.pipeline.start_bag_recording", boom)
+    pipe.start_preview()
+    pipe.start_recording(tmp_path / "t.mp4", tmp_path / "t.csv", bag_path=pre)
+    assert calls["n"] == 0
+    assert pipe._bag_path == pre
+    pipe.stop()

@@ -8,7 +8,9 @@ switches to real hardware automatically when a device appears.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -122,7 +124,23 @@ class RealSenseFrameSource:
                 rs.stream.depth, self.width, self.height, rs.format.z16, self.target_fps
             )
         if self.bag_path:
-            config.enable_record_to_file(str(self.bag_path))
+            from poc1.bag_recorder import coerce_record_path, set_recording_suffix
+
+            bag = coerce_record_path(Path(self.bag_path))
+            self.bag_path = bag
+            self._bag_path = bag
+            try:
+                config.enable_record_to_file(str(bag))
+            except RuntimeError as exc:
+                if "db3" in str(exc).lower() and bag.suffix.lower() != ".db3":
+                    set_recording_suffix(".db3")
+                    bag = bag.with_suffix(".db3")
+                    self.bag_path = bag
+                    self._bag_path = bag
+                    config.enable_record_to_file(str(bag))
+                else:
+                    raise
+            set_recording_suffix(Path(bag).suffix)
 
         try:
             profile = self._pipeline.start(config)
@@ -139,7 +157,11 @@ class RealSenseFrameSource:
                 rs.stream.color, self.width, self.height, rs.format.bgr8, self.target_fps
             )
             if self.bag_path:
-                config.enable_record_to_file(str(self.bag_path))
+                from poc1.bag_recorder import coerce_record_path
+
+                bag = coerce_record_path(Path(self.bag_path))
+                self.bag_path = bag
+                config.enable_record_to_file(str(bag))
             profile = self._pipeline.start(config)
 
         color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
@@ -160,6 +182,20 @@ class RealSenseFrameSource:
             except Exception:  # noqa: BLE001
                 pass
             self._pipeline = None
+
+    def flush_to_live(self) -> None:
+        """Drop SDK-queued frames so preview/record starts at the live edge."""
+        if self._pipeline is None:
+            return
+        deadline = time.perf_counter() + 0.25
+        while time.perf_counter() < deadline:
+            try:
+                poll = getattr(self._pipeline, "poll_for_frames", None)
+                frames = poll() if callable(poll) else None
+            except Exception:  # noqa: BLE001
+                break
+            if not frames:
+                break
 
     def read(self) -> Optional[np.ndarray]:
         if self._pipeline is None:

@@ -11,6 +11,8 @@ dependencies = [
     "psutil>=5.9.0",
     "pillow>=10.0.0",
     "matplotlib>=3.10.9",
+    "rosbags>=0.10.0",
+    "rosbags-image>=0.10.0",
 ]
 
 [project.optional-dependencies]
@@ -27,11 +29,14 @@ dev = [
 ]
 
 [project.scripts]
+poc1 = "poc1.app.gui:main"
 poc1-gui = "poc1.gui:main"
 poc1-proof = "poc1.proof:main"
 poc1-verify = "poc1.verifier:main"
 poc1-tests = "poc1.run_poc1_tests:main"
 poc1-delivery = "poc1.delivery:main"
+poc1-d1 = "poc1.deliverable1.gui:main"
+poc1-d2 = "poc1.deliverable2.gui:main"
 
 [build-system]
 requires = ["hatchling"]

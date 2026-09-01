@@ -38,4 +38,10 @@ class StreamViewer:
             env = self.in_queue.get(timeout=0.5)
             if env is None:
                 continue
+            # Keep only the newest queued frame so a slow GUI cannot pile up copies.
+            while True:
+                nxt = self.in_queue.get(timeout=0)
+                if nxt is None:
+                    break
+                env = nxt
             self.on_frame(env)

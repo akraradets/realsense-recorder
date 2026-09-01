@@ -153,7 +153,9 @@ def build_delivery(
             if elgato_fhd120
             else "  Elgato FHD@120: run suite with card connected + HDMI @1080p120 to claim."
         ),
-        "  DEFERRED: .db3 / R8–R10 export polish / multi-cam arming.",
+        "  DONE: Deliverable 1 multi-cam (R1–R6) + Deliverable 2 review/library/export (R8–R10).",
+        "  NOTE: RealSense SDK record file is .bag or .db3 (whichever this PC’s SDK accepts); Library exports bags to MP4.",
+        "  UI: uv run poc1  (unified Setup / Record / Library).",
     ]
     summary_text = "\n".join(lines) + "\n"
     (pack / "PASS_SUMMARY.txt").write_text(summary_text, encoding="utf-8")

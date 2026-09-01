@@ -21,6 +21,8 @@ import cv2
 
 from poc1.camera_handler import DropCountingQueue, FrameEnvelope
 from poc1.codec import choose_best_fourcc
+from poc1.frame_layout import ensure_bgr
+from poc1.frame_source import embed_seq_barcode
 
 logger = logging.getLogger("poc1.processor")
 
@@ -56,6 +58,7 @@ class Processor:
         self.codec_label = "MPEG-4 (mp4v)"
         self._slow_encodes = 0
         self._slow_encode_ms_max = 0.0
+        self.sidecar_bag = None
 
     def configure_output(
         self,
@@ -112,18 +115,42 @@ class Processor:
         self._thread.start()
 
     def stop(self) -> None:
+        """
+        Stop accepting new work, then encode every frame still in the queue.
+
+        Discarding the backlog made Stop feel instant but failed the no-drop
+        proof (e.g. 400 written of 477 read). Drain is the correct Stop.
+        """
         self._running.clear()
         if self._thread:
-            # FHD@120 drain can take well over 30s on mp4v — never race _drain.
-            self._thread.join(timeout=300.0)
+            self._thread.join(timeout=8.0)
             if self._thread.is_alive():
-                logger.error("processor thread still alive after join timeout")
+                logger.warning("processor thread still encoding; continuing drain")
             self._thread = None
-        else:
-            self._drain()
+        drained = 0
+        deadline = time.perf_counter() + 60.0
+        while time.perf_counter() < deadline:
+            env = self.in_queue.get(timeout=0.05)
+            if env is None:
+                if self.in_queue.qsize() == 0:
+                    break
+                continue
+            self._encode(env)
+            drained += 1
+        leftover = self.in_queue.discard_all()
+        if drained:
+            logger.info("processor stop: encoded %d queued frame(s)", drained)
+        if leftover:
+            logger.error(
+                "processor stop: %d frame(s) still pending after drain timeout",
+                leftover,
+            )
         with self._encode_lock:
             if self._writer is not None:
-                self._writer.release()
+                try:
+                    self._writer.release()
+                except Exception:  # noqa: BLE001
+                    logger.exception("VideoWriter.release failed")
                 self._writer = None
         if self._slow_encodes:
             logger.info(
@@ -135,14 +162,23 @@ class Processor:
         with self._encode_lock:
             if self._writer is None:
                 return
-            frame = env.frame
+            frame = ensure_bgr(env.frame, self.height, self.width)
             h, w = frame.shape[:2]
             if w != self.width or h != self.height:
                 frame = cv2.resize(frame, (self.width, self.height))
 
+            if env.seq >= 0:
+                embed_seq_barcode(frame, env.seq)
+
             t0 = time.perf_counter()
             self._writer.write(frame)
             encode_ms = (time.perf_counter() - t0) * 1000.0
+            sidecar = getattr(self, "sidecar_bag", None)
+            if sidecar is not None:
+                try:
+                    sidecar.submit(frame, env.capture_ts)
+                except Exception:  # noqa: BLE001
+                    logger.exception("sidecar bag submit failed")
             budget = (1000.0 / max(self.fps, 1)) * 2
             if encode_ms > budget:
                 self._slow_encodes += 1
@@ -171,7 +207,8 @@ class Processor:
             if env is None:
                 continue
             self._encode(env)
-        self._drain()
+        # Do not drain the backlog here — stop() discards pending frames so
+        # Stop stays responsive. Only frames encoded above are kept.
 
     def summary(self) -> dict:
         return {
