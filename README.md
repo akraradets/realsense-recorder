@@ -145,7 +145,7 @@ uv run pytest -q
 
 ## Client guide
 
-See **[CLIENT_GUIDE.md](CLIENT_GUIDE.md)** for a plain-language explanation of how the system works, which files do what, which commands to run, and how that maps to the POC-1 requirements.
+**[CLIENT_GUIDE.md](CLIENT_GUIDE.md)** — full operator documentation: installation, dual-camera setup (Elgato + RealSense), daily workflow, HUD, troubleshooting, output files, and version history.
 
 ## POC-1 all commands check
 ```bash
