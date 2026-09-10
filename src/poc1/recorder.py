@@ -3,8 +3,9 @@ Recorder: last stage. Consumes EncodedEnvelope tokens from the processor
 (compression already done) and tracks drop/gap/FPS accounting.
 
 The MP4 file itself is written by the processor's VideoWriter. On stop,
-this stage may remux the file if measured capture fps differs from the
-container stamp (webcam hardware lie).
+this stage measures actual capture FPS. If it differs from the configured
+target, it flags a mismatch — conversion is optional and must be requested
+explicitly (GUI warns the user; remux runs on a worker thread).
 """
 from __future__ import annotations
 
@@ -59,8 +60,8 @@ class Recorder:
     fps: int
     fourcc: str = "mp4v"
     codec_label: str = "MPEG-4 (mp4v)"
-    # Webcam hardware often lies about FPS; remux fixes playback speed.
-    # Synthetic sources must keep the stamped target FPS (R7 claim).
+    # Webcam hardware often lies about FPS; mismatch is detected on stop.
+    # Synthetic / capture-card sources keep stamped target FPS (R7 claim).
     correct_container_fps: bool = True
 
     def __post_init__(self) -> None:
@@ -74,7 +75,10 @@ class Recorder:
         self.measured_fps: float = 0.0
         self.container_fps: float = float(self.fps)
         self.fps_corrected: bool = False
+        self.fps_mismatch: bool = False
+        self.suggested_fps: float = float(self.fps)
         self.bytes_from_processor = 0
+        self._convert_lock = threading.Lock()
 
     def start(self) -> None:
         self.frames_written = 0
@@ -84,6 +88,8 @@ class Recorder:
         self._last_capture_ts = None
         self.measured_fps = 0.0
         self.fps_corrected = False
+        self.fps_mismatch = False
+        self.suggested_fps = float(self.fps)
         self.container_fps = float(self.fps)
         self.bytes_from_processor = 0
         self._running.set()
@@ -97,21 +103,15 @@ class Recorder:
     def stop(self) -> None:
         self._running.clear()
         if self._thread:
-            self._thread.join(timeout=30.0)
-        self._correct_container_fps_if_needed()
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                logger.warning("recorder thread still alive after join timeout")
+            self._thread = None
+        # Measure only — do not remux here (keeps Stop responsive; GUI may ask).
+        self._measure_fps()
 
-    def _correct_container_fps_if_needed(self) -> None:
-        if not self.correct_container_fps:
-            self.container_fps = float(self.fps)
-            if (
-                self.frames_written >= 2
-                and self._first_capture_ts is not None
-                and self._last_capture_ts is not None
-            ):
-                elapsed = self._last_capture_ts - self._first_capture_ts
-                if elapsed > 0:
-                    self.measured_fps = (self.frames_written - 1) / elapsed
-            return
+    def _measure_fps(self) -> None:
+        """Compute measured FPS and flag mismatch; never remux on the stop path."""
         if (
             self.frames_written < 2
             or self._first_capture_ts is None
@@ -123,29 +123,69 @@ class Recorder:
             return
         measured = (self.frames_written - 1) / elapsed
         self.measured_fps = measured
-        if abs(measured - self.fps) / max(self.fps, 1) < 0.10:
-            self.container_fps = float(self.fps)
+        self.container_fps = float(self.fps)
+
+        # Always detect mismatch (webcam, Elgato, RealSense). Whether we auto-remux
+        # is decided by the GUI / allow_fps_remux — but players will play too fast
+        # if we never flag it.
+        # Absolute floor catches 55-vs-60 (relative was ~9% and previously skipped).
+        rel = abs(measured - self.fps) / max(self.fps, 1)
+        if rel < 0.08 and abs(measured - self.fps) < 3.5:
             return
 
-        corrected = max(1.0, round(measured, 3))
+        suggested = max(1.0, round(measured, 3))
+        # Snap suggested to honest bands for remux (same rules as stamp).
+        try:
+            from poc1.deliverable1.devices import honest_container_fps
+
+            suggested = float(honest_container_fps(measured, int(round(self.fps))))
+        except Exception:  # noqa: BLE001
+            pass
+        self.fps_mismatch = True
+        self.suggested_fps = suggested
         logger.info(
-            "Webcam delivered ~%.1ffps (not %d) — fixing playback speed to realtime",
-            measured, self.fps,
+            "FPS mismatch: configured %dfps but measured ~%.1ffps — "
+            "conversion available (not applied automatically)",
+            self.fps, measured,
         )
-        tmp = self.output_path.with_suffix(".fpsfix.mp4")
-        ok = remux_with_fps(
-            self.output_path, tmp, corrected, self.fourcc, self.width, self.height,
-        )
-        if ok:
-            self.output_path.unlink(missing_ok=True)
-            tmp.replace(self.output_path)
-            self.container_fps = corrected
-            self.fps_corrected = True
-        else:
+
+    def convert_container_fps(self) -> bool:
+        """
+        Remux the MP4 so playback uses measured FPS (realtime).
+
+        Safe to call from a worker thread. Returns True if the file was rewritten.
+        """
+        with self._convert_lock:
+            if not self.fps_mismatch or self.fps_corrected:
+                return self.fps_corrected
+            if not self.output_path.exists():
+                logger.warning("convert_container_fps: missing file %s", self.output_path)
+                return False
+
+            corrected = self.suggested_fps
+            logger.info(
+                "Converting container FPS %.1f → %.1f on worker thread…",
+                float(self.fps), corrected,
+            )
+            tmp = self.output_path.with_suffix(".fpsfix.mp4")
+            ok = remux_with_fps(
+                self.output_path, tmp, corrected, self.fourcc, self.width, self.height,
+            )
+            if ok:
+                self.output_path.unlink(missing_ok=True)
+                tmp.replace(self.output_path)
+                self.container_fps = corrected
+                self.fps_corrected = True
+                self.fps_mismatch = False
+                logger.info("FPS conversion done → %s @ %.1ffps", self.output_path, corrected)
+                return True
+
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
+            logger.warning("FPS conversion failed; original file kept")
+            return False
 
     def _loop(self) -> None:
         while self._running.is_set() or self.out_queue.qsize() > 0:
@@ -181,6 +221,8 @@ class Recorder:
             "measured_fps": round(self.measured_fps, 3) if self.measured_fps else 0.0,
             "container_fps": self.container_fps,
             "fps_corrected": self.fps_corrected,
+            "fps_mismatch": self.fps_mismatch,
+            "suggested_container_fps": self.suggested_fps,
             "slow_writes": 0,
             "bytes_from_processor": self.bytes_from_processor,
             "compression_stage": "processor",

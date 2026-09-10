@@ -12,8 +12,9 @@ camera_handler --sub--> processor (compression) --> recorder
 ```
 
 - **processor** owns encode (H.264 when OpenH264 is available, else **mp4v**).
-- **recorder** accounts encoded frames / remuxes webcam FPS metadata; it does
-  not re-encode.
+- **recorder** accounts encoded frames and *detects* FPS mismatch (e.g. config
+  120 but camera delivered ~60). The GUI **warns** and offers optional
+  conversion; remux runs on a **background thread** so the UI does not hang.
 
 Pass/fail on stop:
 
@@ -79,6 +80,14 @@ uv run python -m poc1.run_poc1_tests --seconds 3 --capture-index 1
 ## GUI
 
 ```bash
+# Unified app (recommended) — Setup / Record / Library in one window
+uv run poc1
+# or: uv run python -m poc1
+```
+
+Legacy single-camera POC GUI (still available):
+
+```bash
 # Synthetic FHD@120 (primary R7 throughput proof)
 uv run python -m poc1.gui --source fake --width 1920 --height 1080 --fps 120
 
@@ -92,10 +101,14 @@ uv run python -m poc1.gui --source realsense --width 1280 --height 720 --fps 30
 uv run python -m poc1.gui --source webcam --device-index 0 --width 1280 --height 720 --fps 30
 ```
 
+**Unified app flow:** Setup (cameras + arm) → Record (live gate + one button) → Library (browse / play / export).
+
 **Start Preview** → **Armed** → **Record** → **Stop**.
 
-- **Also .bag (RealSense HW)** — Viewer-compatible `.bag` when a RealSense is connected.
-- **Detect Capture Card** / **Detect RealSense** — set device index automatically.
+- **Also save RealSense .bag** — Viewer-compatible `.bag` when a RealSense is connected (optional).
+- **Library** — browse MP4, play, export `.bag` / `.bd3` / `.db3` → MP4 (H.264/H.265 when available).
+- **FPS mismatch** — if configured FPS ≠ measured FPS, the app asks in plain language whether to fix playback speed. Conversion runs on a **background thread**. Choosing No keeps the original file.
+- **Storage bandwidth** — frames are compressed then written to disk. Inspect `*_sysmon.csv` (`disk_write_mb_since_start`) plus `no_frame_drops` in the report.
 
 ### Virtual camera (two terminals)
 
@@ -132,7 +145,7 @@ uv run pytest -q
 
 ## Client guide
 
-See **[CLIENT_GUIDE.md](CLIENT_GUIDE.md)** for a plain-language explanation of how the system works, which files do what, which commands to run, and how that maps to the POC-1 requirements.
+**[CLIENT_GUIDE.md](CLIENT_GUIDE.md)** — full operator documentation: installation, dual-camera setup (Elgato + RealSense), daily workflow, HUD, troubleshooting, output files, and version history.
 
 ## POC-1 all commands check
 ```bash
@@ -183,9 +196,103 @@ uv run python -m poc1.virtual_cam_sender --width 1920 --height 1080 --fps 120
 - [x] RealSense `.bag` option when hardware present (MP4 always)
 - [x] Client delivery pack (`poc1.delivery` → `recordings/poc1_delivery/`)
 - [x] **Elgato / capture card** source (`capturecard_source`, auto-detect)
-- [ ] `.db3` export — **deferred** (Deliverable 2)
-- [ ] Multi-cam arming (R1–R6) — **deferred**
-- [ ] R8–R10 export polish / in-app browser — **deferred**
+- [x] **Deliverable 1 (R1–R6)** multi-cam GUI — `uv run python -m poc1.deliverable1.gui`
+- [x] **Deliverable 2 (R8–R10)** review prompt / browse+playback / bag·bd3·db3 → MP4 — `uv run python -m poc1.deliverable2.gui`
+- [x] **Unified app** — `uv run poc1` (Setup / Record / Library; same pipelines)
+
+
+## Unified app (recommended)
+
+One window for R1–R10:
+
+```bash
+uv run poc1
+# or: uv run python -m poc1
+# or: uv run python -m poc1.app
+```
+
+| Tab | What you do |
+|-----|-------------|
+| **Setup** | List cameras, set FPS/resolution/format, folder + prefixes, arm, start previews |
+| **Record** | Live mosaic; Record stays disabled until armed cameras show live video; Stop saves |
+| **Library** | Browse / play takes; export `.bag` / `.bd3` / `.db3` → MP4 |
+
+After Stop: a short “Review footage?” popup (5s) can open the take in **Library**.  
+`.bag` can be written while recording RealSense; `.db3` is **import/export only**
+(not recorded natively) — Library Export converts ROS2 bags with image topics to MP4 via `rosbags`.
+
+Legacy separate UIs still work (`poc1-d1`, `poc1-d2`, `poc1-gui`) if you need them.
+
+
+## Deliverable 1 — multi-camera (R1–R6)
+
+Additive package (`poc1.deliverable1`) — **does not change** the POC-1 single-camera GUI/pipeline.
+
+| Req | Feature | How |
+|-----|---------|-----|
+| R1 | List UVC + RealSense | Refresh cameras |
+| R2 | Change FPS / resolution / format | Config dropdown per slot |
+| R3 | Stream 2 or more cameras | Start with 2 slots; use **Add camera slot** for more |
+| R4 | Folder + prefix | Save folder + per-slot prefix (`cam1`/`cam2`/`m`/`r`) |
+| R5 | Arm which cameras record | Armed checkbox per slot |
+| R6 | One Record for all armed | **Record armed cameras** |
+
+```bash
+uv sync --extra dev
+uv sync --extra dev --extra realsense   # optional, for RealSense HW
+
+uv run python -m poc1.deliverable1.gui
+# or: uv run poc1-d1
+
+# Start with 4 slots (you can still add/remove slots in the GUI)
+uv run python -m poc1.deliverable1.gui --slots 4
+```
+
+With real devices: plug Elgato / webcam / RealSense, click **Refresh cameras**,
+add/remove camera cards as needed, select a device + advertised configuration
+for each card, start previews, arm the cameras you want, then use the single
+**Record armed cameras** button.
+
+**Hardware tips (black / empty preview):**
+1. Close Intel RealSense Viewer, Elgato Capture, OBS, Zoom, Teams, etc. — they lock USB cameras.
+2. RealSense: USB **3** port; pick the `[realsense]` entry (not a UVC twin); start with `1280x720@30 bgr8`.
+3. Elgato: HDMI source powered on with a live signal; pick the named Elgato / capture card entry; try `1920x1080@30 mjpg`.
+4. After plugging/unplugging, always click **Refresh cameras** before Start preview.
+5. Install RealSense support with `uv sync --extra realsense` if `[realsense]` never appears.
+
+**FPS behavior (supervisor):** the MP4 keeps your **configured** FPS. After Stop, if measured FPS differs, the app **warns** and offers optional conversion on a **background thread** (never auto-changes FPS). For exact fake FHD@120 with zero drops, arm only the fake camera (or `uv run python -m poc1.proof`).
+
+RealSense configuration uses the selected SDK color profile (resolution, FPS,
+and `bgr8` / `rgb8` / `yuyv` / `y8` data format). Optional `.bag` recording is
+available per RealSense hardware card.
+Synthetic **fake A/B** entries are always listed so you can demo without hardware.
+
+## Deliverable 2 — review / playback / export (R8–R10)
+
+Additive package (`poc1.deliverable2`). R8 is also wired into the Deliverable 1
+stop flow after files are saved.
+
+| Req | Feature | How |
+|-----|---------|-----|
+| R8 | Review prompt after save (5s auto-dismiss) | Popup after D1 Stop; Review / Dismiss |
+| R9 | Browse and playback | D2 media browser + built-in OpenCV player |
+| R10 | Export `.bag` / `.bd3` / `.db3` → MP4 | H.264 or H.265 (falls back to mp4v if needed) |
+
+```bash
+uv sync --extra dev
+uv sync --extra dev --extra realsense   # needed for .bag export
+
+uv run python -m poc1.deliverable2.gui
+# or: uv run poc1-d2
+
+# Point at a recordings folder
+uv run python -m poc1.deliverable2.gui --folder ./recordings/deliverable1
+```
+
+**R10 notes:** `.bag` uses the RealSense SDK (`pyrealsense2`). `.bd3` / `.db3`
+(ROS 2) convert via pure-Python **rosbags** + **rosbags-image** when the bag
+contains `sensor_msgs/Image` or `CompressedImage` topics — then Library can
+play the resulting MP4. Fallbacks: OpenCV, ffmpeg, misnamed-bag try.
 
 
 
