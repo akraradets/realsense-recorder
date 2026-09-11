@@ -1888,6 +1888,14 @@ class ConfiguredRealSenseSource:
                 f"Connected: {', '.join(serials) or '(none)'}. Click Refresh."
             )
 
+    @staticmethod
+    def _depth_size_for(width: int, height: int) -> tuple[int, int]:
+        """D400 depth tops out at 1280x720; keep matching size when possible."""
+        w, h = int(width), int(height)
+        if w <= 1280 and h <= 720:
+            return w, h
+        return 1280, 720
+
     def _start_profile(
         self,
         rs,
@@ -1901,19 +1909,45 @@ class ConfiguredRealSenseSource:
         if self.serial:
             config.enable_device(self.serial)
         fmt = pixel_format.lower()
+        # SDK record_to_file only writes enabled streams. When bag is armed,
+        # enable color + depth so the file has Color_0 and Depth_0 topics.
+        record_both = bool(self.bag_path)
+        depth_w, depth_h = self._depth_size_for(width, height)
         if fmt == "z16":
             config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+            if record_both:
+                config.enable_stream(
+                    rs.stream.color, width, height, rs.format.bgr8, fps
+                )
             self._colorizer = rs.colorizer()
         elif fmt == "y8":
+            used_ir = False
             try:
-                config.enable_stream(rs.stream.infrared, width, height, rs.format.y8, fps)
+                config.enable_stream(
+                    rs.stream.infrared, width, height, rs.format.y8, fps
+                )
+                used_ir = True
             except Exception:  # noqa: BLE001
-                config.enable_stream(rs.stream.color, width, height, rs.format.y8, fps)
+                config.enable_stream(
+                    rs.stream.color, width, height, rs.format.y8, fps
+                )
+            if record_both:
+                if used_ir:
+                    config.enable_stream(
+                        rs.stream.color, width, height, rs.format.bgr8, fps
+                    )
+                config.enable_stream(
+                    rs.stream.depth, depth_w, depth_h, rs.format.z16, fps
+                )
             self._colorizer = None
         else:
             config.enable_stream(
                 rs.stream.color, width, height, self._rs_format(rs, fmt), fps
             )
+            if record_both:
+                config.enable_stream(
+                    rs.stream.depth, depth_w, depth_h, rs.format.z16, fps
+                )
             self._colorizer = None
         if self.bag_path:
             # Absolute path — relative paths can fail silently on Windows SDK builds.
@@ -1962,8 +1996,9 @@ class ConfiguredRealSenseSource:
         )
         self._wanted = wanted
         w, h, fps, fmt = wanted
-        # When arming .bag (or restoring after a failed bag), never silently drop
-        # to 640x480 — that mismatch is what users saw in Record error dialogs.
+        # When arming .bag (or restoring after a failed bag), prefer the selected
+        # mode, but allow dual color+depth fallbacks if USB bandwidth rejects
+        # the first size (depth is capped at 1280x720 on D400).
         strict = bool(self.bag_path) or not allow_fallback
         if strict:
             attempts = [
@@ -1971,6 +2006,14 @@ class ConfiguredRealSenseSource:
                 (w, h, fps, "bgr8") if fmt not in {"z16", "y8"} else (w, h, fps, fmt),
                 (w, h, fps, "yuyv") if fmt not in {"z16", "y8"} else (w, h, fps, fmt),
             ]
+            if self.bag_path and fmt not in {"z16", "y8"}:
+                for fb in (
+                    (1280, 720, fps, "bgr8"),
+                    (640, 480, fps, "bgr8"),
+                    (640, 480, 30, "bgr8"),
+                ):
+                    if fb not in attempts:
+                        attempts.append(fb)
         else:
             attempts = [
                 (w, h, fps, fmt),
@@ -2082,7 +2125,13 @@ class ConfiguredRealSenseSource:
                     self._rs_recorder.pause()
                     logger.info("RealSense .bag pre-armed (paused) -> %s", self.bag_path)
                 else:
-                    logger.info("RealSense .bag recording active -> %s", self.bag_path)
+                    dw, dh = self._depth_size_for(self.width, self.height)
+                    logger.info(
+                        "RealSense .bag recording active (color + depth %dx%d) -> %s",
+                        dw,
+                        dh,
+                        self.bag_path,
+                    )
             except Exception as exc:  # noqa: BLE001
                 self._rs_recorder = None
                 logger.warning(
