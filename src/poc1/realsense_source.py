@@ -116,12 +116,16 @@ class RealSenseFrameSource:
         if self.serial:
             config.enable_device(self.serial)
 
+        # SDK bag only records enabled streams — arm color + depth when bag is set.
+        want_depth = bool(self.enable_depth or self.bag_path)
         config.enable_stream(
             rs.stream.color, self.width, self.height, rs.format.bgr8, self.target_fps
         )
-        if self.enable_depth:
+        if want_depth:
+            dw = self.width if self.width <= 1280 else 1280
+            dh = self.height if self.height <= 720 else 720
             config.enable_stream(
-                rs.stream.depth, self.width, self.height, rs.format.z16, self.target_fps
+                rs.stream.depth, dw, dh, rs.format.z16, self.target_fps
             )
         if self.bag_path:
             from poc1.bag_recorder import coerce_record_path, set_recording_suffix
@@ -156,6 +160,14 @@ class RealSenseFrameSource:
             config.enable_stream(
                 rs.stream.color, self.width, self.height, rs.format.bgr8, self.target_fps
             )
+            if want_depth:
+                config.enable_stream(
+                    rs.stream.depth,
+                    self.width,
+                    self.height,
+                    rs.format.z16,
+                    self.target_fps,
+                )
             if self.bag_path:
                 from poc1.bag_recorder import coerce_record_path
 
@@ -170,9 +182,10 @@ class RealSenseFrameSource:
         self.target_fps = int(color_profile.fps())
         self.mode = "hardware"
         logger.info(
-            "RealSenseFrameSource started: %dx%d@%d serial=%s bag=%s",
+            "RealSenseFrameSource started: %dx%d@%d serial=%s bag=%s depth=%s",
             self.width, self.height, self.target_fps, self.serial or "auto",
             bool(self.bag_path),
+            want_depth,
         )
 
     def stop(self) -> None:

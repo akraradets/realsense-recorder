@@ -55,6 +55,13 @@ def test_realsense_config_source_keeps_selected_profile():
     assert source.mode == "hardware"
 
 
+def test_realsense_depth_size_capped_for_d400():
+    """Depth stream cannot be 1920x1080 on D400 — cap when pairing with color."""
+    assert ConfiguredRealSenseSource._depth_size_for(640, 480) == (640, 480)
+    assert ConfiguredRealSenseSource._depth_size_for(1280, 720) == (1280, 720)
+    assert ConfiguredRealSenseSource._depth_size_for(1920, 1080) == (1280, 720)
+
+
 def test_build_frame_source_wires_uvc_and_realsense():
     """R1/R2 wiring: UVC → FormattedUvcSource, RealSense → ConfiguredRealSenseSource."""
     from poc1.deliverable1.devices import (
