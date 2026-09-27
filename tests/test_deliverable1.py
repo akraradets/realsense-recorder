@@ -60,6 +60,9 @@ def test_realsense_depth_size_capped_for_d400():
     assert ConfiguredRealSenseSource._depth_size_for(640, 480) == (640, 480)
     assert ConfiguredRealSenseSource._depth_size_for(1280, 720) == (1280, 720)
     assert ConfiguredRealSenseSource._depth_size_for(1920, 1080) == (1280, 720)
+    assert ConfiguredRealSenseSource.BAG_WIDTH == 640
+    assert ConfiguredRealSenseSource.BAG_HEIGHT == 480
+    assert ConfiguredRealSenseSource.BAG_FPS == 30
 
 
 def test_build_frame_source_wires_uvc_and_realsense():

@@ -7,6 +7,7 @@ from tkinter import messagebox, ttk
 from typing import TYPE_CHECKING, Optional
 
 from PIL import Image, ImageTk
+import numpy as np
 
 logger = logging.getLogger("poc1.app.cards")
 
@@ -415,7 +416,14 @@ class CameraCard(tk.Frame):
             return
         tw = max(self.preview_shell.winfo_width() - 4, 280)
         th = max(self.preview_shell.winfo_height() - 4, 160)
-        rgb = bgr_to_rgb_fill(frame, tw, th)
+        depth = slot.get_depth_preview_frame()
+        if depth is not None and getattr(src, "device_tag", "") == "realsense":
+            half = max(tw // 2, 80)
+            left = bgr_to_rgb_fill(frame, half, th)
+            right = bgr_to_rgb_fill(depth, max(tw - half, 80), th)
+            rgb = np.concatenate([left, right], axis=1)
+        else:
+            rgb = bgr_to_rgb_fill(frame, tw, th)
         if src is not None:
             try:
                 rgb = overlay_hud(rgb, hud_lines_for_source(slot, src))

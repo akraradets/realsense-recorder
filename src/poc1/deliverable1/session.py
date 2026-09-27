@@ -50,6 +50,7 @@ class CameraSlot:
     available_modes: list[StreamMode] = field(default_factory=list)
     pipeline: Optional[Pipeline] = None
     last_frame: Optional[object] = None  # numpy array
+    last_depth_frame: Optional[object] = None
     last_report: dict = field(default_factory=dict)
     status: str = "idle"
     record_bag: bool = False
@@ -69,6 +70,12 @@ class CameraSlot:
         self._preview_draw_t = now
         with self._frame_lock:
             self.last_frame = small
+            depth = None
+            src = self.pipeline.source if self.pipeline is not None else None
+            raw_depth = getattr(src, "latest_depth", None) if src is not None else None
+            if raw_depth is not None:
+                depth = downscale_for_preview(raw_depth)
+            self.last_depth_frame = depth
             self._preview_ts.append(time.time())
             if len(self._preview_ts) > 90:
                 self._preview_ts = self._preview_ts[-90:]
@@ -78,6 +85,12 @@ class CameraSlot:
             if self.last_frame is None:
                 return None
             return self.last_frame
+
+    def get_depth_preview_frame(self):
+        with self._frame_lock:
+            if self.last_depth_frame is None:
+                return None
+            return self.last_depth_frame
 
     def estimate_preview_fps(self) -> Optional[float]:
         """Recent live preview rate (informational only — never changes record stamp)."""

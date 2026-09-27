@@ -1855,6 +1855,8 @@ class ConfiguredRealSenseSource:
         self._wanted = (self.width, self.height, self.target_fps, self.pixel_format)
         # When True, pause SDK bag writer immediately after start (preview pre-arm).
         self.bag_start_paused: bool = False
+        self._depth_enabled: bool = False
+        self.latest_depth: Optional[np.ndarray] = None
 
     @staticmethod
     def _rs_format(rs, name: str):
@@ -1888,6 +1890,11 @@ class ConfiguredRealSenseSource:
                 f"Connected: {', '.join(serials) or '(none)'}. Click Refresh."
             )
 
+    # SDK bag color + depth. One .db3 holds Color_0 and Depth_0.
+    BAG_WIDTH = 640
+    BAG_HEIGHT = 480
+    BAG_FPS = 30
+
     @staticmethod
     def _depth_size_for(width: int, height: int) -> tuple[int, int]:
         """D400 depth tops out at 1280x720; keep matching size when possible."""
@@ -1896,6 +1903,25 @@ class ConfiguredRealSenseSource:
             return w, h
         return 1280, 720
 
+    def _enable_bag_color_depth(self, rs, config) -> None:
+        """Record color and depth together at 640x480@30."""
+        config.enable_stream(
+            rs.stream.color,
+            self.BAG_WIDTH,
+            self.BAG_HEIGHT,
+            rs.format.bgr8,
+            self.BAG_FPS,
+        )
+        config.enable_stream(
+            rs.stream.depth,
+            self.BAG_WIDTH,
+            self.BAG_HEIGHT,
+            rs.format.z16,
+            self.BAG_FPS,
+        )
+        if self._colorizer is None:
+            self._colorizer = rs.colorizer()
+
     def _start_profile(
         self,
         rs,
@@ -1903,52 +1929,45 @@ class ConfiguredRealSenseSource:
         height: int,
         fps: int,
         pixel_format: str,
+        *,
+        with_depth: bool = False,
     ):
         pipeline = rs.pipeline()
         config = rs.config()
         if self.serial:
             config.enable_device(self.serial)
         fmt = pixel_format.lower()
-        # SDK record_to_file only writes enabled streams. When bag is armed,
-        # enable color + depth so the file has Color_0 and Depth_0 topics.
-        record_both = bool(self.bag_path)
-        depth_w, depth_h = self._depth_size_for(width, height)
-        if fmt == "z16":
+        # Bag record is a fixed dual stream so the file has Color_0 and Depth_0.
+        if self.bag_path and fmt not in {"y8"}:
+            self._enable_bag_color_depth(rs, config)
+            self._depth_enabled = True
+        elif fmt == "z16":
             config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
-            if record_both:
-                config.enable_stream(
-                    rs.stream.color, width, height, rs.format.bgr8, fps
-                )
             self._colorizer = rs.colorizer()
+            self._depth_enabled = True
         elif fmt == "y8":
-            used_ir = False
             try:
-                config.enable_stream(
-                    rs.stream.infrared, width, height, rs.format.y8, fps
-                )
-                used_ir = True
+                config.enable_stream(rs.stream.infrared, width, height, rs.format.y8, fps)
             except Exception:  # noqa: BLE001
-                config.enable_stream(
-                    rs.stream.color, width, height, rs.format.y8, fps
-                )
-            if record_both:
-                if used_ir:
-                    config.enable_stream(
-                        rs.stream.color, width, height, rs.format.bgr8, fps
-                    )
-                config.enable_stream(
-                    rs.stream.depth, depth_w, depth_h, rs.format.z16, fps
-                )
+                config.enable_stream(rs.stream.color, width, height, rs.format.y8, fps)
             self._colorizer = None
+            self._depth_enabled = False
         else:
             config.enable_stream(
                 rs.stream.color, width, height, self._rs_format(rs, fmt), fps
             )
-            if record_both:
+            self._depth_enabled = False
+            if with_depth:
                 config.enable_stream(
-                    rs.stream.depth, depth_w, depth_h, rs.format.z16, fps
+                    rs.stream.depth,
+                    self.BAG_WIDTH,
+                    self.BAG_HEIGHT,
+                    rs.format.z16,
+                    self.BAG_FPS,
                 )
-            self._colorizer = None
+                if self._colorizer is None:
+                    self._colorizer = rs.colorizer()
+                self._depth_enabled = True
         if self.bag_path:
             # Absolute path — relative paths can fail silently on Windows SDK builds.
             # Newer librealsense requires .db3 (not legacy .bag); coerce here so even
@@ -2042,9 +2061,24 @@ class ConfiguredRealSenseSource:
                     except Exception:  # noqa: BLE001
                         pass
                     pipeline = None
-                pipeline, profile = self._start_profile(rs, width, height, try_fps, try_fmt)
+                depth_preview = try_fmt not in {"z16", "y8"} and not self.bag_path
+                try:
+                    pipeline, profile = self._start_profile(
+                        rs,
+                        width,
+                        height,
+                        try_fps,
+                        try_fmt,
+                        with_depth=True if (self.bag_path or depth_preview) else False,
+                    )
+                except Exception as depth_exc:
+                    if not depth_preview:
+                        raise depth_exc
+                    pipeline, profile = self._start_profile(
+                        rs, width, height, try_fps, try_fmt, with_depth=False
+                    )
                 used = attempt
-                self.pixel_format = try_fmt
+                self.pixel_format = "bgr8" if self.bag_path and try_fmt not in {"z16", "y8"} else try_fmt
                 break
             except Exception as exc:  # noqa: BLE001
                 msg = str(exc)
@@ -2144,6 +2178,7 @@ class ConfiguredRealSenseSource:
             first: Optional[np.ndarray] = None
             for _ in range(8):
                 frames = pipeline.wait_for_frames(timeout_ms=3000)
+                self._stash_depth(frames)
                 first = self._frames_to_bgr(frames)
                 if first is not None and first.size:
                     break
@@ -2197,6 +2232,8 @@ class ConfiguredRealSenseSource:
         self._profile = None
         self._rs_recorder = None
         self._pending_frame = None
+        self.latest_depth = None
+        self._depth_enabled = False
         self._colorizer = None
 
     def _frames_to_bgr(self, frames: Any) -> Optional[np.ndarray]:
@@ -2243,6 +2280,28 @@ class ConfiguredRealSenseSource:
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         return np.ascontiguousarray(frame)
 
+    def _stash_depth(self, frames: Any) -> None:
+        """Keep a colorized depth frame for preview. Does not change the RGB read()."""
+        if not self._depth_enabled:
+            return
+        try:
+            depth = frames.get_depth_frame()
+        except Exception:  # noqa: BLE001
+            return
+        if not depth:
+            return
+        if self._colorizer is None:
+            import pyrealsense2 as rs
+
+            self._colorizer = rs.colorizer()
+        colorized = self._colorizer.colorize(depth)
+        frame = np.asanyarray(colorized.get_data())
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif frame.ndim == 3 and frame.shape[2] == 3:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        self.latest_depth = np.ascontiguousarray(frame)
+
     def flush_to_live(self) -> None:
         """Drop SDK-queued frames so preview/record starts at the live edge."""
         self._pending_frame = None
@@ -2280,6 +2339,7 @@ class ConfiguredRealSenseSource:
             frames = self._pipeline.wait_for_frames(timeout_ms=1000)
         except Exception:  # noqa: BLE001
             return None
+        self._stash_depth(frames)
         return self._frames_to_bgr(frames)
 
 

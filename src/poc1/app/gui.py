@@ -21,6 +21,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from PIL import Image, ImageTk
+import numpy as np
 
 from poc1.app.cards import CameraCard
 from poc1.app.user_messages import (
@@ -753,6 +754,12 @@ class UnifiedApp:
                 continue
             rgb = bgr_to_rgb_fill(frame, tw, th)
             src = slot.pipeline.source if slot.pipeline else None
+            depth = slot.get_depth_preview_frame()
+            if depth is not None and getattr(src, "device_tag", "") == "realsense":
+                half = max(tw // 2, 40)
+                left = bgr_to_rgb_fill(frame, half, th)
+                right = bgr_to_rgb_fill(depth, max(tw - half, 40), th)
+                rgb = np.concatenate([left, right], axis=1)
             if src is not None:
                 rgb = overlay_hud(rgb, hud_lines_for_source(slot, src))
             photo = ImageTk.PhotoImage(Image.fromarray(rgb))
