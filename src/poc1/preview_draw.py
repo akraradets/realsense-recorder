@@ -11,6 +11,14 @@ PREVIEW_MAX_WIDTH = 960
 PREVIEW_HZ = 15.0
 
 
+def colorize_depth_preview(raw: np.ndarray) -> np.ndarray:
+    """Jet preview of a uint16 depth buffer. Not used on the capture thread."""
+    if raw.ndim != 2:
+        return ensure_bgr(raw)
+    vis = cv2.convertScaleAbs(raw, alpha=255.0 / 4000.0)
+    return cv2.applyColorMap(vis, cv2.COLORMAP_JET)
+
+
 def downscale_for_preview(frame: np.ndarray, max_width: int = PREVIEW_MAX_WIDTH) -> np.ndarray:
     bgr = ensure_bgr(frame, 0, 0)
     h, w = bgr.shape[:2]

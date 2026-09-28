@@ -14,7 +14,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-from poc1.preview_draw import PREVIEW_HZ, downscale_for_preview
+import numpy as np
+
+from poc1.preview_draw import PREVIEW_HZ, colorize_depth_preview, downscale_for_preview
 from poc1.bag_recorder import clear_bag_on_source, with_sdk_record_suffix
 from poc1.camera_handler import FrameEnvelope
 from poc1.deliverable1.devices import (
@@ -67,14 +69,17 @@ class CameraSlot:
         if env.frame is None:
             return
         small = downscale_for_preview(env.frame)
+        depth = None
+        src = self.pipeline.source if self.pipeline is not None else None
+        raw_depth = getattr(src, "_depth_raw", None) if src is not None else None
+        if raw_depth is not None:
+            try:
+                depth = downscale_for_preview(colorize_depth_preview(np.array(raw_depth, copy=True)))
+            except Exception:  # noqa: BLE001
+                depth = None
         self._preview_draw_t = now
         with self._frame_lock:
             self.last_frame = small
-            depth = None
-            src = self.pipeline.source if self.pipeline is not None else None
-            raw_depth = getattr(src, "latest_depth", None) if src is not None else None
-            if raw_depth is not None:
-                depth = downscale_for_preview(raw_depth)
             self.last_depth_frame = depth
             self._preview_ts.append(time.time())
             if len(self._preview_ts) > 90:

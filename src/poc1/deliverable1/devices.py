@@ -1856,7 +1856,7 @@ class ConfiguredRealSenseSource:
         # When True, pause SDK bag writer immediately after start (preview pre-arm).
         self.bag_start_paused: bool = False
         self._depth_enabled: bool = False
-        self.latest_depth: Optional[np.ndarray] = None
+        self._depth_raw: Optional[np.ndarray] = None
 
     @staticmethod
     def _rs_format(rs, name: str):
@@ -2232,7 +2232,7 @@ class ConfiguredRealSenseSource:
         self._profile = None
         self._rs_recorder = None
         self._pending_frame = None
-        self.latest_depth = None
+        self._depth_raw = None
         self._depth_enabled = False
         self._colorizer = None
 
@@ -2281,26 +2281,17 @@ class ConfiguredRealSenseSource:
         return np.ascontiguousarray(frame)
 
     def _stash_depth(self, frames: Any) -> None:
-        """Keep a colorized depth frame for preview. Does not change the RGB read()."""
+        """Copy raw depth only. Colorizing here stalled the next wait_for_frames."""
         if not self._depth_enabled:
             return
         try:
             depth = frames.get_depth_frame()
+            if not depth:
+                return
+            raw = np.asanyarray(depth.get_data())
+            self._depth_raw = np.array(raw, dtype=np.uint16, copy=True)
         except Exception:  # noqa: BLE001
             return
-        if not depth:
-            return
-        if self._colorizer is None:
-            import pyrealsense2 as rs
-
-            self._colorizer = rs.colorizer()
-        colorized = self._colorizer.colorize(depth)
-        frame = np.asanyarray(colorized.get_data())
-        if frame.ndim == 2:
-            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-        elif frame.ndim == 3 and frame.shape[2] == 3:
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        self.latest_depth = np.ascontiguousarray(frame)
 
     def flush_to_live(self) -> None:
         """Drop SDK-queued frames so preview/record starts at the live edge."""

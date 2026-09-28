@@ -752,14 +752,22 @@ class UnifiedApp:
             th = tile.winfo_height()
             if tw < 40 or th < 40:
                 continue
-            rgb = bgr_to_rgb_fill(frame, tw, th)
             src = slot.pipeline.source if slot.pipeline else None
             depth = slot.get_depth_preview_frame()
-            if depth is not None and getattr(src, "device_tag", "") == "realsense":
-                half = max(tw // 2, 40)
-                left = bgr_to_rgb_fill(frame, half, th)
-                right = bgr_to_rgb_fill(depth, max(tw - half, 40), th)
-                rgb = np.concatenate([left, right], axis=1)
+            try:
+                if depth is not None and getattr(src, "device_tag", "") == "realsense":
+                    half = max(tw // 2, 40)
+                    left = bgr_to_rgb_fill(frame, half, th)
+                    right = bgr_to_rgb_fill(depth, max(tw - half, 40), th)
+                    if left.shape[0] != right.shape[0] or left.ndim != right.ndim:
+                        rgb = bgr_to_rgb_fill(frame, tw, th)
+                    else:
+                        rgb = np.concatenate([left, right], axis=1)
+                else:
+                    rgb = bgr_to_rgb_fill(frame, tw, th)
+            except Exception:  # noqa: BLE001
+                logger.exception("record tile draw failed")
+                continue
             if src is not None:
                 rgb = overlay_hud(rgb, hud_lines_for_source(slot, src))
             photo = ImageTk.PhotoImage(Image.fromarray(rgb))
@@ -1221,9 +1229,15 @@ class UnifiedApp:
         # was freezing Tk ("Not Responding").
         if page == str(self.setup_page):
             for card in self.cards:
-                card.tick()
+                try:
+                    card.tick()
+                except Exception:  # noqa: BLE001
+                    logger.exception("preview tick failed for slot %s", getattr(card, "slot_id", "?"))
         elif page == str(self.record_page):
-            self._tick_record_tiles()
+            try:
+                self._tick_record_tiles()
+            except Exception:  # noqa: BLE001
+                logger.exception("record preview tick failed")
             if self.session.is_recording:
                 extra = self._elgato_live_lines()
                 if extra:
