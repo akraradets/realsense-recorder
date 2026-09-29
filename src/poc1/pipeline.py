@@ -137,6 +137,25 @@ class Pipeline:
             self.camera_handler.resume_reads()
         return self._bag_path
 
+    def _resume_paused_bag(self) -> None:
+        """Unpause the SDK recorder on the same beat as the RealSense MP4."""
+        if not getattr(self.source, "bag_start_paused", False):
+            return
+        resume = getattr(self.source, "resume_bag", None)
+        if not callable(resume):
+            return
+        try:
+            resume()
+            logger.info("RealSense .db3 resumed with MP4 arm")
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Could not resume paused RealSense bag; file may already be writing"
+            )
+            try:
+                self.source.bag_start_paused = False
+            except Exception:  # noqa: BLE001
+                pass
+
     def start_recording(
         self,
         output_path: Path,
@@ -214,6 +233,7 @@ class Pipeline:
         self.processor.start()
         self.recorder.start()
         self.monitor.start()
+        self._resume_paused_bag()
         self.camera_handler.enable_recording()
 
         if not self.camera_handler.wait_recorded_frames(2.0):
@@ -257,6 +277,7 @@ class Pipeline:
             self.processor.start()
             self.recorder.start()
             self.monitor.start()
+            self._resume_paused_bag()
             self.camera_handler.enable_recording()
             if not self.camera_handler.wait_recorded_frames(2.5):
                 try:

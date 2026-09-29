@@ -21,7 +21,7 @@ logger = logging.getLogger("poc1.bag")
 _RECORD_SUFFIX: Optional[str] = ".db3"
 
 # Build stamp so operators can confirm they are not on a stale Phue copy.
-BUILD_ID = "sdk-record-v38-2026-09-28"
+BUILD_ID = "sdk-record-v39-2026-09-30"
 
 
 def can_record_bag(source: Any) -> bool:
@@ -190,31 +190,39 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
                 source.bag_path = candidate
                 source._bag_path = candidate
                 source._bag_final_path = candidate
+                # Write nothing until the MP4 recorders arm. enable_record_to_file
+                # starts at pipeline.start(); pause runs immediately after that.
                 if hasattr(source, "bag_start_paused"):
-                    source.bag_start_paused = False
+                    source.bag_start_paused = True
                 _restore_wanted(source, wanted)
                 _call_start(source, allow_fallback=False)
 
-                size = 0
-                for _ in range(12):
-                    try:
-                        _ = source.read()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    if candidate.exists():
+                paused = bool(
+                    getattr(source, "bag_start_paused", False)
+                    and getattr(source, "_rs_recorder", None) is not None
+                    and getattr(source, "_pipeline", None) is not None
+                )
+                if not paused:
+                    size = 0
+                    for _ in range(12):
                         try:
-                            size = candidate.stat().st_size
-                        except OSError:
-                            size = 0
-                        if size > 0:
+                            _ = source.read()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        if candidate.exists():
+                            try:
+                                size = candidate.stat().st_size
+                            except OSError:
+                                size = 0
+                            if size > 0:
+                                break
+                        if candidate.with_suffix("").exists():
                             break
-                    if candidate.with_suffix("").exists():
-                        break
-                    time.sleep(0.05)
+                        time.sleep(0.05)
 
-                if candidate.exists() and candidate.stat().st_size <= 0:
-                    if getattr(source, "_pipeline", None) is None:
-                        raise RuntimeError("SDK created no record file after start")
+                    if candidate.exists() and candidate.stat().st_size <= 0:
+                        if getattr(source, "_pipeline", None) is None:
+                            raise RuntimeError("SDK created no record file after start")
 
                 set_recording_suffix(candidate.suffix)
                 flush = getattr(source, "flush_to_live", None)
@@ -224,8 +232,9 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
                     except Exception:  # noqa: BLE001
                         logger.debug("RealSense flush_to_live after bag arm failed", exc_info=True)
                 logger.info(
-                    "RealSense record armed (try %d) -> %s (exists=%s size=%s)",
+                    "RealSense record armed (try %d) paused=%s -> %s (exists=%s size=%s)",
                     attempt,
+                    paused,
                     candidate,
                     candidate.exists(),
                     candidate.stat().st_size if candidate.exists() else 0,

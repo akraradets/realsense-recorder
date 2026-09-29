@@ -125,4 +125,43 @@ def test_start_recording_keeps_prearmed_realsense_bag(tmp_path: Path, monkeypatc
     pipe.start_recording(tmp_path / "t.mp4", tmp_path / "t.csv", bag_path=pre)
     assert calls["n"] == 0
     assert pipe._bag_path == pre
+    pre.write_bytes(b"bag")
+    pipe.stop()
+
+
+def test_paused_bag_resumes_before_mp4_arm(tmp_path: Path, monkeypatch):
+    src = FakeFrameSource(width=64, height=48, target_fps=30)
+    src.device_tag = "realsense"
+    src.mode = "hardware"
+    src.bag_start_paused = True
+    order: list[str] = []
+
+    def resume_bag() -> None:
+        order.append("resume")
+        src.bag_start_paused = False
+
+    src.resume_bag = resume_bag
+    pipe = Pipeline(source=src, on_preview_frame=lambda _e: None)
+    pre = tmp_path / "pre.db3"
+    pipe._bag_path = pre
+
+    from poc1.camera_handler import CameraHandler
+
+    real_enable = CameraHandler.enable_recording
+
+    def wrapped_enable(self):
+        order.append("enable")
+        return real_enable(self)
+
+    monkeypatch.setattr(CameraHandler, "enable_recording", wrapped_enable)
+
+    def boom(*_a, **_k):
+        raise AssertionError("start_bag_recording should not run when prearmed")
+
+    monkeypatch.setattr("poc1.pipeline.start_bag_recording", boom)
+    pipe.start_preview()
+    pipe.start_recording(tmp_path / "t.mp4", tmp_path / "t.csv", bag_path=pre)
+    assert order[:2] == ["resume", "enable"]
+    assert src.bag_start_paused is False
+    pre.write_bytes(b"bag")
     pipe.stop()
