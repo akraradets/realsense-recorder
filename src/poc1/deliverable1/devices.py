@@ -1904,12 +1904,17 @@ class ConfiguredRealSenseSource:
         return 1280, 720
 
     def _enable_bag_color_depth(self, rs, config) -> None:
-        """Record color and depth together at 640x480@30."""
+        """Record color and depth together at 640x480@30.
+
+        Color is rgb8. bgr8 bytes are correct on screen after our BGR conversion,
+        but bag viewers read the color stream as RGB, so red was stored in the
+        blue channel. Preview and the MP4 still receive BGR via _convert_color.
+        """
         config.enable_stream(
             rs.stream.color,
             self.BAG_WIDTH,
             self.BAG_HEIGHT,
-            rs.format.bgr8,
+            rs.format.rgb8,
             self.BAG_FPS,
         )
         config.enable_stream(
@@ -2078,7 +2083,9 @@ class ConfiguredRealSenseSource:
                         rs, width, height, try_fps, try_fmt, with_depth=False
                     )
                 used = attempt
-                self.pixel_format = "bgr8" if self.bag_path and try_fmt not in {"z16", "y8"} else try_fmt
+                self.pixel_format = (
+                    "rgb8" if self.bag_path and try_fmt not in {"z16", "y8"} else try_fmt
+                )
                 break
             except Exception as exc:  # noqa: BLE001
                 msg = str(exc)
@@ -2097,7 +2104,11 @@ class ConfiguredRealSenseSource:
                             rs, width, height, try_fps, try_fmt
                         )
                         used = attempt
-                        self.pixel_format = try_fmt
+                        self.pixel_format = (
+                            "rgb8"
+                            if self.bag_path and try_fmt not in {"z16", "y8"}
+                            else try_fmt
+                        )
                         break
                     except Exception as exc2:  # noqa: BLE001
                         errors.append(
