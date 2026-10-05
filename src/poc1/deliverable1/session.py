@@ -21,11 +21,13 @@ from poc1.bag_recorder import clear_bag_on_source, with_sdk_record_suffix
 from poc1.camera_handler import FrameEnvelope
 from poc1.deliverable1.devices import (
     ConnectedCamera,
+    PreviewOpenCancelled,
     StreamMode,
     build_frame_source,
     list_all_cameras,
     list_stream_modes,
     prefix_for_camera,
+    preview_cancel_requested,
 )
 from poc1.pipeline import Pipeline
 
@@ -296,7 +298,14 @@ class MultiCamSession:
             # and would fail Start preview when the checkbox is on).
             clear_bag_on_source(source)
             pipe = Pipeline(source=source, on_preview_frame=slot.on_preview)
-            pipe.start_preview()
+            try:
+                pipe.start_preview()
+            except Exception:
+                try:
+                    pipe.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
             slot.pipeline = pipe
             slot.status = f"preview {slot.camera.kind} {slot.mode.label()}"
             if slot.record_bag and slot.camera.kind == "realsense":
@@ -359,6 +368,8 @@ class MultiCamSession:
             key=_order,
         )
         for slot in ordered:
+            if preview_cancel_requested():
+                raise PreviewOpenCancelled("Preview open cancelled")
             try:
                 self.start_slot_preview(slot.slot_id)
                 # Brief pause so USB / exclusive access settles before the next open.
@@ -367,6 +378,8 @@ class MultiCamSession:
                     or (want_elgato_first and slot.camera.device_tag == "elgato")
                 ):
                     time.sleep(0.35)
+            except PreviewOpenCancelled:
+                raise
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"slot{slot.slot_id}: {exc}")
                 slot.status = f"error: {exc}"

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,7 @@ from poc1.deliverable1.win_names import (
     elgato_open_name_paths,
     ffmpeg_available,
     friendly_name_for_index,
+    is_laptop_webcam,
     list_windows_capture_names,
     names_are_index_aligned,
 )
@@ -37,6 +39,26 @@ from poc1.realsense_source import (
 )
 
 logger = logging.getLogger("poc1.d1.devices")
+
+# Set while Stop is pressed during a preview open. The Elgato search checks it
+# between devices so the UI is not stuck until every UVC index is measured.
+_preview_cancel = threading.Event()
+
+
+class PreviewOpenCancelled(RuntimeError):
+    """Operator pressed Stop while a camera was still opening."""
+
+
+def request_preview_cancel() -> None:
+    _preview_cancel.set()
+
+
+def clear_preview_cancel() -> None:
+    _preview_cancel.clear()
+
+
+def preview_cancel_requested() -> bool:
+    return _preview_cancel.is_set()
 
 # Sensible presets when the driver does not expose a full mode list.
 _UVC_PRESET_MODES: list[tuple[int, int, int, str]] = [
@@ -382,7 +404,7 @@ def _merge_windows_named_cameras(
 
     for i, name in enumerate(names):
         tag = classify_capture_name(name)
-        if tag == "virtual":
+        if tag == "virtual" or is_laptop_webcam(name):
             continue
         path = f"video={name}"
         if path in claimed_paths:
@@ -504,7 +526,15 @@ def list_uvc_cameras(
         _merge_windows_named_cameras(found_by_index, backends[0][0], backends[0][1])
         _ensure_elgato_entries(found_by_index, backends[0][0], backends[0][1])
 
-    return [found_by_index[i] for i in sorted(found_by_index)]
+    cameras = [found_by_index[i] for i in sorted(found_by_index)]
+    kept: list[ConnectedCamera] = []
+    for cam in cameras:
+        label = f"{cam.name} {cam.open_path or ''}"
+        if is_laptop_webcam(label):
+            logger.info("Hiding laptop webcam from camera list: %s", cam.name)
+            continue
+        kept.append(cam)
+    return kept
 
 
 def list_realsense_cameras() -> list[ConnectedCamera]:
@@ -597,6 +627,7 @@ def pick_auto_camera_for_slot(
                 kind == "uvc"
                 and d.kind == "uvc"
                 and d.device_tag not in {"virtual", "realsense-uvc"}
+                and not is_laptop_webcam(f"{d.name} {d.open_path or ''}")
             ):
                 return d
             if kind == "fake" and d.kind == "fake":
@@ -1294,8 +1325,13 @@ class FormattedUvcSource(CvCaptureSource):
                 got_h,
                 got_fps,
             )
-            # Driver advertises high-rate (or 0/unknown) at the right size → use it.
+            if preview_cancel_requested():
+                return best
+            # Wrong camera (often the laptop webcam) negotiated a smaller size.
+            # Further pin orders and fps windows will not turn 720 into 1080.
             size_ok = got_w >= int(width * 0.9) and got_h >= int(height * 0.9)
+            if not size_ok:
+                return best
             fps_ok = got_fps <= 0.5 or got_fps >= fps * 0.85
             if size_ok and fps_ok:
                 return frame
@@ -1330,6 +1366,8 @@ class FormattedUvcSource(CvCaptureSource):
         self._cap = cap
         best = 0.0
         for attempt in range(3):
+            if preview_cancel_requested():
+                return best
             if attempt > 0:
                 w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or self.width or 1920)
                 h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or self.height or 1080)
@@ -1350,6 +1388,9 @@ class FormattedUvcSource(CvCaptureSource):
                 fps,
             )
             if measured >= fps * 0.85:
+                return measured
+            # ~9fps or ~30fps will not climb to 120. One sample is enough.
+            if measured < 45.0:
                 return measured
         return best
 
@@ -1435,9 +1476,6 @@ class FormattedUvcSource(CvCaptureSource):
                         int(self.device_index or 0),
                         dshow_only=True,
                     )
-                    # Three exclusive DSHOW passes with a short settle between —
-                    # OBS often needs a reopen after another app released the pin.
-                    open_targets = open_targets + open_targets + open_targets
                 else:
                     open_targets = _elgato_open_targets(
                         self.open_path, int(self.device_index or 0)
@@ -1459,6 +1497,14 @@ class FormattedUvcSource(CvCaptureSource):
             seen_open: set[tuple[str, int]] = set()
             pass_n = 0
             for target, backend in open_targets:
+                if preview_cancel_requested():
+                    try:
+                        if self._cap is not None:
+                            self._cap.release()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._cap = None
+                    raise PreviewOpenCancelled("Preview open cancelled")
                 ok_key = (str(target), int(backend))
                 # Allow repeated DSHOW passes for high-rate (exclusive pin after OBS).
                 if want_high:
@@ -1520,17 +1566,18 @@ class FormattedUvcSource(CvCaptureSource):
                         self.device_index = target
                     owned = np.ascontiguousarray(frame)
                     self._pending_frame = owned
-                    if is_elgato and fps >= 90:
-                        measured = self._elgato_measure_high_rate(cap, fps)
-                    else:
-                        measured = 0.0
-                    reported = float(cap.get(cv2.CAP_PROP_FPS) or 0)
-                    rate = measured if measured > 1 else (
-                        reported if reported > 0 else float(fps)
-                    )
                     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
                     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
-                    # Reject silent resolution fallback (1080 request → 720 open).
+                    if preview_cancel_requested():
+                        try:
+                            cap.release()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        self._cap = None
+                        raise PreviewOpenCancelled("Preview open cancelled")
+                    # Reject silent resolution fallback (1080 request → 720 open)
+                    # before the multi-second fps window. That window is what
+                    # kept the webcam (720 @ ~9fps) blocking Stop.
                     if want_high and (
                         w < int(wanted_w * 0.9) or h < int(wanted_h * 0.9)
                     ):
@@ -1543,6 +1590,21 @@ class FormattedUvcSource(CvCaptureSource):
                             wanted_fps,
                         )
                         continue
+                    if is_elgato and fps >= 90:
+                        measured = self._elgato_measure_high_rate(cap, fps)
+                    else:
+                        measured = 0.0
+                    if preview_cancel_requested():
+                        try:
+                            cap.release()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        self._cap = None
+                        raise PreviewOpenCancelled("Preview open cancelled")
+                    reported = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+                    rate = measured if measured > 1 else (
+                        reported if reported > 0 else float(fps)
+                    )
                     candidate = (rate, w, h, fps, fmt, cap, owned)
                     logger.info(
                         "UVC opened via target=%r backend=%s %dx%d@%d %s (measured ~%.1f)",
@@ -1585,6 +1647,17 @@ class FormattedUvcSource(CvCaptureSource):
                             fps,
                             rate,
                         )
+                        if not ffmpeg_available():
+                            logger.warning(
+                                "ffmpeg missing — keeping %dx%d ~%.1ffps "
+                                "instead of scanning other cameras",
+                                w,
+                                h,
+                                rate,
+                            )
+                            chosen = candidate
+                            accepted_here = True
+                            break
                         continue
                     chosen = candidate
                     accepted_here = True
@@ -1603,7 +1676,7 @@ class FormattedUvcSource(CvCaptureSource):
 
             # Fallbacks when 120 never locked: same resolution only (no 1080→720).
             # Never open MSMF for want_high — Media Foundation commonly caps Elgato @60.
-            if chosen is None and want_high:
+            if chosen is None and want_high and ffmpeg_available():
                 logger.warning(
                     "Elgato could not lock ~%dfps at %dx%d after OBS-style DSHOW retries. "
                     "Fully quit OBS, confirm HDMI is 1080p120, then Start preview again. "
@@ -1619,6 +1692,8 @@ class FormattedUvcSource(CvCaptureSource):
                 )
                 seen_open = set()
                 for target, backend in open_targets:
+                    if preview_cancel_requested():
+                        raise PreviewOpenCancelled("Preview open cancelled")
                     ok_key = (str(target), int(backend))
                     if ok_key in seen_open:
                         continue

@@ -364,6 +364,7 @@ class CameraCard(tk.Frame):
 
     def stop_preview(self) -> None:
         if self.app.busy:
+            self.app.stop_all_previews()
             return
         self.session.stop_slot_preview(self.slot_id)
         self.preview.configure(image="", text="Preview stopped")

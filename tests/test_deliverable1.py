@@ -151,6 +151,12 @@ def test_win_names_classify_elgato_and_realsense():
     assert classify_capture_name("Intel RealSense D435") == "realsense-uvc"
     assert classify_capture_name("OBS Virtual Camera") == "virtual"
     assert classify_capture_name("USB2.0 HD UVC WebCam") == "uvc"
+    from poc1.deliverable1.win_names import is_laptop_webcam
+
+    assert is_laptop_webcam("USB2.0 HD UVC WebCam")
+    assert is_laptop_webcam("Integrated Camera")
+    assert not is_laptop_webcam("Elgato 4K S")
+    assert not is_laptop_webcam("Intel RealSense D435")
 
 
 def test_elgato_open_profiles_prefer_user_selection():
