@@ -20,6 +20,14 @@ def test_realsense_modes_default_30_no_invented_color_120() -> None:
     assert all(m.fps < 90 for m in color)
     assert any(m.fps == 30 for m in color)
     assert not any(m.width >= 1920 and m.fps >= 90 for m in color)
+    assert [m.label() for m in modes] == [
+        "640x480@30 rgb8",
+        "640x480@30 bgr8",
+        "640x480@30 yuyv",
+        "1280x720@30 rgb8",
+        "1280x720@30 bgr8",
+        "1280x720@30 yuyv",
+    ]
 
 
 def test_fhd_high_rate_helper() -> None:

@@ -652,142 +652,26 @@ def _rs_format_name(fmt: Any) -> str:
 
 
 def list_realsense_modes(serial: Optional[str] = None) -> list[StreamMode]:
+    """Station color modes only.
+
+    The D435 advertises well over a hundred profiles. The dropdown keeps the
+    sizes this capture station uses, in rgb8, bgr8, and yuyv. Depth is written
+    into the same .db3 as z16 and is not a separate row. rgb8 is first so a
+    new slot records a file RealSense Viewer can show with red intact.
     """
-    R2 — all video profiles the RealSense SDK advertises for this device.
-
-    Includes color (preferred for MP4) plus depth/IR so higher FPS options the
-    sensor supports (often on depth) appear in the configuration dropdown.
-    """
-    if not realsense_available():
-        return [
-            StreamMode(1280, 720, 30, "bgr8"),
-            StreamMode(1920, 1080, 30, "bgr8"),
-            StreamMode(640, 480, 30, "bgr8"),
-            StreamMode(848, 480, 90, "z16"),
-            StreamMode(640, 480, 90, "z16"),
-        ]
-    import pyrealsense2 as rs
-
-    ctx = rs.context()
-    device = None
-    for dev in ctx.query_devices():
-        sn = dev.get_info(rs.camera_info.serial_number)
-        if serial is None or sn == serial:
-            device = dev
-            break
-    if device is None:
-        logger.warning(
-            "list_realsense_modes: serial=%s not found — returning common presets",
-            serial,
-        )
-        return [
-            StreamMode(1280, 720, 30, "bgr8"),
-            StreamMode(1920, 1080, 30, "bgr8"),
-            StreamMode(640, 480, 30, "bgr8"),
-            StreamMode(848, 480, 90, "z16"),
-        ]
-
-    modes: list[StreamMode] = []
-    seen: set[tuple[int, int, int, str]] = set()
-    try:
-        sensors = list(device.query_sensors())
-    except Exception:  # noqa: BLE001
-        sensors = []
-
-    allowed_streams = {
-        rs.stream.color,
-        rs.stream.depth,
-        rs.stream.infrared,
-    }
-    for sensor in sensors:
-        try:
-            profiles = sensor.get_stream_profiles()
-        except Exception:  # noqa: BLE001
-            continue
-        for p in profiles:
-            try:
-                vp = p.as_video_stream_profile()
-            except Exception:  # noqa: BLE001
-                continue
-            try:
-                st = vp.stream_type()
-            except Exception:  # noqa: BLE001
-                continue
-            if st not in allowed_streams:
-                continue
-            try:
-                w, h = int(vp.width()), int(vp.height())
-                fps = int(round(float(vp.fps())))
-                fmt = _rs_format_name(vp.format())
-            except Exception:  # noqa: BLE001
-                continue
-            if fps <= 0 or w <= 0 or h <= 0:
-                continue
-
-            # Map stream+format to a pipeline pixel_format the GUI can open.
-            if st == rs.stream.color:
-                if fmt not in {"bgr8", "rgb8", "yuyv", "y8"}:
-                    continue
-                # D400 color is 30 (sometimes 60). Never invent 90/120 for RGB.
-                if fps > 60:
-                    continue
-            elif st == rs.stream.depth:
-                # Depth is recorded/previewed via colorizer → BGR for MP4.
-                fmt = "z16"
-            elif st == rs.stream.infrared:
-                if fmt not in {"y8", "y16"}:
-                    fmt = "y8"
-                else:
-                    fmt = "y8"
-            else:
-                continue
-
-            key = (w, h, fps, fmt)
-            if key in seen:
-                continue
-            seen.add(key)
-            modes.append(StreamMode(w, h, fps, fmt))
-
-    # Extra color presets at 30fps only. Do not advertise 120 for D400 color —
-    # the SDK list above already includes 60 if the device supports it.
-    for preset in (
-        StreamMode(1920, 1080, 30, "bgr8"),
-        StreamMode(1280, 720, 30, "bgr8"),
-        StreamMode(848, 480, 30, "bgr8"),
+    modes = [
+        StreamMode(640, 480, 30, "rgb8"),
         StreamMode(640, 480, 30, "bgr8"),
-        StreamMode(640, 480, 90, "z16"),
-        StreamMode(848, 480, 90, "z16"),
-        StreamMode(1280, 720, 30, "z16"),
-    ):
-        key = (preset.width, preset.height, preset.fps, preset.pixel_format)
-        if key not in seen:
-            seen.add(key)
-            modes.append(preset)
-
-    if not modes:
-        modes = [
-            StreamMode(1280, 720, 30, "bgr8"),
-            StreamMode(640, 480, 30, "bgr8"),
-        ]
-
-    # Sort: color first, 30fps color preferred, bgr8 before rgb8, then resolution.
-    def mode_priority(mode: StreamMode) -> tuple:
-        is_color = 0 if mode.pixel_format in {"bgr8", "rgb8", "yuyv"} else 1
-        pixels = mode.width * mode.height
-        fps_bias = 0 if mode.fps == 30 else (1 if mode.fps < 90 else 2)
-        fmt_pref = (
-            0
-            if mode.pixel_format == "bgr8"
-            else (1 if mode.pixel_format == "rgb8" else 2)
-        )
-        return (is_color, fps_bias, fmt_pref, -pixels, -mode.fps)
-
-    modes.sort(key=mode_priority)
+        StreamMode(640, 480, 30, "yuyv"),
+        StreamMode(1280, 720, 30, "rgb8"),
+        StreamMode(1280, 720, 30, "bgr8"),
+        StreamMode(1280, 720, 30, "yuyv"),
+    ]
     logger.info(
-        "RealSense modes for sn=%s: %d profiles (fps set=%s)",
-        serial,
+        "RealSense modes for sn=%s: %d station profiles %s",
+        serial or "any",
         len(modes),
-        sorted({m.fps for m in modes}),
+        [m.label() for m in modes],
     )
     return modes
 
@@ -1978,26 +1862,49 @@ class ConfiguredRealSenseSource:
             return w, h
         return 1280, 720
 
-    def _enable_bag_color_depth(self, rs, config) -> None:
-        """Record color and depth together at 640x480@30.
+    def _enable_bag_color_depth(
+        self,
+        rs,
+        config,
+        width: int,
+        height: int,
+        fps: int,
+        pixel_format: str,
+    ) -> None:
+        """Record the selected color format plus depth in one .db3.
 
-        Color is rgb8. bgr8 bytes are correct on screen after our BGR conversion,
-        but bag viewers read the color stream as RGB, so red was stored in the
-        blue channel. Preview and the MP4 still receive BGR via _convert_color.
+        The Setup dropdown chooses rgb8, bgr8, or yuyv. That format is what
+        the bag stores. rgb8 is the one RealSense Viewer shows with red intact
+        when Available Streams is RGB8. Preview and the MP4 still convert to BGR.
         """
+        fmt_name = (pixel_format or "rgb8").lower()
+        if fmt_name not in {"rgb8", "bgr8", "yuyv"}:
+            fmt_name = "rgb8"
+        color_fps = int(fps) if int(fps) > 0 else self.BAG_FPS
+        dw, dh = self._depth_size_for(width, height)
         config.enable_stream(
             rs.stream.color,
-            self.BAG_WIDTH,
-            self.BAG_HEIGHT,
-            rs.format.rgb8,
-            self.BAG_FPS,
+            int(width),
+            int(height),
+            self._rs_format(rs, fmt_name),
+            color_fps,
         )
         config.enable_stream(
             rs.stream.depth,
-            self.BAG_WIDTH,
-            self.BAG_HEIGHT,
+            dw,
+            dh,
             rs.format.z16,
-            self.BAG_FPS,
+            color_fps,
+        )
+        logger.info(
+            "RealSense bag streams: color %dx%d@%d %s + depth %dx%d@%d z16",
+            int(width),
+            int(height),
+            color_fps,
+            fmt_name,
+            dw,
+            dh,
+            color_fps,
         )
         if self._colorizer is None:
             self._colorizer = rs.colorizer()
@@ -2019,7 +1926,7 @@ class ConfiguredRealSenseSource:
         fmt = pixel_format.lower()
         # Bag record is a fixed dual stream so the file has Color_0 and Depth_0.
         if self.bag_path and fmt not in {"y8"}:
-            self._enable_bag_color_depth(rs, config)
+            self._enable_bag_color_depth(rs, config, width, height, fps, fmt)
             self._depth_enabled = True
         elif fmt == "z16":
             config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
@@ -2099,20 +2006,22 @@ class ConfiguredRealSenseSource:
         # mode, but allow dual color+depth fallbacks if USB bandwidth rejects
         # the first size (depth is capped at 1280x720 on D400).
         strict = bool(self.bag_path) or not allow_fallback
-        if strict:
+        if self.bag_path and fmt not in {"z16", "y8"}:
+            # Keep the selected color format. Do not fall through to bgr8 first,
+            # or a dropdown set to rgb8 still writes a BGR8 bag.
+            color_fmt = fmt if fmt in {"rgb8", "bgr8", "yuyv"} else "rgb8"
+            attempts = [
+                (w, h, fps, color_fmt),
+                (640, 480, 30, color_fmt),
+                (1280, 720, 30, color_fmt),
+                (640, 480, 30, "rgb8"),
+            ]
+        elif strict:
             attempts = [
                 (w, h, fps, fmt),
                 (w, h, fps, "bgr8") if fmt not in {"z16", "y8"} else (w, h, fps, fmt),
                 (w, h, fps, "yuyv") if fmt not in {"z16", "y8"} else (w, h, fps, fmt),
             ]
-            if self.bag_path and fmt not in {"z16", "y8"}:
-                for fb in (
-                    (1280, 720, fps, "bgr8"),
-                    (640, 480, fps, "bgr8"),
-                    (640, 480, 30, "bgr8"),
-                ):
-                    if fb not in attempts:
-                        attempts.append(fb)
         else:
             attempts = [
                 (w, h, fps, fmt),
@@ -2158,9 +2067,7 @@ class ConfiguredRealSenseSource:
                         rs, width, height, try_fps, try_fmt, with_depth=False
                     )
                 used = attempt
-                self.pixel_format = (
-                    "rgb8" if self.bag_path and try_fmt not in {"z16", "y8"} else try_fmt
-                )
+                self.pixel_format = try_fmt
                 break
             except Exception as exc:  # noqa: BLE001
                 msg = str(exc)
@@ -2179,11 +2086,7 @@ class ConfiguredRealSenseSource:
                             rs, width, height, try_fps, try_fmt
                         )
                         used = attempt
-                        self.pixel_format = (
-                            "rgb8"
-                            if self.bag_path and try_fmt not in {"z16", "y8"}
-                            else try_fmt
-                        )
+                        self.pixel_format = try_fmt
                         break
                     except Exception as exc2:  # noqa: BLE001
                         errors.append(
@@ -2243,7 +2146,11 @@ class ConfiguredRealSenseSource:
                 self._rs_recorder = profile.get_device().as_recorder()
                 if self.bag_start_paused and self._rs_recorder is not None:
                     self._rs_recorder.pause()
-                    logger.info("RealSense .bag pre-armed (paused) -> %s", self.bag_path)
+                    logger.info(
+                        "RealSense .bag pre-armed (paused) %s -> %s",
+                        self.pixel_format,
+                        self.bag_path,
+                    )
                 else:
                     dw, dh = self._depth_size_for(self.width, self.height)
                     logger.info(
