@@ -836,41 +836,40 @@ def _elgato_open_targets(
     max_index: int = 8,
     dshow_only: bool = False,
 ) -> list[tuple[Any, int]]:
-    """
-    Ordered OpenCV open attempts for Elgato 4K X / HD60.
+    """Open the Elgato card only.
 
-    Prefer ffmpeg DirectShow names, then scan indices (PnP index is unreliable).
-    For high-rate lock passes, use dshow_only=True (MSMF often caps Elgato at 60).
+    Named DirectShow path first, then this slot's own index. Do not scan
+    indexes 0..N — that opened the laptop webcam inside the Elgato slot.
+    ``max_index`` is unused and kept so older callers still import.
     """
+    del max_index
     targets: list[tuple[Any, int]] = []
     name_paths = list(elgato_open_name_paths())
     if open_path and open_path not in name_paths:
         name_paths.insert(0, open_path)
 
-    # 1) DirectShow by friendly name (ffmpeg-aligned preferred).
     for path in name_paths:
         targets.append((path, cv2.CAP_DSHOW))
 
-    # 2) Scan OpenCV indices — do not trust PnP/synthetic index alone.
-    indices = list(range(max_index))
-    if device_index not in indices and 0 <= device_index < 100:
-        indices.insert(0, device_index)
-    for idx in indices:
-        targets.append((idx, cv2.CAP_DSHOW))
+    friendly, _tag = friendly_name_for_index(int(device_index), "")
+    index_is_webcam = bool(friendly) and is_laptop_webcam(friendly)
+    if not index_is_webcam and device_index >= 0:
+        targets.append((int(device_index), cv2.CAP_DSHOW))
+    elif index_is_webcam:
+        logger.info(
+            "Not opening index %s for Elgato — that index is the laptop webcam (%s)",
+            device_index,
+            friendly,
+        )
 
     if dshow_only:
         return targets
 
-    # 3) MSMF last-resort for Elgato 4K X when DSHOW fails on Station A.
     for path in name_paths:
         targets.append((path, cv2.CAP_MSMF))
-    for idx in indices[:4]:
-        targets.append((idx, cv2.CAP_MSMF))
-
-    # 4) CAP_ANY
-    for idx in indices[:4]:
-        targets.append((idx, cv2.CAP_ANY))
-
+    if not index_is_webcam and device_index >= 0:
+        targets.append((int(device_index), cv2.CAP_MSMF))
+        targets.append((int(device_index), cv2.CAP_ANY))
     return targets
 
 
@@ -1371,6 +1370,8 @@ class FormattedUvcSource(CvCaptureSource):
                     open_targets.append((self.open_path, cv2.CAP_DSHOW))
                 if sys.platform == "win32" and self.device_tag == "uvc" and not self.open_path:
                     for path in dshow_open_paths_for_tag("uvc"):
+                        if is_laptop_webcam(path):
+                            continue
                         open_targets.append((path, cv2.CAP_DSHOW))
                 open_targets.append((self.device_index, self._backend))
                 if self.device_tag == "uvc" and self._backend == cv2.CAP_DSHOW:

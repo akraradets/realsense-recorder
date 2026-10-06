@@ -314,16 +314,36 @@ def test_elgato_open_targets_prefer_dshow_then_index_then_msmf(monkeypatch):
     monkeypatch.setattr(
         dev, "elgato_open_name_paths", lambda: ["video=Elgato 4K X"]
     )
-    targets = dev._elgato_open_targets("video=Elgato 4K X", device_index=0, max_index=3)
+    monkeypatch.setattr(
+        dev,
+        "friendly_name_for_index",
+        lambda index, fallback: ("Elgato 4K X", "elgato"),
+    )
+    targets = dev._elgato_open_targets("video=Elgato 4K X", device_index=1, max_index=8)
     assert targets[0] == ("video=Elgato 4K X", cv2.CAP_DSHOW)
-    # Index scan after named DSHOW
-    assert (0, cv2.CAP_DSHOW) in targets
-    assert (1, cv2.CAP_DSHOW) in targets
-    # MSMF appears after DSHOW index attempts
+    numeric = [t for t, _b in targets if isinstance(t, int)]
+    assert numeric == [1, 1, 1]
+    assert 0 not in numeric
     dshow_idxs = [i for i, (t, b) in enumerate(targets) if b == cv2.CAP_DSHOW]
     msmf_idxs = [i for i, (t, b) in enumerate(targets) if b == cv2.CAP_MSMF]
     assert msmf_idxs and max(dshow_idxs) < min(msmf_idxs)
     assert ("video=Elgato 4K X", cv2.CAP_MSMF) in targets
+
+
+def test_elgato_open_targets_skip_laptop_webcam_index(monkeypatch):
+    from poc1.deliverable1 import devices as dev
+
+    monkeypatch.setattr(
+        dev, "elgato_open_name_paths", lambda: ["video=Elgato 4K S"]
+    )
+    monkeypatch.setattr(
+        dev,
+        "friendly_name_for_index",
+        lambda index, fallback: ("USB2.0 HD UVC WebCam", "uvc"),
+    )
+    targets = dev._elgato_open_targets("video=Elgato 4K S", device_index=0, max_index=8)
+    assert targets
+    assert all(isinstance(target, str) for target, _backend in targets)
 
 
 def test_uvc_open_failure_message_distinguishes_open_vs_frames():
