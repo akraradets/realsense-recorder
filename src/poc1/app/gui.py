@@ -23,6 +23,7 @@ from typing import Optional
 from PIL import Image, ImageTk
 import numpy as np
 
+from poc1.app.cards import CameraCard
 from poc1.deliverable1.devices import (
     PreviewOpenCancelled,
     clear_preview_cancel,
