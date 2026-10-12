@@ -541,7 +541,7 @@ class MultiCamSession:
                 for s, mp4, csv, bag in jobs:
                     assert s.pipeline is not None
                     try:
-                        s.pipeline.start_recording(mp4, csv, bag_path=bag)
+                        s.pipeline.start_recording(mp4, csv, bag_path=bag, hold=True)
                     except Exception as exc:
                         # Leave preview alive and clean up any zero-byte/partial
                         # writer created by a failed start.
@@ -551,6 +551,31 @@ class MultiCamSession:
                             pass
                         if mp4.exists() and mp4.stat().st_size == 0:
                             mp4.unlink(missing_ok=True)
+                        raise RuntimeError(
+                            f"Camera {s.slot_id + 1} ({s.prefix}) could not start "
+                            f"recording at {s.pipeline.source.width}x"
+                            f"{s.pipeline.source.height}@"
+                            f"{s.pipeline.source.target_fps}: {exc}"
+                        ) from exc
+
+                # Drop frames left in each camera from preview, then start every
+                # file before any camera waits for its first recorded frame.
+                for s, _mp4, _csv, _bag in jobs:
+                    assert s.pipeline is not None
+                    s.pipeline._flush_record_start()
+                for s, _mp4, _csv, _bag in jobs:
+                    assert s.pipeline is not None
+                    s.pipeline.commit_recording()
+
+                for s, mp4, _csv, bag in jobs:
+                    assert s.pipeline is not None
+                    try:
+                        s.pipeline._finish_record_arm()
+                    except Exception as exc:
+                        try:
+                            s.pipeline.stop_recording()
+                        except Exception:  # noqa: BLE001
+                            pass
                         raise RuntimeError(
                             f"Camera {s.slot_id + 1} ({s.prefix}) could not start "
                             f"recording at {s.pipeline.source.width}x"

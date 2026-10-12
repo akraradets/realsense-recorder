@@ -21,7 +21,7 @@ logger = logging.getLogger("poc1.bag")
 _RECORD_SUFFIX: Optional[str] = ".db3"
 
 # Build stamp so operators can confirm they are not on a stale Phue copy.
-BUILD_ID = "sdk-record-v43-2026-10-06"
+BUILD_ID = "sdk-record-v44-2026-10-12"
 
 
 def can_record_bag(source: Any) -> bool:
@@ -302,6 +302,10 @@ def stop_bag_recording(source: Any) -> Optional[Path]:
                 source.pause_bag()
             except Exception:  # noqa: BLE001
                 pass
+            # Let the SDK write the frames it already accepted before the
+            # pipeline is torn down. Stopping immediately drops that tail,
+            # so the MP4 (still draining its queue) ends up longer than the .db3.
+            time.sleep(0.15)
         source.stop()
     except Exception:  # noqa: BLE001
         pass

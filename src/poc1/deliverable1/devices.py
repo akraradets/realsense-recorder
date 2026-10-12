@@ -1779,9 +1779,19 @@ class FormattedUvcSource(CvCaptureSource):
         # when the HDMI/OBS pin could do 120.
         return super().read()
 
+    def flush_to_live(self) -> None:
+        """Drop stale Elgato frames so this take does not start seconds behind."""
+        self._pending_frame = None
+        ff = self._ffmpeg
+        flush = getattr(ff, "flush_to_live", None) if ff is not None else None
+        if callable(flush):
+            try:
+                flush()
+            except Exception:  # noqa: BLE001
+                pass
+
 
 class ConfiguredRealSenseSource:
-    """RealSense color/depth source honoring selected resolution/FPS/format."""
 
     mode = "hardware"
     allow_fps_remux = False
