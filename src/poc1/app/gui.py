@@ -21,8 +21,14 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from PIL import Image, ImageTk
+import numpy as np
 
 from poc1.app.cards import CameraCard
+from poc1.deliverable1.devices import (
+    PreviewOpenCancelled,
+    clear_preview_cancel,
+    request_preview_cancel,
+)
 from poc1.app.user_messages import (
     bag_file_missing,
     capture_not_120_status,
@@ -488,6 +494,7 @@ class UnifiedApp:
         if self.busy:
             return
         self._sync_all()
+        clear_preview_cancel()
         self._set_busy(True)
         self.set_status("Opening cameras… (UI stays responsive)")
         for card in self.cards:
@@ -496,12 +503,24 @@ class UnifiedApp:
 
         def worker() -> None:
             error: Optional[str] = None
+            cancelled = False
             try:
                 self.session.start_previews()
+            except PreviewOpenCancelled:
+                cancelled = True
             except Exception as exc:  # noqa: BLE001
                 logger.exception("start_previews failed")
                 error = str(exc)
-            self.root.after(0, lambda err=error: self._previews_started(err))
+            if cancelled:
+                try:
+                    self.session.stop_previews()
+                except Exception:  # noqa: BLE001
+                    logger.exception("stop after cancel failed")
+            self.root.after(
+                0, lambda err=error, was_cancelled=cancelled: self._previews_started(
+                    err, cancelled=was_cancelled
+                )
+            )
 
         threading.Thread(target=worker, name="app-preview-start", daemon=True).start()
 
@@ -512,6 +531,7 @@ class UnifiedApp:
             self.cards[slot_id].sync_controls()
         except Exception:  # noqa: BLE001
             pass
+        clear_preview_cancel()
         self._set_busy(True)
         self.set_status(f"Opening camera {slot_id + 1}…")
         try:
@@ -521,20 +541,42 @@ class UnifiedApp:
 
         def worker() -> None:
             error: Optional[str] = None
+            cancelled = False
             try:
                 self.session.start_slot_preview(slot_id)
+            except PreviewOpenCancelled:
+                cancelled = True
             except Exception as exc:  # noqa: BLE001
                 logger.exception("start_slot_preview failed")
                 error = str(exc)
-            self.root.after(0, lambda err=error, sid=slot_id: self._slot_preview_started(sid, err))
+            if cancelled:
+                try:
+                    self.session.stop_slot_preview(slot_id)
+                except Exception:  # noqa: BLE001
+                    logger.exception("stop slot after cancel failed")
+            self.root.after(
+                0,
+                lambda err=error, sid=slot_id, was_cancelled=cancelled: self._slot_preview_started(
+                    sid, err, cancelled=was_cancelled
+                ),
+            )
 
         threading.Thread(
             target=worker, name=f"app-preview-slot{slot_id}", daemon=True
         ).start()
 
-    def _previews_started(self, error: Optional[str]) -> None:
+    def _previews_started(self, error: Optional[str], cancelled: bool = False) -> None:
         self._set_busy(False)
+        clear_preview_cancel()
         self._clear_opening_placeholders()
+        if cancelled:
+            for card in self.cards:
+                if self.session.slots[card.slot_id].pipeline is None:
+                    card.preview.configure(image="", text="Preview stopped")
+                    card._photo = None
+            self.set_status("Preview open cancelled.")
+            self.refresh_record_gate()
+            return
         for card in self.cards:
             try:
                 card.sync_opened_mode_from_source()
@@ -561,9 +603,21 @@ class UnifiedApp:
             self.set_status(f"{msg}. Open Record when ready.")
         self.refresh_record_gate()
 
-    def _slot_preview_started(self, slot_id: int, error: Optional[str]) -> None:
+    def _slot_preview_started(
+        self, slot_id: int, error: Optional[str], cancelled: bool = False
+    ) -> None:
         self._set_busy(False)
+        clear_preview_cancel()
         self._clear_opening_placeholders()
+        if cancelled:
+            try:
+                self.cards[slot_id].preview.configure(image="", text="Preview stopped")
+                self.cards[slot_id]._photo = None
+            except Exception:  # noqa: BLE001
+                pass
+            self.set_status(f"Camera {slot_id + 1} open cancelled.")
+            self.refresh_record_gate()
+            return
         if error:
             self.set_status(f"Camera {slot_id + 1} preview failed.")
             slot = self.session.slots[slot_id]
@@ -611,10 +665,12 @@ class UnifiedApp:
         )
 
     def stop_all_previews(self) -> None:
-        if self.busy:
-            return
         if self.session.is_recording:
             messagebox.showwarning("Recording", "Stop recording first.")
+            return
+        if self.busy:
+            request_preview_cancel()
+            self.set_status("Stopping camera open…")
             return
         self.session.stop_previews()
         for card in self.cards:
@@ -751,8 +807,22 @@ class UnifiedApp:
             th = tile.winfo_height()
             if tw < 40 or th < 40:
                 continue
-            rgb = bgr_to_rgb_fill(frame, tw, th)
             src = slot.pipeline.source if slot.pipeline else None
+            depth = slot.get_depth_preview_frame()
+            try:
+                if depth is not None and getattr(src, "device_tag", "") == "realsense":
+                    half = max(tw // 2, 40)
+                    left = bgr_to_rgb_fill(frame, half, th)
+                    right = bgr_to_rgb_fill(depth, max(tw - half, 40), th)
+                    if left.shape[0] != right.shape[0] or left.ndim != right.ndim:
+                        rgb = bgr_to_rgb_fill(frame, tw, th)
+                    else:
+                        rgb = np.concatenate([left, right], axis=1)
+                else:
+                    rgb = bgr_to_rgb_fill(frame, tw, th)
+            except Exception:  # noqa: BLE001
+                logger.exception("record tile draw failed")
+                continue
             if src is not None:
                 rgb = overlay_hud(rgb, hud_lines_for_source(slot, src))
             photo = ImageTk.PhotoImage(Image.fromarray(rgb))
@@ -773,9 +843,10 @@ class UnifiedApp:
             self.refresh_btn,
             self.add_btn,
             self.start_all_btn,
-            self.stop_all_btn,
         ):
             btn.configure(state=state)
+        # Stop stays available while a preview is opening so it can cancel.
+        self.stop_all_btn.configure(state="disabled" if recording else "normal")
         self.out_entry.configure(state=state)
         if recording:
             self.record_btn.configure(state="disabled")
@@ -1214,9 +1285,15 @@ class UnifiedApp:
         # was freezing Tk ("Not Responding").
         if page == str(self.setup_page):
             for card in self.cards:
-                card.tick()
+                try:
+                    card.tick()
+                except Exception:  # noqa: BLE001
+                    logger.exception("preview tick failed for slot %s", getattr(card, "slot_id", "?"))
         elif page == str(self.record_page):
-            self._tick_record_tiles()
+            try:
+                self._tick_record_tiles()
+            except Exception:  # noqa: BLE001
+                logger.exception("record preview tick failed")
             if self.session.is_recording:
                 extra = self._elgato_live_lines()
                 if extra:
@@ -1227,8 +1304,16 @@ class UnifiedApp:
         self.root.after(delay_ms, self._tick)
 
     def _on_close(self) -> None:
-        if self.busy:
+        if self.busy and self.session.is_recording:
             messagebox.showwarning("Please wait", "Finish saving before closing.")
+            return
+        if self.busy:
+            request_preview_cancel()
+            messagebox.showwarning(
+                "Please wait",
+                "A camera is still opening. Stop was requested. "
+                "Wait until the preview clears, then close.",
+            )
             return
         if self.session.is_recording and not messagebox.askyesno(
             "Recording", "Stop and save, then close?"

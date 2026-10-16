@@ -21,6 +21,25 @@ def classify_capture_name(name: str) -> str:
     return _classify(name)
 
 
+def is_laptop_webcam(name: str) -> bool:
+    """Built-in or generic UVC webcams. Not Elgato, RealSense, or virtual cams."""
+    text = (name or "").lower()
+    if not text or _classify(text) != "uvc":
+        return False
+    return any(
+        key in text
+        for key in (
+            "webcam",
+            "web cam",
+            "integrated camera",
+            "facetime",
+            "truevision",
+            "easy camera",
+            "usb2.0 hd uvc",
+        )
+    )
+
+
 def _classify(name: str) -> str:
     low = name.lower()
     if any(

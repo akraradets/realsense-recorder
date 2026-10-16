@@ -14,16 +14,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-from poc1.preview_draw import PREVIEW_HZ, downscale_for_preview
+import numpy as np
+
+from poc1.preview_draw import PREVIEW_HZ, colorize_depth_preview, downscale_for_preview
 from poc1.bag_recorder import clear_bag_on_source, with_sdk_record_suffix
 from poc1.camera_handler import FrameEnvelope
 from poc1.deliverable1.devices import (
     ConnectedCamera,
+    PreviewOpenCancelled,
     StreamMode,
     build_frame_source,
     list_all_cameras,
     list_stream_modes,
     prefix_for_camera,
+    preview_cancel_requested,
 )
 from poc1.pipeline import Pipeline
 
@@ -50,6 +54,7 @@ class CameraSlot:
     available_modes: list[StreamMode] = field(default_factory=list)
     pipeline: Optional[Pipeline] = None
     last_frame: Optional[object] = None  # numpy array
+    last_depth_frame: Optional[object] = None
     last_report: dict = field(default_factory=dict)
     status: str = "idle"
     record_bag: bool = False
@@ -66,9 +71,18 @@ class CameraSlot:
         if env.frame is None:
             return
         small = downscale_for_preview(env.frame)
+        depth = None
+        src = self.pipeline.source if self.pipeline is not None else None
+        raw_depth = getattr(src, "_depth_raw", None) if src is not None else None
+        if raw_depth is not None:
+            try:
+                depth = downscale_for_preview(colorize_depth_preview(np.array(raw_depth, copy=True)))
+            except Exception:  # noqa: BLE001
+                depth = None
         self._preview_draw_t = now
         with self._frame_lock:
             self.last_frame = small
+            self.last_depth_frame = depth
             self._preview_ts.append(time.time())
             if len(self._preview_ts) > 90:
                 self._preview_ts = self._preview_ts[-90:]
@@ -78,6 +92,12 @@ class CameraSlot:
             if self.last_frame is None:
                 return None
             return self.last_frame
+
+    def get_depth_preview_frame(self):
+        with self._frame_lock:
+            if self.last_depth_frame is None:
+                return None
+            return self.last_depth_frame
 
     def estimate_preview_fps(self) -> Optional[float]:
         """Recent live preview rate (informational only — never changes record stamp)."""
@@ -278,7 +298,14 @@ class MultiCamSession:
             # and would fail Start preview when the checkbox is on).
             clear_bag_on_source(source)
             pipe = Pipeline(source=source, on_preview_frame=slot.on_preview)
-            pipe.start_preview()
+            try:
+                pipe.start_preview()
+            except Exception:
+                try:
+                    pipe.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
             slot.pipeline = pipe
             slot.status = f"preview {slot.camera.kind} {slot.mode.label()}"
             if slot.record_bag and slot.camera.kind == "realsense":
@@ -341,6 +368,8 @@ class MultiCamSession:
             key=_order,
         )
         for slot in ordered:
+            if preview_cancel_requested():
+                raise PreviewOpenCancelled("Preview open cancelled")
             try:
                 self.start_slot_preview(slot.slot_id)
                 # Brief pause so USB / exclusive access settles before the next open.
@@ -349,6 +378,8 @@ class MultiCamSession:
                     or (want_elgato_first and slot.camera.device_tag == "elgato")
                 ):
                     time.sleep(0.35)
+            except PreviewOpenCancelled:
+                raise
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"slot{slot.slot_id}: {exc}")
                 slot.status = f"error: {exc}"
@@ -510,7 +541,7 @@ class MultiCamSession:
                 for s, mp4, csv, bag in jobs:
                     assert s.pipeline is not None
                     try:
-                        s.pipeline.start_recording(mp4, csv, bag_path=bag)
+                        s.pipeline.start_recording(mp4, csv, bag_path=bag, hold=True)
                     except Exception as exc:
                         # Leave preview alive and clean up any zero-byte/partial
                         # writer created by a failed start.
@@ -520,6 +551,31 @@ class MultiCamSession:
                             pass
                         if mp4.exists() and mp4.stat().st_size == 0:
                             mp4.unlink(missing_ok=True)
+                        raise RuntimeError(
+                            f"Camera {s.slot_id + 1} ({s.prefix}) could not start "
+                            f"recording at {s.pipeline.source.width}x"
+                            f"{s.pipeline.source.height}@"
+                            f"{s.pipeline.source.target_fps}: {exc}"
+                        ) from exc
+
+                # Drop frames left in each camera from preview, then start every
+                # file before any camera waits for its first recorded frame.
+                for s, _mp4, _csv, _bag in jobs:
+                    assert s.pipeline is not None
+                    s.pipeline._flush_record_start()
+                for s, _mp4, _csv, _bag in jobs:
+                    assert s.pipeline is not None
+                    s.pipeline.commit_recording()
+
+                for s, mp4, _csv, bag in jobs:
+                    assert s.pipeline is not None
+                    try:
+                        s.pipeline._finish_record_arm()
+                    except Exception as exc:
+                        try:
+                            s.pipeline.stop_recording()
+                        except Exception:  # noqa: BLE001
+                            pass
                         raise RuntimeError(
                             f"Camera {s.slot_id + 1} ({s.prefix}) could not start "
                             f"recording at {s.pipeline.source.width}x"

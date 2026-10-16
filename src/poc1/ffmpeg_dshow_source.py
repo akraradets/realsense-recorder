@@ -418,6 +418,17 @@ class FfmpegDshowCaptureSource:
             return newer if newer is not None else frame
         return self._dequeue_newest(block=True)
 
+    def flush_to_live(self) -> None:
+        """Drop queued pipe frames so Record starts at the live edge."""
+        self._pending = None
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                break
+
     def stop(self) -> None:
         self._running = False
         proc = self._proc

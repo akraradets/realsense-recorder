@@ -7,6 +7,7 @@ from tkinter import messagebox, ttk
 from typing import TYPE_CHECKING, Optional
 
 from PIL import Image, ImageTk
+import numpy as np
 
 logger = logging.getLogger("poc1.app.cards")
 
@@ -363,6 +364,7 @@ class CameraCard(tk.Frame):
 
     def stop_preview(self) -> None:
         if self.app.busy:
+            self.app.stop_all_previews()
             return
         self.session.stop_slot_preview(self.slot_id)
         self.preview.configure(image="", text="Preview stopped")
@@ -415,7 +417,21 @@ class CameraCard(tk.Frame):
             return
         tw = max(self.preview_shell.winfo_width() - 4, 280)
         th = max(self.preview_shell.winfo_height() - 4, 160)
-        rgb = bgr_to_rgb_fill(frame, tw, th)
+        depth = slot.get_depth_preview_frame()
+        try:
+            if depth is not None and getattr(src, "device_tag", "") == "realsense":
+                half = max(tw // 2, 80)
+                left = bgr_to_rgb_fill(frame, half, th)
+                right = bgr_to_rgb_fill(depth, max(tw - half, 80), th)
+                if left.shape[0] != right.shape[0] or left.ndim != right.ndim:
+                    rgb = bgr_to_rgb_fill(frame, tw, th)
+                else:
+                    rgb = np.concatenate([left, right], axis=1)
+            else:
+                rgb = bgr_to_rgb_fill(frame, tw, th)
+        except Exception:  # noqa: BLE001
+            logger.exception("preview draw failed for slot %d", self.slot_id)
+            return
         if src is not None:
             try:
                 rgb = overlay_hud(rgb, hud_lines_for_source(slot, src))

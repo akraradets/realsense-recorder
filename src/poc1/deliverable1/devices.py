@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,7 @@ from poc1.deliverable1.win_names import (
     elgato_open_name_paths,
     ffmpeg_available,
     friendly_name_for_index,
+    is_laptop_webcam,
     list_windows_capture_names,
     names_are_index_aligned,
 )
@@ -37,6 +39,26 @@ from poc1.realsense_source import (
 )
 
 logger = logging.getLogger("poc1.d1.devices")
+
+# Set while Stop is pressed during a preview open. The Elgato search checks it
+# between devices so the UI is not stuck until every UVC index is measured.
+_preview_cancel = threading.Event()
+
+
+class PreviewOpenCancelled(RuntimeError):
+    """Operator pressed Stop while a camera was still opening."""
+
+
+def request_preview_cancel() -> None:
+    _preview_cancel.set()
+
+
+def clear_preview_cancel() -> None:
+    _preview_cancel.clear()
+
+
+def preview_cancel_requested() -> bool:
+    return _preview_cancel.is_set()
 
 # Sensible presets when the driver does not expose a full mode list.
 _UVC_PRESET_MODES: list[tuple[int, int, int, str]] = [
@@ -382,7 +404,7 @@ def _merge_windows_named_cameras(
 
     for i, name in enumerate(names):
         tag = classify_capture_name(name)
-        if tag == "virtual":
+        if tag == "virtual" or is_laptop_webcam(name):
             continue
         path = f"video={name}"
         if path in claimed_paths:
@@ -504,7 +526,15 @@ def list_uvc_cameras(
         _merge_windows_named_cameras(found_by_index, backends[0][0], backends[0][1])
         _ensure_elgato_entries(found_by_index, backends[0][0], backends[0][1])
 
-    return [found_by_index[i] for i in sorted(found_by_index)]
+    cameras = [found_by_index[i] for i in sorted(found_by_index)]
+    kept: list[ConnectedCamera] = []
+    for cam in cameras:
+        label = f"{cam.name} {cam.open_path or ''}"
+        if is_laptop_webcam(label):
+            logger.info("Hiding laptop webcam from camera list: %s", cam.name)
+            continue
+        kept.append(cam)
+    return kept
 
 
 def list_realsense_cameras() -> list[ConnectedCamera]:
@@ -597,6 +627,7 @@ def pick_auto_camera_for_slot(
                 kind == "uvc"
                 and d.kind == "uvc"
                 and d.device_tag not in {"virtual", "realsense-uvc"}
+                and not is_laptop_webcam(f"{d.name} {d.open_path or ''}")
             ):
                 return d
             if kind == "fake" and d.kind == "fake":
@@ -621,142 +652,26 @@ def _rs_format_name(fmt: Any) -> str:
 
 
 def list_realsense_modes(serial: Optional[str] = None) -> list[StreamMode]:
+    """Station color modes only.
+
+    The D435 advertises well over a hundred profiles. The dropdown keeps the
+    sizes this capture station uses, in rgb8, bgr8, and yuyv. Depth is written
+    into the same .db3 as z16 and is not a separate row. rgb8 is first so a
+    new slot records a file RealSense Viewer can show with red intact.
     """
-    R2 — all video profiles the RealSense SDK advertises for this device.
-
-    Includes color (preferred for MP4) plus depth/IR so higher FPS options the
-    sensor supports (often on depth) appear in the configuration dropdown.
-    """
-    if not realsense_available():
-        return [
-            StreamMode(1280, 720, 30, "bgr8"),
-            StreamMode(1920, 1080, 30, "bgr8"),
-            StreamMode(640, 480, 30, "bgr8"),
-            StreamMode(848, 480, 90, "z16"),
-            StreamMode(640, 480, 90, "z16"),
-        ]
-    import pyrealsense2 as rs
-
-    ctx = rs.context()
-    device = None
-    for dev in ctx.query_devices():
-        sn = dev.get_info(rs.camera_info.serial_number)
-        if serial is None or sn == serial:
-            device = dev
-            break
-    if device is None:
-        logger.warning(
-            "list_realsense_modes: serial=%s not found — returning common presets",
-            serial,
-        )
-        return [
-            StreamMode(1280, 720, 30, "bgr8"),
-            StreamMode(1920, 1080, 30, "bgr8"),
-            StreamMode(640, 480, 30, "bgr8"),
-            StreamMode(848, 480, 90, "z16"),
-        ]
-
-    modes: list[StreamMode] = []
-    seen: set[tuple[int, int, int, str]] = set()
-    try:
-        sensors = list(device.query_sensors())
-    except Exception:  # noqa: BLE001
-        sensors = []
-
-    allowed_streams = {
-        rs.stream.color,
-        rs.stream.depth,
-        rs.stream.infrared,
-    }
-    for sensor in sensors:
-        try:
-            profiles = sensor.get_stream_profiles()
-        except Exception:  # noqa: BLE001
-            continue
-        for p in profiles:
-            try:
-                vp = p.as_video_stream_profile()
-            except Exception:  # noqa: BLE001
-                continue
-            try:
-                st = vp.stream_type()
-            except Exception:  # noqa: BLE001
-                continue
-            if st not in allowed_streams:
-                continue
-            try:
-                w, h = int(vp.width()), int(vp.height())
-                fps = int(round(float(vp.fps())))
-                fmt = _rs_format_name(vp.format())
-            except Exception:  # noqa: BLE001
-                continue
-            if fps <= 0 or w <= 0 or h <= 0:
-                continue
-
-            # Map stream+format to a pipeline pixel_format the GUI can open.
-            if st == rs.stream.color:
-                if fmt not in {"bgr8", "rgb8", "yuyv", "y8"}:
-                    continue
-                # D400 color is 30 (sometimes 60). Never invent 90/120 for RGB.
-                if fps > 60:
-                    continue
-            elif st == rs.stream.depth:
-                # Depth is recorded/previewed via colorizer → BGR for MP4.
-                fmt = "z16"
-            elif st == rs.stream.infrared:
-                if fmt not in {"y8", "y16"}:
-                    fmt = "y8"
-                else:
-                    fmt = "y8"
-            else:
-                continue
-
-            key = (w, h, fps, fmt)
-            if key in seen:
-                continue
-            seen.add(key)
-            modes.append(StreamMode(w, h, fps, fmt))
-
-    # Extra color presets at 30fps only. Do not advertise 120 for D400 color —
-    # the SDK list above already includes 60 if the device supports it.
-    for preset in (
-        StreamMode(1920, 1080, 30, "bgr8"),
-        StreamMode(1280, 720, 30, "bgr8"),
-        StreamMode(848, 480, 30, "bgr8"),
+    modes = [
+        StreamMode(640, 480, 30, "rgb8"),
         StreamMode(640, 480, 30, "bgr8"),
-        StreamMode(640, 480, 90, "z16"),
-        StreamMode(848, 480, 90, "z16"),
-        StreamMode(1280, 720, 30, "z16"),
-    ):
-        key = (preset.width, preset.height, preset.fps, preset.pixel_format)
-        if key not in seen:
-            seen.add(key)
-            modes.append(preset)
-
-    if not modes:
-        modes = [
-            StreamMode(1280, 720, 30, "bgr8"),
-            StreamMode(640, 480, 30, "bgr8"),
-        ]
-
-    # Sort: color first, 30fps color preferred, bgr8 before rgb8, then resolution.
-    def mode_priority(mode: StreamMode) -> tuple:
-        is_color = 0 if mode.pixel_format in {"bgr8", "rgb8", "yuyv"} else 1
-        pixels = mode.width * mode.height
-        fps_bias = 0 if mode.fps == 30 else (1 if mode.fps < 90 else 2)
-        fmt_pref = (
-            0
-            if mode.pixel_format == "bgr8"
-            else (1 if mode.pixel_format == "rgb8" else 2)
-        )
-        return (is_color, fps_bias, fmt_pref, -pixels, -mode.fps)
-
-    modes.sort(key=mode_priority)
+        StreamMode(640, 480, 30, "yuyv"),
+        StreamMode(1280, 720, 30, "rgb8"),
+        StreamMode(1280, 720, 30, "bgr8"),
+        StreamMode(1280, 720, 30, "yuyv"),
+    ]
     logger.info(
-        "RealSense modes for sn=%s: %d profiles (fps set=%s)",
-        serial,
+        "RealSense modes for sn=%s: %d station profiles %s",
+        serial or "any",
         len(modes),
-        sorted({m.fps for m in modes}),
+        [m.label() for m in modes],
     )
     return modes
 
@@ -921,41 +836,40 @@ def _elgato_open_targets(
     max_index: int = 8,
     dshow_only: bool = False,
 ) -> list[tuple[Any, int]]:
-    """
-    Ordered OpenCV open attempts for Elgato 4K X / HD60.
+    """Open the Elgato card only.
 
-    Prefer ffmpeg DirectShow names, then scan indices (PnP index is unreliable).
-    For high-rate lock passes, use dshow_only=True (MSMF often caps Elgato at 60).
+    Named DirectShow path first, then this slot's own index. Do not scan
+    indexes 0..N — that opened the laptop webcam inside the Elgato slot.
+    ``max_index`` is unused and kept so older callers still import.
     """
+    del max_index
     targets: list[tuple[Any, int]] = []
     name_paths = list(elgato_open_name_paths())
     if open_path and open_path not in name_paths:
         name_paths.insert(0, open_path)
 
-    # 1) DirectShow by friendly name (ffmpeg-aligned preferred).
     for path in name_paths:
         targets.append((path, cv2.CAP_DSHOW))
 
-    # 2) Scan OpenCV indices — do not trust PnP/synthetic index alone.
-    indices = list(range(max_index))
-    if device_index not in indices and 0 <= device_index < 100:
-        indices.insert(0, device_index)
-    for idx in indices:
-        targets.append((idx, cv2.CAP_DSHOW))
+    friendly, _tag = friendly_name_for_index(int(device_index), "")
+    index_is_webcam = bool(friendly) and is_laptop_webcam(friendly)
+    if not index_is_webcam and device_index >= 0:
+        targets.append((int(device_index), cv2.CAP_DSHOW))
+    elif index_is_webcam:
+        logger.info(
+            "Not opening index %s for Elgato — that index is the laptop webcam (%s)",
+            device_index,
+            friendly,
+        )
 
     if dshow_only:
         return targets
 
-    # 3) MSMF last-resort for Elgato 4K X when DSHOW fails on Station A.
     for path in name_paths:
         targets.append((path, cv2.CAP_MSMF))
-    for idx in indices[:4]:
-        targets.append((idx, cv2.CAP_MSMF))
-
-    # 4) CAP_ANY
-    for idx in indices[:4]:
-        targets.append((idx, cv2.CAP_ANY))
-
+    if not index_is_webcam and device_index >= 0:
+        targets.append((int(device_index), cv2.CAP_MSMF))
+        targets.append((int(device_index), cv2.CAP_ANY))
     return targets
 
 
@@ -1294,8 +1208,13 @@ class FormattedUvcSource(CvCaptureSource):
                 got_h,
                 got_fps,
             )
-            # Driver advertises high-rate (or 0/unknown) at the right size → use it.
+            if preview_cancel_requested():
+                return best
+            # Wrong camera (often the laptop webcam) negotiated a smaller size.
+            # Further pin orders and fps windows will not turn 720 into 1080.
             size_ok = got_w >= int(width * 0.9) and got_h >= int(height * 0.9)
+            if not size_ok:
+                return best
             fps_ok = got_fps <= 0.5 or got_fps >= fps * 0.85
             if size_ok and fps_ok:
                 return frame
@@ -1330,6 +1249,8 @@ class FormattedUvcSource(CvCaptureSource):
         self._cap = cap
         best = 0.0
         for attempt in range(3):
+            if preview_cancel_requested():
+                return best
             if attempt > 0:
                 w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or self.width or 1920)
                 h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or self.height or 1080)
@@ -1350,6 +1271,9 @@ class FormattedUvcSource(CvCaptureSource):
                 fps,
             )
             if measured >= fps * 0.85:
+                return measured
+            # ~9fps or ~30fps will not climb to 120. One sample is enough.
+            if measured < 45.0:
                 return measured
         return best
 
@@ -1435,9 +1359,6 @@ class FormattedUvcSource(CvCaptureSource):
                         int(self.device_index or 0),
                         dshow_only=True,
                     )
-                    # Three exclusive DSHOW passes with a short settle between —
-                    # OBS often needs a reopen after another app released the pin.
-                    open_targets = open_targets + open_targets + open_targets
                 else:
                     open_targets = _elgato_open_targets(
                         self.open_path, int(self.device_index or 0)
@@ -1449,6 +1370,8 @@ class FormattedUvcSource(CvCaptureSource):
                     open_targets.append((self.open_path, cv2.CAP_DSHOW))
                 if sys.platform == "win32" and self.device_tag == "uvc" and not self.open_path:
                     for path in dshow_open_paths_for_tag("uvc"):
+                        if is_laptop_webcam(path):
+                            continue
                         open_targets.append((path, cv2.CAP_DSHOW))
                 open_targets.append((self.device_index, self._backend))
                 if self.device_tag == "uvc" and self._backend == cv2.CAP_DSHOW:
@@ -1459,6 +1382,14 @@ class FormattedUvcSource(CvCaptureSource):
             seen_open: set[tuple[str, int]] = set()
             pass_n = 0
             for target, backend in open_targets:
+                if preview_cancel_requested():
+                    try:
+                        if self._cap is not None:
+                            self._cap.release()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._cap = None
+                    raise PreviewOpenCancelled("Preview open cancelled")
                 ok_key = (str(target), int(backend))
                 # Allow repeated DSHOW passes for high-rate (exclusive pin after OBS).
                 if want_high:
@@ -1520,17 +1451,18 @@ class FormattedUvcSource(CvCaptureSource):
                         self.device_index = target
                     owned = np.ascontiguousarray(frame)
                     self._pending_frame = owned
-                    if is_elgato and fps >= 90:
-                        measured = self._elgato_measure_high_rate(cap, fps)
-                    else:
-                        measured = 0.0
-                    reported = float(cap.get(cv2.CAP_PROP_FPS) or 0)
-                    rate = measured if measured > 1 else (
-                        reported if reported > 0 else float(fps)
-                    )
                     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
                     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
-                    # Reject silent resolution fallback (1080 request → 720 open).
+                    if preview_cancel_requested():
+                        try:
+                            cap.release()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        self._cap = None
+                        raise PreviewOpenCancelled("Preview open cancelled")
+                    # Reject silent resolution fallback (1080 request → 720 open)
+                    # before the multi-second fps window. That window is what
+                    # kept the webcam (720 @ ~9fps) blocking Stop.
                     if want_high and (
                         w < int(wanted_w * 0.9) or h < int(wanted_h * 0.9)
                     ):
@@ -1543,6 +1475,21 @@ class FormattedUvcSource(CvCaptureSource):
                             wanted_fps,
                         )
                         continue
+                    if is_elgato and fps >= 90:
+                        measured = self._elgato_measure_high_rate(cap, fps)
+                    else:
+                        measured = 0.0
+                    if preview_cancel_requested():
+                        try:
+                            cap.release()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        self._cap = None
+                        raise PreviewOpenCancelled("Preview open cancelled")
+                    reported = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+                    rate = measured if measured > 1 else (
+                        reported if reported > 0 else float(fps)
+                    )
                     candidate = (rate, w, h, fps, fmt, cap, owned)
                     logger.info(
                         "UVC opened via target=%r backend=%s %dx%d@%d %s (measured ~%.1f)",
@@ -1585,6 +1532,17 @@ class FormattedUvcSource(CvCaptureSource):
                             fps,
                             rate,
                         )
+                        if not ffmpeg_available():
+                            logger.warning(
+                                "ffmpeg missing — keeping %dx%d ~%.1ffps "
+                                "instead of scanning other cameras",
+                                w,
+                                h,
+                                rate,
+                            )
+                            chosen = candidate
+                            accepted_here = True
+                            break
                         continue
                     chosen = candidate
                     accepted_here = True
@@ -1603,7 +1561,7 @@ class FormattedUvcSource(CvCaptureSource):
 
             # Fallbacks when 120 never locked: same resolution only (no 1080→720).
             # Never open MSMF for want_high — Media Foundation commonly caps Elgato @60.
-            if chosen is None and want_high:
+            if chosen is None and want_high and ffmpeg_available():
                 logger.warning(
                     "Elgato could not lock ~%dfps at %dx%d after OBS-style DSHOW retries. "
                     "Fully quit OBS, confirm HDMI is 1080p120, then Start preview again. "
@@ -1619,6 +1577,8 @@ class FormattedUvcSource(CvCaptureSource):
                 )
                 seen_open = set()
                 for target, backend in open_targets:
+                    if preview_cancel_requested():
+                        raise PreviewOpenCancelled("Preview open cancelled")
                     ok_key = (str(target), int(backend))
                     if ok_key in seen_open:
                         continue
@@ -1819,9 +1779,19 @@ class FormattedUvcSource(CvCaptureSource):
         # when the HDMI/OBS pin could do 120.
         return super().read()
 
+    def flush_to_live(self) -> None:
+        """Drop stale Elgato frames so this take does not start seconds behind."""
+        self._pending_frame = None
+        ff = self._ffmpeg
+        flush = getattr(ff, "flush_to_live", None) if ff is not None else None
+        if callable(flush):
+            try:
+                flush()
+            except Exception:  # noqa: BLE001
+                pass
+
 
 class ConfiguredRealSenseSource:
-    """RealSense color/depth source honoring selected resolution/FPS/format."""
 
     mode = "hardware"
     allow_fps_remux = False
@@ -1855,6 +1825,8 @@ class ConfiguredRealSenseSource:
         self._wanted = (self.width, self.height, self.target_fps, self.pixel_format)
         # When True, pause SDK bag writer immediately after start (preview pre-arm).
         self.bag_start_paused: bool = False
+        self._depth_enabled: bool = False
+        self._depth_raw: Optional[np.ndarray] = None
 
     @staticmethod
     def _rs_format(rs, name: str):
@@ -1888,6 +1860,66 @@ class ConfiguredRealSenseSource:
                 f"Connected: {', '.join(serials) or '(none)'}. Click Refresh."
             )
 
+    # SDK bag color + depth. One .db3 holds Color_0 and Depth_0.
+    BAG_WIDTH = 640
+    BAG_HEIGHT = 480
+    BAG_FPS = 30
+
+    @staticmethod
+    def _depth_size_for(width: int, height: int) -> tuple[int, int]:
+        """D400 depth tops out at 1280x720; keep matching size when possible."""
+        w, h = int(width), int(height)
+        if w <= 1280 and h <= 720:
+            return w, h
+        return 1280, 720
+
+    def _enable_bag_color_depth(
+        self,
+        rs,
+        config,
+        width: int,
+        height: int,
+        fps: int,
+        pixel_format: str,
+    ) -> None:
+        """Record the selected color format plus depth in one .db3.
+
+        The Setup dropdown chooses rgb8, bgr8, or yuyv. That format is what
+        the bag stores. rgb8 is the one RealSense Viewer shows with red intact
+        when Available Streams is RGB8. Preview and the MP4 still convert to BGR.
+        """
+        fmt_name = (pixel_format or "rgb8").lower()
+        if fmt_name not in {"rgb8", "bgr8", "yuyv"}:
+            fmt_name = "rgb8"
+        color_fps = int(fps) if int(fps) > 0 else self.BAG_FPS
+        dw, dh = self._depth_size_for(width, height)
+        config.enable_stream(
+            rs.stream.color,
+            int(width),
+            int(height),
+            self._rs_format(rs, fmt_name),
+            color_fps,
+        )
+        config.enable_stream(
+            rs.stream.depth,
+            dw,
+            dh,
+            rs.format.z16,
+            color_fps,
+        )
+        logger.info(
+            "RealSense bag streams: color %dx%d@%d %s + depth %dx%d@%d z16",
+            int(width),
+            int(height),
+            color_fps,
+            fmt_name,
+            dw,
+            dh,
+            color_fps,
+        )
+        if self._colorizer is None:
+            self._colorizer = rs.colorizer()
+
     def _start_profile(
         self,
         rs,
@@ -1895,26 +1927,45 @@ class ConfiguredRealSenseSource:
         height: int,
         fps: int,
         pixel_format: str,
+        *,
+        with_depth: bool = False,
     ):
         pipeline = rs.pipeline()
         config = rs.config()
         if self.serial:
             config.enable_device(self.serial)
         fmt = pixel_format.lower()
-        if fmt == "z16":
+        # Bag record is a fixed dual stream so the file has Color_0 and Depth_0.
+        if self.bag_path and fmt not in {"y8"}:
+            self._enable_bag_color_depth(rs, config, width, height, fps, fmt)
+            self._depth_enabled = True
+        elif fmt == "z16":
             config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
             self._colorizer = rs.colorizer()
+            self._depth_enabled = True
         elif fmt == "y8":
             try:
                 config.enable_stream(rs.stream.infrared, width, height, rs.format.y8, fps)
             except Exception:  # noqa: BLE001
                 config.enable_stream(rs.stream.color, width, height, rs.format.y8, fps)
             self._colorizer = None
+            self._depth_enabled = False
         else:
             config.enable_stream(
                 rs.stream.color, width, height, self._rs_format(rs, fmt), fps
             )
-            self._colorizer = None
+            self._depth_enabled = False
+            if with_depth:
+                config.enable_stream(
+                    rs.stream.depth,
+                    self.BAG_WIDTH,
+                    self.BAG_HEIGHT,
+                    rs.format.z16,
+                    self.BAG_FPS,
+                )
+                if self._colorizer is None:
+                    self._colorizer = rs.colorizer()
+                self._depth_enabled = True
         if self.bag_path:
             # Absolute path — relative paths can fail silently on Windows SDK builds.
             # Newer librealsense requires .db3 (not legacy .bag); coerce here so even
@@ -1962,10 +2013,21 @@ class ConfiguredRealSenseSource:
         )
         self._wanted = wanted
         w, h, fps, fmt = wanted
-        # When arming .bag (or restoring after a failed bag), never silently drop
-        # to 640x480 — that mismatch is what users saw in Record error dialogs.
+        # When arming .bag (or restoring after a failed bag), prefer the selected
+        # mode, but allow dual color+depth fallbacks if USB bandwidth rejects
+        # the first size (depth is capped at 1280x720 on D400).
         strict = bool(self.bag_path) or not allow_fallback
-        if strict:
+        if self.bag_path and fmt not in {"z16", "y8"}:
+            # Keep the selected color format. Do not fall through to bgr8 first,
+            # or a dropdown set to rgb8 still writes a BGR8 bag.
+            color_fmt = fmt if fmt in {"rgb8", "bgr8", "yuyv"} else "rgb8"
+            attempts = [
+                (w, h, fps, color_fmt),
+                (640, 480, 30, color_fmt),
+                (1280, 720, 30, color_fmt),
+                (640, 480, 30, "rgb8"),
+            ]
+        elif strict:
             attempts = [
                 (w, h, fps, fmt),
                 (w, h, fps, "bgr8") if fmt not in {"z16", "y8"} else (w, h, fps, fmt),
@@ -1999,7 +2061,22 @@ class ConfiguredRealSenseSource:
                     except Exception:  # noqa: BLE001
                         pass
                     pipeline = None
-                pipeline, profile = self._start_profile(rs, width, height, try_fps, try_fmt)
+                depth_preview = try_fmt not in {"z16", "y8"} and not self.bag_path
+                try:
+                    pipeline, profile = self._start_profile(
+                        rs,
+                        width,
+                        height,
+                        try_fps,
+                        try_fmt,
+                        with_depth=True if (self.bag_path or depth_preview) else False,
+                    )
+                except Exception as depth_exc:
+                    if not depth_preview:
+                        raise depth_exc
+                    pipeline, profile = self._start_profile(
+                        rs, width, height, try_fps, try_fmt, with_depth=False
+                    )
                 used = attempt
                 self.pixel_format = try_fmt
                 break
@@ -2080,9 +2157,19 @@ class ConfiguredRealSenseSource:
                 self._rs_recorder = profile.get_device().as_recorder()
                 if self.bag_start_paused and self._rs_recorder is not None:
                     self._rs_recorder.pause()
-                    logger.info("RealSense .bag pre-armed (paused) -> %s", self.bag_path)
+                    logger.info(
+                        "RealSense .bag pre-armed (paused) %s -> %s",
+                        self.pixel_format,
+                        self.bag_path,
+                    )
                 else:
-                    logger.info("RealSense .bag recording active -> %s", self.bag_path)
+                    dw, dh = self._depth_size_for(self.width, self.height)
+                    logger.info(
+                        "RealSense .bag recording active (color + depth %dx%d) -> %s",
+                        dw,
+                        dh,
+                        self.bag_path,
+                    )
             except Exception as exc:  # noqa: BLE001
                 self._rs_recorder = None
                 logger.warning(
@@ -2095,6 +2182,7 @@ class ConfiguredRealSenseSource:
             first: Optional[np.ndarray] = None
             for _ in range(8):
                 frames = pipeline.wait_for_frames(timeout_ms=3000)
+                self._stash_depth(frames)
                 first = self._frames_to_bgr(frames)
                 if first is not None and first.size:
                     break
@@ -2148,6 +2236,8 @@ class ConfiguredRealSenseSource:
         self._profile = None
         self._rs_recorder = None
         self._pending_frame = None
+        self._depth_raw = None
+        self._depth_enabled = False
         self._colorizer = None
 
     def _frames_to_bgr(self, frames: Any) -> Optional[np.ndarray]:
@@ -2194,6 +2284,19 @@ class ConfiguredRealSenseSource:
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         return np.ascontiguousarray(frame)
 
+    def _stash_depth(self, frames: Any) -> None:
+        """Copy raw depth only. Colorizing here stalled the next wait_for_frames."""
+        if not self._depth_enabled:
+            return
+        try:
+            depth = frames.get_depth_frame()
+            if not depth:
+                return
+            raw = np.asanyarray(depth.get_data())
+            self._depth_raw = np.array(raw, dtype=np.uint16, copy=True)
+        except Exception:  # noqa: BLE001
+            return
+
     def flush_to_live(self) -> None:
         """Drop SDK-queued frames so preview/record starts at the live edge."""
         self._pending_frame = None
@@ -2231,6 +2334,7 @@ class ConfiguredRealSenseSource:
             frames = self._pipeline.wait_for_frames(timeout_ms=1000)
         except Exception:  # noqa: BLE001
             return None
+        self._stash_depth(frames)
         return self._frames_to_bgr(frames)
 
 

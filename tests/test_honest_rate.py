@@ -20,6 +20,14 @@ def test_realsense_modes_default_30_no_invented_color_120() -> None:
     assert all(m.fps < 90 for m in color)
     assert any(m.fps == 30 for m in color)
     assert not any(m.width >= 1920 and m.fps >= 90 for m in color)
+    assert [m.label() for m in modes] == [
+        "640x480@30 rgb8",
+        "640x480@30 bgr8",
+        "640x480@30 yuyv",
+        "1280x720@30 rgb8",
+        "1280x720@30 bgr8",
+        "1280x720@30 yuyv",
+    ]
 
 
 def test_fhd_high_rate_helper() -> None:
@@ -58,15 +66,24 @@ def test_honest_container_fps_never_55_from_near_60() -> None:
     assert honest_container_fps(30.1, 30) == 30
 
 
-def test_elgato_open_targets_dshow_only_skips_msmf() -> None:
+def test_elgato_open_targets_dshow_only_skips_msmf(monkeypatch) -> None:
     import cv2
 
-    from poc1.deliverable1.devices import _elgato_open_targets
+    from poc1.deliverable1 import devices as dev
 
-    targets = _elgato_open_targets(None, 0, dshow_only=True)
+    monkeypatch.setattr(
+        dev, "elgato_open_name_paths", lambda: ["video=Elgato 4K S"]
+    )
+    monkeypatch.setattr(
+        dev,
+        "friendly_name_for_index",
+        lambda index, fallback: ("Elgato 4K S", "elgato"),
+    )
+    targets = dev._elgato_open_targets(None, 1, dshow_only=True)
     assert targets
     assert all(backend == cv2.CAP_DSHOW for _, backend in targets)
-    full = _elgato_open_targets(None, 0, dshow_only=False)
+    assert all(not isinstance(target, int) or target == 1 for target, _b in targets)
+    full = dev._elgato_open_targets(None, 1, dshow_only=False)
     assert any(backend == cv2.CAP_MSMF for _, backend in full)
 
 

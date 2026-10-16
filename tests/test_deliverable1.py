@@ -55,6 +55,16 @@ def test_realsense_config_source_keeps_selected_profile():
     assert source.mode == "hardware"
 
 
+def test_realsense_depth_size_capped_for_d400():
+    """Depth stream cannot be 1920x1080 on D400 — cap when pairing with color."""
+    assert ConfiguredRealSenseSource._depth_size_for(640, 480) == (640, 480)
+    assert ConfiguredRealSenseSource._depth_size_for(1280, 720) == (1280, 720)
+    assert ConfiguredRealSenseSource._depth_size_for(1920, 1080) == (1280, 720)
+    assert ConfiguredRealSenseSource.BAG_WIDTH == 640
+    assert ConfiguredRealSenseSource.BAG_HEIGHT == 480
+    assert ConfiguredRealSenseSource.BAG_FPS == 30
+
+
 def test_build_frame_source_wires_uvc_and_realsense():
     """R1/R2 wiring: UVC → FormattedUvcSource, RealSense → ConfiguredRealSenseSource."""
     from poc1.deliverable1.devices import (
@@ -141,6 +151,12 @@ def test_win_names_classify_elgato_and_realsense():
     assert classify_capture_name("Intel RealSense D435") == "realsense-uvc"
     assert classify_capture_name("OBS Virtual Camera") == "virtual"
     assert classify_capture_name("USB2.0 HD UVC WebCam") == "uvc"
+    from poc1.deliverable1.win_names import is_laptop_webcam
+
+    assert is_laptop_webcam("USB2.0 HD UVC WebCam")
+    assert is_laptop_webcam("Integrated Camera")
+    assert not is_laptop_webcam("Elgato 4K S")
+    assert not is_laptop_webcam("Intel RealSense D435")
 
 
 def test_elgato_open_profiles_prefer_user_selection():
@@ -298,16 +314,36 @@ def test_elgato_open_targets_prefer_dshow_then_index_then_msmf(monkeypatch):
     monkeypatch.setattr(
         dev, "elgato_open_name_paths", lambda: ["video=Elgato 4K X"]
     )
-    targets = dev._elgato_open_targets("video=Elgato 4K X", device_index=0, max_index=3)
+    monkeypatch.setattr(
+        dev,
+        "friendly_name_for_index",
+        lambda index, fallback: ("Elgato 4K X", "elgato"),
+    )
+    targets = dev._elgato_open_targets("video=Elgato 4K X", device_index=1, max_index=8)
     assert targets[0] == ("video=Elgato 4K X", cv2.CAP_DSHOW)
-    # Index scan after named DSHOW
-    assert (0, cv2.CAP_DSHOW) in targets
-    assert (1, cv2.CAP_DSHOW) in targets
-    # MSMF appears after DSHOW index attempts
+    numeric = [t for t, _b in targets if isinstance(t, int)]
+    assert numeric == [1, 1, 1]
+    assert 0 not in numeric
     dshow_idxs = [i for i, (t, b) in enumerate(targets) if b == cv2.CAP_DSHOW]
     msmf_idxs = [i for i, (t, b) in enumerate(targets) if b == cv2.CAP_MSMF]
     assert msmf_idxs and max(dshow_idxs) < min(msmf_idxs)
     assert ("video=Elgato 4K X", cv2.CAP_MSMF) in targets
+
+
+def test_elgato_open_targets_skip_laptop_webcam_index(monkeypatch):
+    from poc1.deliverable1 import devices as dev
+
+    monkeypatch.setattr(
+        dev, "elgato_open_name_paths", lambda: ["video=Elgato 4K S"]
+    )
+    monkeypatch.setattr(
+        dev,
+        "friendly_name_for_index",
+        lambda index, fallback: ("USB2.0 HD UVC WebCam", "uvc"),
+    )
+    targets = dev._elgato_open_targets("video=Elgato 4K S", device_index=0, max_index=8)
+    assert targets
+    assert all(isinstance(target, str) for target, _backend in targets)
 
 
 def test_uvc_open_failure_message_distinguishes_open_vs_frames():

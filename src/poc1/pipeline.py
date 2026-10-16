@@ -112,6 +112,10 @@ class Pipeline:
         self._bag_path: Optional[Path] = None
         self._bag_written: Optional[Path] = None
         self._uvc_bag = None
+        self._record_held = False
+        self._pending_uvc_bag: Optional[Path] = None
+        self._record_allow_remux = True
+        self._record_output_path: Optional[Path] = None
 
     def start_preview(self) -> None:
         if self._preview_started:
@@ -137,11 +141,31 @@ class Pipeline:
             self.camera_handler.resume_reads()
         return self._bag_path
 
+    def _resume_paused_bag(self) -> None:
+        """Unpause the SDK recorder on the same beat as the RealSense MP4."""
+        if not getattr(self.source, "bag_start_paused", False):
+            return
+        resume = getattr(self.source, "resume_bag", None)
+        if not callable(resume):
+            return
+        try:
+            resume()
+            logger.info("RealSense .db3 resumed with MP4 arm")
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Could not resume paused RealSense bag; file may already be writing"
+            )
+            try:
+                self.source.bag_start_paused = False
+            except Exception:  # noqa: BLE001
+                pass
+
     def start_recording(
         self,
         output_path: Path,
         monitor_csv: Path,
         bag_path: Optional[Path] = None,
+        hold: bool = False,
     ) -> None:
         if not self._preview_started:
             self.start_preview()
@@ -214,8 +238,47 @@ class Pipeline:
         self.processor.start()
         self.recorder.start()
         self.monitor.start()
-        self.camera_handler.enable_recording()
+        self._pending_uvc_bag = pending_uvc_bag
+        self._record_allow_remux = allow_remux
+        self._record_output_path = output_path
+        if hold:
+            # Writers are ready, but no camera file grows until release_recording.
+            self._record_held = True
+            logger.info("Recording held -> %s (tag=%s)", output_path, tag or "camera")
+            return
+        self._record_held = False
+        self.release_recording()
+        self._finish_record_arm()
 
+    def _flush_record_start(self) -> None:
+        """Drop frames already sitting in the capture buffer before this take."""
+        flush = getattr(self.source, "flush_to_live", None)
+        if callable(flush):
+            try:
+                flush()
+            except Exception:  # noqa: BLE001
+                logger.exception("flush_to_live failed")
+
+    def release_recording(self) -> None:
+        """Flush, then start this camera's files. Single-camera Record uses this."""
+        self._flush_record_start()
+        self.commit_recording()
+
+    def commit_recording(self) -> None:
+        """Resume a paused .db3 and enable the MP4. No flush, no frame wait."""
+        self._resume_paused_bag()
+        self.camera_handler.enable_recording()
+        self._record_held = False
+
+    def _finish_record_arm(self) -> None:
+        """Wait until frames are flowing, then start the Elgato ROS2 bag."""
+        output_path = self._record_output_path or self.output_path
+        if output_path is None:
+            raise RuntimeError("Record was released before a writer was prepared")
+        allow_remux = bool(self._record_allow_remux)
+        monitor_csv = self.monitor_csv
+        pending_uvc_bag = self._pending_uvc_bag
+        tag = str(getattr(self.source, "device_tag", "") or "")
         if not self.camera_handler.wait_recorded_frames(2.0):
             logger.warning(
                 "Record armed but frames_read=0 (tag=%s) — recovering capture",
@@ -234,7 +297,6 @@ class Pipeline:
             except Exception:  # noqa: BLE001
                 pass
             self.camera_handler.recover_capture()
-            # Rebuild writers against the recovered stream.
             self.processor.configure_output(
                 output_path=output_path,
                 width=self.source.width,
@@ -257,6 +319,7 @@ class Pipeline:
             self.processor.start()
             self.recorder.start()
             self.monitor.start()
+            self._resume_paused_bag()
             self.camera_handler.enable_recording()
             if not self.camera_handler.wait_recorded_frames(2.5):
                 try:
@@ -290,6 +353,7 @@ class Pipeline:
             self._uvc_bag.start()
             self._bag_path = pending_uvc_bag
             self.processor.sidecar_bag = self._uvc_bag
+            self._pending_uvc_bag = None
 
         logger.info(
             "Recording started -> %s (compression=%s bag=%s fps=%s requested=%s read=%d)",
@@ -361,6 +425,16 @@ class Pipeline:
             self.camera_handler.disable_recording()
         except Exception:  # noqa: BLE001
             logger.exception("disable_recording failed")
+        # Pause the .db3 on the same beat the MP4 stops accepting frames.
+        # Doing this after pause_reads lets the SDK keep writing while Python
+        # has already stopped, or the other way around if the queue still drains.
+        if self._uvc_bag is None:
+            pause_bag = getattr(self.source, "pause_bag", None)
+            if callable(pause_bag):
+                try:
+                    pause_bag()
+                except Exception:  # noqa: BLE001
+                    logger.exception("pause_bag at stop failed")
         if self._uvc_bag is None:
             try:
                 self.camera_handler.pause_reads()
